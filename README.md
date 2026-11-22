@@ -27,6 +27,14 @@ A prototype with per-element dirty tracking takes that same unchanged frame to
 tens of nanoseconds and zero allocations. That is the one architectural bet
 behind this project. Everything else here is ordinary engineering.
 
+The bet was re-tested against real flexbox — flex-shrink, the CSS 9.7 min/max
+freeze loop, wrap, justify-content, baseline alignment — because the first
+prototype's layout model was too simple to trust. It survives unchanged, for a
+reason worth being precise about: it is not a claim about layout cost. A frame
+that changes nothing does no layout work, however complicated the layout model
+is. What does degrade is size-change propagation, by about 2.35x on pathological
+trees, to 20 us — a quarter of one percent of a 120 fps budget.
+
 To be clear about what that is *not*: GPUI misses **zero** frame budget
 overruns at 120 fps on that tree. The 2.3 ms is lost headroom and battery, not
 dropped frames.
