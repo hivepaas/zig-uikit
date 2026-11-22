@@ -31,6 +31,12 @@ To be clear about what that is *not*: GPUI misses **zero** frame budget
 overruns at 120 fps on that tree. The 2.3 ms is lost headroom and battery, not
 dropped frames.
 
+Those numbers, the machine they came from, the method, and — importantly — the
+runs that contradicted the original plan are all in
+**[zig-uikit-bench](https://github.com/hivepaas/zig-uikit-bench)**. It also
+states per run what may *not* be concluded from it. If you intend to disagree
+with the premise of this project, that repo is where to start.
+
 ## Non-goals
 
 - Beating GPUI, iced or egui on microbenchmarks. Architecture is worth 10–100x;
