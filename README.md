@@ -49,5 +49,5 @@ text was never the blocker it was assumed to be.
 
 ## Licence
 
-Not yet chosen. Until a `LICENSE` file lands here, this code carries no grant
-of rights.
+[MIT](LICENSE). Deliberately permissive: a UI toolkit is only useful if it can
+be linked into anything, including closed-source applications.
