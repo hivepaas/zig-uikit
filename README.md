@@ -41,6 +41,10 @@ dropped frames.
 
 ## Design notes
 
+- [Native components vs. self-drawn components](docs/native-vs-drawn.md) — why
+  there is one widget set and not two, and the three tiers "native" actually
+  decomposes into.
+
 Decisions and the measurements behind them will be published here as they are
 made, including the ones that went against the original plan — a frame arena
 wins jitter and memory but not mean frame time; persistently-mapped quad
