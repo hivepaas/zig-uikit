@@ -30,7 +30,7 @@ IME is impossible for *any* client on that compositor, not just this one.
 
 Not convenience. Telex composes diacritics by **retroactively rewriting letters
 already typed**: `a` then `w` becomes `ă`, and `a` `w` `s` becomes `ắ`. That
-exercises the two mistakes that matter:
+targets the two mistakes that matter:
 
 1. **`delete_surrounding_text` lengths are in bytes**, not codepoints and not
    characters. `ă` is two bytes. An implementation that treats them as characters
@@ -39,9 +39,21 @@ exercises the two mistakes that matter:
    must not appear in `set_surrounding_text`. Confusing the two produces doubled
    characters that only show up mid-composition.
 
-Neither bug is reachable from an English-only test. Chinese and Japanese add a
+Neither is reachable from an English-only test. Chinese and Japanese add a
 candidate window, which is a UI problem; Vietnamese isolates the protocol
 problem, which is harder to get right and silently corrupts data when wrong.
+
+**Correction, after the first real session:** only hazard 2 was actually
+exercised. ibus-bamboo's default input mode is **1. Pre-edit**, which keeps the
+whole syllable in the preedit and commits only the finished result — it never
+rewrites committed text, so `delete_surrounding_text` was called **zero** times.
+Hazard 1 remains untested, and it is the more dangerous of the two.
+
+Bamboo's other modes are **2. Surrounding Text** and **5. Forward as Commit**,
+switched with `Shift + ~` (the first entry of `Shortcuts` in
+`~/.config/ibus-bamboo/ibus-bamboo.config.json` is keysym 126). Mode 2 is the one
+that drives `delete_surrounding_text`, and testing it is the next thing this
+spike needs.
 
 Set up with `ibus-bamboo` and the Bamboo engine selected.
 
@@ -57,18 +69,36 @@ Set up with `ibus-bamboo` and the Bamboo engine selected.
 On exit it prints a tally of each event type, the largest `delete_surrounding_text`
 seen, and the final document in bytes and codepoints.
 
-## Verified so far
+## Verified
 
-On Ubuntu 26.04, GNOME 49 / Mutter, Wayland, ibus 1.5.34-rc2, ibus-bamboo 0.8.5:
+On Ubuntu 26.04, GNOME / Mutter, Wayland, ibus 1.5.34-rc2, ibus-bamboo 0.8.5,
+Telex, input mode 1 (Pre-edit). One interactive session, 43 `done` events,
+28 `preedit_string`, 7 `commit_string`:
 
-- all five required globals bind, including `zwp_text_input_manager_v3`
-- the window maps, takes keyboard focus, and `enable` + `commit` activates the
-  input context
-- the event loop is quiet at rest
+| typed | produced | logged | bytes correct |
+| --- | --- | --- | --- |
+| `aw` | `ă` U+0103 | `2B 1cp` | yes |
+| `dd` | `ăđ` | `4B 2cp` | yes |
+| `aws` | `ắ` U+1EAF | `3B 1cp` | yes |
+| `tieengs ` | `tiếng ` | `8B 6cp` | yes (`ế` is 3 bytes) |
+| `vieejt` | `việt` | `6B 4cp` | yes (`ệ` is 3 bytes) |
 
-**Still unverified: actual composition.** That needs a human typing Telex into
-the window and reading the dump. Everything above is necessary and none of it is
-sufficient.
+- Every `preedit_string` left the document untouched. Hazard 2 holds.
+- Byte and codepoint accounting was exact at every step, including 3-byte
+  characters. Final document 32 bytes / 23 codepoints, checked by hand.
+- No `!!` lines: no length ever needed snapping to a UTF-8 boundary.
+- No stale-serial `done` events.
+- No resync storm after the fix described below.
+
+**Not yet verified, and it is the more dangerous half:**
+`delete_surrounding_text` was never called, so the byte-length hazard is
+untested. See the correction above — this needs bamboo input mode 2.
+
+Also untested: selection replacement (cursor and anchor are kept equal), cursor
+movement during composition, and a raw key arriving while a preedit is live.
+That last one now logs a `!!` warning rather than silently interleaving two
+writers into one document, because the correct recovery depends on which key it
+is and guessing would hide the problem.
 
 ## Two protocol traps this spike already hit
 
@@ -103,8 +133,9 @@ its replacement.
 - **Selection.** `set_surrounding_text` takes a cursor *and* an anchor; this
   spike keeps them equal, so selection replacement is untested.
 - **Stale serials.** A `done` whose serial does not match our commit count is
-  logged and applied anyway. Whether that is right under rapid typing is
-  unverified.
+  logged and applied anyway. None occurred in the first session, so whether that
+  is right under rapid typing is unverified.
+- **bamboo input modes 2 and 5.** Mode 1 is all that has been exercised.
 
 ## Zig 0.17 churn, continued
 

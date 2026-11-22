@@ -499,6 +499,19 @@ fn kbKey(
     state: u32,
 ) callconv(.c) void {
     if (state != c.WL_KEYBOARD_KEY_STATE_PRESSED) return;
+    // An ordering hazard the first session never reached: a raw key arriving
+    // while a preedit is pending. The IME normally consumes keys during
+    // composition, so this path should be unreachable then -- but if it is
+    // reached, inserting into the document behind a live preedit interleaves
+    // two writers and corrupts the text. Surfaced rather than silently handled,
+    // because the correct recovery (commit the preedit, or cancel it) depends
+    // on which key it is, and guessing here would hide the problem.
+    if (app.preedit.len > 0) {
+        std.debug.print(
+            "  !! raw key while preedit=\"{s}\" is live -- two writers to one document\n",
+            .{app.preedit.text()},
+        );
+    }
     const xkb_state = app.xkb_state orelse return;
     const code = key + 8; // evdev -> xkb keycode
     const sym = c.xkb_state_key_get_one_sym(xkb_state, code);

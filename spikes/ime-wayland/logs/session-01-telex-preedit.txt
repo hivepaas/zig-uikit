@@ -1,0 +1,177 @@
+globals:
+  wl_compositor              yes
+  wl_shm                     yes
+  xdg_wm_base                yes
+  wl_seat                    yes
+  zwp_text_input_manager_v3  yes
+
+A window is open. Click it to focus, then type.
+
+  Vietnamese (Telex, ibus-bamboo):  aw -> a-breve     aws -> a-breve-acute
+                                    dd -> d-stroke    oo  -> o-circumflex
+  What to watch for:
+    - preedit_string arrives WITHOUT the document changing
+    - delete_surrounding_text lengths are BYTES; a diacritic is 2 bytes
+    - the doc line must show the same text your eyes expect, every step
+
+  Esc or close the window to finish.
+
+[focus] surface gained keyboard focus -> enabling input context
+  <- preedit_string("a") cursor=1..1
+  [doc] doc="" | cursor=0B (0cp) | preedit="a" cur=1..1 | 0B 0cp
+  <- preedit_string("ă") cursor=2..2
+  [doc] doc="" | cursor=0B (0cp) | preedit="ă" cur=2..2 | 0B 0cp
+  <- commit_string("ă") 2B 1cp
+  <- preedit cleared
+  [doc] doc="ă" | cursor=2B (1cp) | 2B 1cp
+  <- preedit_string("a") cursor=1..1
+  [doc] doc="ă" | cursor=2B (1cp) | preedit="a" cur=1..1 | 2B 1cp
+  <- preedit_string("ă") cursor=2..2
+  [doc] doc="ă" | cursor=2B (1cp) | preedit="ă" cur=2..2 | 2B 1cp
+  <- preedit_string("ăd") cursor=3..3
+  [doc] doc="ă" | cursor=2B (1cp) | preedit="ăd" cur=3..3 | 2B 1cp
+  <- preedit_string("ăđ") cursor=4..4
+  [doc] doc="ă" | cursor=2B (1cp) | preedit="ăđ" cur=4..4 | 2B 1cp
+  <- commit_string("ăđ") 4B 2cp
+  <- preedit cleared
+  [doc] doc="ăăđ" | cursor=6B (3cp) | 6B 3cp
+[key ] Return
+  [doc] doc="ăăđ
+" | cursor=7B (4cp) | 7B 4cp
+  <- preedit_string("a") cursor=1..1
+  [doc] doc="ăăđ
+" | cursor=7B (4cp) | preedit="a" cur=1..1 | 7B 4cp
+  <- preedit_string("ă") cursor=2..2
+  [doc] doc="ăăđ
+" | cursor=7B (4cp) | preedit="ă" cur=2..2 | 7B 4cp
+  <- preedit_string("ắ") cursor=3..3
+  [doc] doc="ăăđ
+" | cursor=7B (4cp) | preedit="ắ" cur=3..3 | 7B 4cp
+  <- commit_string("ắ") 3B 1cp
+  <- preedit cleared
+  [doc] doc="ăăđ
+ắ" | cursor=10B (5cp) | 10B 5cp
+[key ] Return
+  [doc] doc="ăăđ
+ắ
+" | cursor=11B (6cp) | 11B 6cp
+  <- preedit_string("t") cursor=1..1
+  [doc] doc="ăăđ
+ắ
+" | cursor=11B (6cp) | preedit="t" cur=1..1 | 11B 6cp
+  <- preedit_string("ti") cursor=2..2
+  [doc] doc="ăăđ
+ắ
+" | cursor=11B (6cp) | preedit="ti" cur=2..2 | 11B 6cp
+  <- preedit_string("tie") cursor=3..3
+  [doc] doc="ăăđ
+ắ
+" | cursor=11B (6cp) | preedit="tie" cur=3..3 | 11B 6cp
+  <- preedit_string("tiê") cursor=4..4
+  [doc] doc="ăăđ
+ắ
+" | cursor=11B (6cp) | preedit="tiê" cur=4..4 | 11B 6cp
+  <- preedit_string("tiên") cursor=5..5
+  [doc] doc="ăăđ
+ắ
+" | cursor=11B (6cp) | preedit="tiên" cur=5..5 | 11B 6cp
+  <- preedit_string("tiêng") cursor=6..6
+  [doc] doc="ăăđ
+ắ
+" | cursor=11B (6cp) | preedit="tiêng" cur=6..6 | 11B 6cp
+  <- preedit_string("tiếng") cursor=7..7
+  [doc] doc="ăăđ
+ắ
+" | cursor=11B (6cp) | preedit="tiếng" cur=7..7 | 11B 6cp
+  <- commit_string("tiếng ") 8B 6cp
+  <- preedit cleared
+  [doc] doc="ăăđ
+ắ
+tiếng " | cursor=19B (12cp) | 19B 12cp
+  <- preedit_string("v") cursor=1..1
+  [doc] doc="ăăđ
+ắ
+tiếng " | cursor=19B (12cp) | preedit="v" cur=1..1 | 19B 12cp
+  <- preedit_string("vi") cursor=2..2
+  [doc] doc="ăăđ
+ắ
+tiếng " | cursor=19B (12cp) | preedit="vi" cur=2..2 | 19B 12cp
+  <- preedit_string("vie") cursor=3..3
+  [doc] doc="ăăđ
+ắ
+tiếng " | cursor=19B (12cp) | preedit="vie" cur=3..3 | 19B 12cp
+  <- preedit_string("viê") cursor=4..4
+  [doc] doc="ăăđ
+ắ
+tiếng " | cursor=19B (12cp) | preedit="viê" cur=4..4 | 19B 12cp
+  <- preedit_string("việ") cursor=5..5
+  [doc] doc="ăăđ
+ắ
+tiếng " | cursor=19B (12cp) | preedit="việ" cur=5..5 | 19B 12cp
+  <- preedit_string("việt") cursor=6..6
+  [doc] doc="ăăđ
+ắ
+tiếng " | cursor=19B (12cp) | preedit="việt" cur=6..6 | 19B 12cp
+  <- commit_string("việt") 6B 4cp
+  <- preedit cleared
+  [doc] doc="ăăđ
+ắ
+tiếng việt" | cursor=25B (16cp) | 25B 16cp
+[key ] Return
+  [doc] doc="ăăđ
+ắ
+tiếng việt
+" | cursor=26B (17cp) | 26B 17cp
+  <- preedit_string("f") cursor=1..1
+  [doc] doc="ăăđ
+ắ
+tiếng việt
+" | cursor=26B (17cp) | preedit="f" cur=1..1 | 26B 17cp
+  <- preedit_string("fs") cursor=2..2
+  [doc] doc="ăăđ
+ắ
+tiếng việt
+" | cursor=26B (17cp) | preedit="fs" cur=2..2 | 26B 17cp
+  <- preedit_string("fsd") cursor=3..3
+  [doc] doc="ăăđ
+ắ
+tiếng việt
+" | cursor=26B (17cp) | preedit="fsd" cur=3..3 | 26B 17cp
+  <- preedit_string("fsda") cursor=4..4
+  [doc] doc="ăăđ
+ắ
+tiếng việt
+" | cursor=26B (17cp) | preedit="fsda" cur=4..4 | 26B 17cp
+  <- commit_string("fsda") 4B 4cp
+  <- preedit cleared
+  [doc] doc="ăăđ
+ắ
+tiếng việt
+fsda" | cursor=30B (21cp) | 30B 21cp
+  <- preedit_string("f") cursor=1..1
+  [doc] doc="ăăđ
+ắ
+tiếng việt
+fsda" | cursor=30B (21cp) | preedit="f" cur=1..1 | 30B 21cp
+  <- preedit_string("fd") cursor=2..2
+  [doc] doc="ăăđ
+ắ
+tiếng việt
+fsda" | cursor=30B (21cp) | preedit="fd" cur=2..2 | 30B 21cp
+  <- commit_string("fd") 2B 2cp
+  <- preedit cleared
+  [doc] doc="ăăđ
+ắ
+tiếng việt
+fsdafd" | cursor=32B (23cp) | 32B 23cp
+
+--- observed ---
+  done events              43
+  preedit_string           28
+  commit_string            7
+  delete_surrounding_text  0  (largest before= 0 bytes)
+  stale-serial done        0
+  final doc                "ăăđ
+ắ
+tiếng việt
+fsdafd"  32 bytes, 23 codepoints
