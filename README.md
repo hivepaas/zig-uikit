@@ -59,6 +59,20 @@ with the premise of this project, that repo is where to start.
   there is one widget set and not two, and the three tiers "native" actually
   decomposes into.
 
+Tier A of that note is load-bearing, so it is being tested before any widget
+code exists:
+
+- [spikes/ime-wayland](spikes/ime-wayland/) — `zwp_text_input_v3`. Vietnamese
+  Telex composes correctly and byte-exactly; `delete_surrounding_text` is still
+  untested.
+- [spikes/a11y-atspi](spikes/a11y-atspi/) — AT-SPI implemented directly over
+  DBus. The running registry accepts us and the desktop tree includes us; no
+  events yet, so no screen reader has read it aloud.
+
+Together they surfaced the constraint that shapes the text field: **AT-SPI
+counts characters, `text-input-v3` counts bytes.** One widget, two offset units,
+and the mismatch is invisible in ASCII.
+
 Decisions and the measurements behind them will be published here as they are
 made, including the ones that went against the original plan — a frame arena
 wins jitter and memory but not mean frame time; persistently-mapped quad
