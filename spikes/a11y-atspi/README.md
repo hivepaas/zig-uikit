@@ -70,7 +70,16 @@ our bus name: :1.55
 - `GetState` returns `1191188864`, which is bit-exact for EDITABLE(7),
   ENABLED(8), FOCUSABLE(11), FOCUSED(12), SENSITIVE(24), SHOWING(25),
   SINGLE_LINE(26), VISIBLE(30) — checked arithmetically, not eyeballed.
-- 27 DBus calls served in the first session with no unhandled methods.
+- **The registry assigns us an application id**, and we now accept it:
+  `registry assigned Application.Id = 37`. Zero unhandled methods.
+
+That last point was a real hole, and logging found it rather than the spec did.
+The first session logged one `(unhandled)` line — `org.freedesktop.DBus.Properties.Set`
+on the root — which is the registry handing the application its id immediately
+after `Embed`. We were accepting the registration and then refusing the id that
+follows it, leaving us registered but anonymous. `Properties.Set` is now handled
+(and replies with an empty method return, not a value). Printing every unhandled
+method instead of silently returning `NOT_YET_HANDLED` is what surfaced it.
 
 Note that `org.gnome.desktop.interface toolkit-accessibility` is **`false`** on
 this machine. That gates the GTK bridge; the AT-SPI bus and registry run anyway

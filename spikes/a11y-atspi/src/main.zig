@@ -289,6 +289,32 @@ fn argStr(msg: ?*c.DBusMessage, index: u32) []const u8 {
     return std.mem.span(v);
 }
 
+/// Reads an INT32 out of a variant argument. Properties.Set has signature
+/// (ssv), so the value is one level down from the top iterator.
+fn argVariantI32(msg: ?*c.DBusMessage, index: u32) i32 {
+    var it: c.DBusMessageIter = undefined;
+    if (c.dbus_message_iter_init(msg, &it) == 0) return 0;
+    var k: u32 = 0;
+    while (k < index) : (k += 1) {
+        if (c.dbus_message_iter_next(&it) == 0) return 0;
+    }
+    if (c.dbus_message_iter_get_arg_type(&it) != c.DBUS_TYPE_VARIANT) return 0;
+    var sub: c.DBusMessageIter = undefined;
+    c.dbus_message_iter_recurse(&it, &sub);
+    const t = c.dbus_message_iter_get_arg_type(&sub);
+    if (t == c.DBUS_TYPE_INT32) {
+        var v: i32 = 0;
+        c.dbus_message_iter_get_basic(&sub, @ptrCast(&v));
+        return v;
+    }
+    if (t == c.DBUS_TYPE_UINT32) {
+        var v: u32 = 0;
+        c.dbus_message_iter_get_basic(&sub, @ptrCast(&v));
+        return @intCast(v);
+    }
+    return 0;
+}
+
 fn send(reply: ?*c.DBusMessage) void {
     _ = c.dbus_connection_send(conn, reply, null);
     c.dbus_message_unref(reply);
@@ -347,8 +373,26 @@ const INTROSPECT_XML =
 
 var n_calls: u32 = 0;
 
+/// Assigned by the registry via Properties.Set on the Application interface
+/// after Embed. Not optional: the registry really does send it, and refusing it
+/// leaves us registered but anonymous.
+var app_id: i32 = 0;
+
 fn handleProps(msg: ?*c.DBusMessage, n: *Node, member: []const u8) bool {
     const iface = argStr(msg, 0);
+    // The registry assigns the application id this way, right after Embed.
+    // Found by logging unhandled methods rather than by reading the spec: we
+    // were accepting Embed and then refusing the id that follows it.
+    if (std.mem.eql(u8, member, "Set")) {
+        const prop = argStr(msg, 1);
+        if (std.mem.eql(u8, iface, IF_APPLICATION) and std.mem.eql(u8, prop, "Id")) {
+            app_id = argVariantI32(msg, 2);
+            std.debug.print("     registry assigned Application.Id = {d}\n", .{app_id});
+        }
+        // A property Set replies with an empty method return, not a value.
+        send(c.dbus_message_new_method_return(msg));
+        return true;
+    }
     if (std.mem.eql(u8, member, "Get")) {
         const prop = argStr(msg, 1);
         const reply = c.dbus_message_new_method_return(msg);
@@ -387,7 +431,7 @@ fn handleProps(msg: ?*c.DBusMessage, n: *Node, member: []const u8) bool {
             } else if (std.mem.eql(u8, prop, "AtspiVersion")) {
                 appendVariantStr(&it, "2.1");
             } else if (std.mem.eql(u8, prop, "Id")) {
-                appendVariantI32(&it, 1);
+                appendVariantI32(&it, app_id);
             } else {
                 appendVariantStr(&it, "");
             }
