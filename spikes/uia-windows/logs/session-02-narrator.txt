@@ -1,0 +1,113 @@
+zig-uikit UIA spike -- UI Automation provider, implemented directly.
+Cross-compiled on Linux: no MSVC, no Windows SDK.
+
+Three offset units, one text field:
+  entry text        23 bytes   13 codepoints   15 utf16 units
+  tieng viet        14 bytes   10 codepoints   10 utf16 units
+  ascii only        10 bytes   10 codepoints   10 utf16 units
+
+  utf-8 bytes      <- zwp_text_input_v3 (spike B)
+  codepoints       <- AT-SPI            (spike C)
+  utf-16 units     <- Windows BSTR      (this spike)
+
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=0) node=1 -> 0
+  -> GetRuntimeId node=1
+  -> get_HostRawElementProvider node=0
+  <= AutomationFocusChanged on node=1
+Window open. UiaClientsAreListening() = true (an assistive client is active)
+
+  Start Narrator with Ctrl+Win+Enter, then Tab/arrow into the window.
+  Every UIA call into this process is logged below.
+
+  Close the window to finish.
+
+  -> WM_GETOBJECT(UiaRootObjectId): handing over the root provider
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=0) node=0 -> null
+  -> WM_GETOBJECT(UiaRootObjectId): handing over the root provider
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=0) node=0 -> null
+  -> WM_GETOBJECT(UiaRootObjectId): handing over the root provider
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=0) node=0 -> null
+  -> WM_GETOBJECT(UiaRootObjectId): handing over the root provider
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=0) node=0 -> null
+  -> WM_GETOBJECT(UiaRootObjectId): handing over the root provider
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=0) node=0 -> null
+  -> WM_GETOBJECT(UiaRootObjectId): handing over the root provider
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=0) node=0 -> null
+  -> GetFocus -> node=1
+  -> Navigate(dir=0) node=1 -> 0
+  -> GetRuntimeId node=1
+  -> get_HostRawElementProvider node=0
+  -> get_HostRawElementProvider node=0
+  -> GetRuntimeId node=1
+  -> get_HostRawElementProvider node=0
+  -> GetPropertyValue(ControlType) node=1
+  -> GetPatternProvider(Value) node=1
+  -> GetPropertyValue(ControlType) node=1
+  -> GetPropertyValue(Name) node=1
+  -> GetPatternProvider(Value) node=1
+  -> GetPatternProvider(Value) node=1
+  -> get_Value
+  -> GetPatternProvider(Value) node=1
+  -> GetRuntimeId node=1
+  -> get_HostRawElementProvider node=0
+  -> WM_GETOBJECT(UiaRootObjectId): handing over the root provider
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=0) node=0 -> null
+  -> WM_GETOBJECT(UiaRootObjectId): handing over the root provider
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=0) node=0 -> null
+  -> GetPropertyValue(ControlType) node=0
+  -> GetPropertyValue(ControlType) node=0
+  -> GetPropertyValue(Name) node=0
+  -> get_BoundingRectangle node=0
+  -> GetPropertyValue(ControlType) node=0
+  -> WM_GETOBJECT(UiaRootObjectId): handing over the root provider
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=0) node=0 -> null
+  -> WM_GETOBJECT(UiaRootObjectId): handing over the root provider
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=0) node=0 -> null
+  -> Navigate(dir=3) node=0 -> 1
+  -> Navigate(dir=0) node=1 -> 0
+  -> GetPropertyValue(ControlType) node=1
+  -> GetRuntimeId node=1
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=1) node=1 -> null
+  -> Navigate(dir=0) node=1 -> 0
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=0) node=0 -> null
+  -> WM_GETOBJECT(UiaRootObjectId): handing over the root provider
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=0) node=0 -> null
+  -> WM_GETOBJECT(UiaRootObjectId): handing over the root provider
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=0) node=0 -> null
+  -> WM_GETOBJECT(UiaRootObjectId): handing over the root provider
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=0) node=0 -> null
+  -> GetPropertyValue(ControlType) node=0
+  -> WM_GETOBJECT(UiaRootObjectId): handing over the root provider
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=0) node=0 -> null
+  -> WM_GETOBJECT(UiaRootObjectId): handing over the root provider
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=0) node=0 -> null
+  -> Navigate(dir=3) node=0 -> 1
+  -> Navigate(dir=0) node=1 -> 0
+  -> GetPropertyValue(ControlType) node=1
+  -> GetRuntimeId node=1
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=1) node=1 -> null
+  -> Navigate(dir=0) node=1 -> 0
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=0) node=0 -> null
+  -> WM_GETOBJECT(UiaRootObjectId): handing over the root provider
+  -> get_HostRawElementProvider node=0
+  -> Navigate(dir=0) node=0 -> null

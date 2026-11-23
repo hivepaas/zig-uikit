@@ -72,7 +72,8 @@ code exists:
 
 - [spikes/uia-windows](spikes/uia-windows/) — Windows UI Automation, a provider
   implemented directly in COM and **cross-compiled from Linux** with no MSVC or
-  Windows SDK. Builds and links; Narrator has not read it yet.
+  Windows SDK. **Narrator reads it**: 93 calls into the process, ending in
+  `get_Value`.
 
 Together they surfaced the constraint that shapes the text field. **The same
 widget has to speak three different offset units:**
@@ -87,9 +88,17 @@ widget has to speak three different offset units:**
 three mismatches, which is why none of this is testable in English.
 
 They also showed that the two accessibility backends have almost nothing in
-common: AT-SPI is push, out of process, over a bus, with a serialised tree
-snapshot; UIA is pull, in process, straight into COM vtables. One internal tree
-can feed both, but the adapters are separate work.
+common, and the gap is measurable. Reading the same two-node tree costs:
+
+```
+AT-SPI:   1 call   -- Cache.GetItems, whole tree, serialised
+UIA:     93 calls  -- no snapshot exists; the client re-walks what it needs
+```
+
+AT-SPI is push, out of process, over a bus. UIA is pull, in process, straight
+into COM vtables. One internal tree can feed both, but the adapters want
+opposite things: a cheap tree *serialisation* on Linux, a cheap *individual
+accessor* on Windows.
 
 Decisions and the measurements behind them will be published here as they are
 made, including the ones that went against the original plan — a frame arena

@@ -572,11 +572,17 @@ const value_vtbl = c.IValueProviderVtbl{
 
 // ---------------------------------------------------------------------- events
 
-/// UiaClientsAreListening is the Windows analogue of AT-SPI's
-/// GetRegisteredEvents: the cheap way to skip accessibility work entirely when
-/// no assistive technology is running. Spike C found that emitting
-/// unconditionally floods the a11y bus; here the equivalent waste is building
-/// BSTRs and VARIANTs nobody reads.
+/// The Windows analogue of AT-SPI's GetRegisteredEvents -- but a WEAKER one,
+/// and measurement corrected the assumption here.
+///
+/// On Linux, GetRegisteredEvents returned an empty array with no screen reader
+/// running, so it gates event work precisely. UiaClientsAreListening returned
+/// TRUE on an idle Windows 11 desktop with no screen reader at all: Windows
+/// itself has UIA clients. So it distinguishes "something uses UIA" from
+/// "nothing does", not "a screen reader needs this" from "nobody does".
+///
+/// It is still worth calling -- it is one cheap call and it is correct when it
+/// returns false -- but it cannot be relied on to skip the work.
 fn clientsListening() bool {
     return c.UiaClientsAreListening() != 0;
 }

@@ -125,20 +125,94 @@ VBoxManage sharedfolder add windows-11 --name zigui \
     --hostpath .../uia-windows/zig-out/bin --transient --automount
 ```
 
-## Verified
+## Verified — Narrator reads it
 
-- Cross-compiles on Linux to a PE32+ binary importing `UIAutomationCore.DLL`.
-- The COM machinery compiles: four interfaces on one object, vtables built by
-  hand, `QueryInterface` handing out the correct interface pointer per IID.
-- VirtualBox guest reachable, Guest Additions 7.2.6 present, shared folder
-  mounted.
+Run in a VirtualBox Windows 11 guest, driven headlessly over
+`VBoxManage guestcontrol`, with the build output exposed as a shared folder so
+the host's rebuild is what runs.
 
-**Not yet verified: Narrator reading it.** That needs the binary run inside
-Windows with Narrator on, which is the equivalent of what spike C did with Orca.
-Until that happens this spike proves the code builds and links, not that it
-works — and spike C is the reason to insist on the difference: running Orca
-found two gaps (`Cache.GetItems`, `GetApplicationBusAddress`) that reading the
-protocol had not, and falsified a claim about `focus:` events.
+The three offset counts, printed by the binary on real Windows, match the
+table above exactly:
+
+```
+entry text        23 bytes   13 codepoints   15 utf16 units
+tieng viet        14 bytes   10 codepoints   10 utf16 units
+ascii only        10 bytes   10 codepoints   10 utf16 units
+```
+
+With Narrator running, **93 UIA calls** came into the process:
+
+| method | calls |
+| --- | --- |
+| `Navigate` | 28 |
+| `get_HostRawElementProvider` | 26 |
+| `WM_GETOBJECT` | 16 |
+| `GetPropertyValue` | 10 |
+| `GetRuntimeId` | 6 |
+| `GetPatternProvider` | 4 |
+| `get_Value` | 1 |
+| `get_BoundingRectangle` | 1 |
+| `GetFocus` | 1 |
+
+Narrator walked the whole path: took the provider from `WM_GETOBJECT`, found the
+root, navigated to the child, fetched its runtime id, asked for the Value
+pattern, and **read the text**. Zero methods were left unhandled.
+
+### The push/pull contrast, now measured
+
+This is the number worth keeping:
+
+```
+AT-SPI (spike C):   1 call   -- Cache.GetItems, whole tree, serialised
+UIA (this spike):  93 calls  -- for a TWO-node tree
+```
+
+`Navigate(Parent)` from the root was called **18 times**, each returning null,
+and `get_HostRawElementProvider` 26 times. UIA's pull model is chatty by design:
+there is no snapshot, so a client re-walks whatever it needs whenever it needs
+it.
+
+For a toolkit that means the two backends have opposite performance shapes. An
+AT-SPI backend wants a cheap *serialisation* of the tree. A UIA backend wants
+every individual accessor to be cheap, because they are called constantly —
+`get_HostRawElementProvider` being the second most-called method is not
+something a reading of the protocol would predict.
+
+### Correction: `UiaClientsAreListening()` is a weaker gate than it looks
+
+This spike's code claimed it was "the exact Windows analogue" of
+`GetRegisteredEvents`. It is not. On an **idle Windows 11 desktop with no screen
+reader running at all**, the baseline run reported:
+
+```
+Window open. UiaClientsAreListening() = true (an assistive client is active)
+```
+
+Windows itself has UIA clients. So the call distinguishes "something uses UIA"
+from "nothing does" — not "a screen reader needs this" from "nobody does".
+On Linux `GetRegisteredEvents` returned an genuinely empty array under the same
+conditions, and gates the work precisely.
+
+It is still worth calling, since it is one cheap call and is trustworthy when it
+returns false, but it cannot carry the optimisation the way the Linux equivalent
+can. The comment in the source has been corrected.
+
+Session logs are in [logs/](logs/).
+
+### Still not covered
+
+- **Text pattern.** This exposes `IValueProvider`, which gives a screen reader
+  the whole string but no caret, no selection and no per-character navigation.
+  A real edit control needs `ITextProvider`/`ITextRangeProvider`, where ranges
+  are *opaque objects moved by `TextUnit`* rather than integer offsets — a third
+  model again, different from both AT-SPI's character offsets and the IME's byte
+  offsets.
+- **`UiaDisconnectProvider` on teardown.** The providers here are statically
+  allocated so the lifetime question is deferred; a real toolkit cannot do that.
+- **Windows IME (TSF).** The other half of tier A on Windows, and the harder
+  half. `msctf.h` is bundled, so it cross-compiles the same way.
+- **Narrator speaking.** The run was headless, so the calls are proven and the
+  audio is not. What Narrator *did* with the value it read is unverified.
 
 ## Zig friction worth recording
 
