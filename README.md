@@ -70,9 +70,26 @@ code exists:
   `Cache.GetItems`, and decodes the text events correctly, including the
   character offsets on multi-byte Vietnamese.
 
-Together they surfaced the constraint that shapes the text field: **AT-SPI
-counts characters, `text-input-v3` counts bytes.** One widget, two offset units,
-and the mismatch is invisible in ASCII.
+- [spikes/uia-windows](spikes/uia-windows/) — Windows UI Automation, a provider
+  implemented directly in COM and **cross-compiled from Linux** with no MSVC or
+  Windows SDK. Builds and links; Narrator has not read it yet.
+
+Together they surfaced the constraint that shapes the text field. **The same
+widget has to speak three different offset units:**
+
+| protocol | unit |
+| --- | --- |
+| `zwp_text_input_v3` | UTF-8 bytes |
+| AT-SPI | codepoints |
+| Windows `BSTR` | UTF-16 code units |
+
+`tiếng việt 🇻🇳` is 23 bytes, 13 codepoints and 15 UTF-16 units. ASCII hides all
+three mismatches, which is why none of this is testable in English.
+
+They also showed that the two accessibility backends have almost nothing in
+common: AT-SPI is push, out of process, over a bus, with a serialised tree
+snapshot; UIA is pull, in process, straight into COM vtables. One internal tree
+can feed both, but the adapters are separate work.
 
 Decisions and the measurements behind them will be published here as they are
 made, including the ones that went against the original plan — a frame arena
