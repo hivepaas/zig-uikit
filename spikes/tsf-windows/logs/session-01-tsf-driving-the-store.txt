@@ -1,0 +1,37 @@
+zig-uikit TSF spike -- Windows IME via ITextStoreACP.
+Cross-compiled on Linux: no MSVC, no Windows SDK.
+
+  ACP = Application Character Position = UTF-16 CODE UNITS,
+  the same unit as a BSTR. Windows is internally consistent;
+  Linux is not (text-input-v3 counts bytes, AT-SPI counts codepoints).
+
+ITfThreadMgr created
+activated, client id 32
+  -> AdviseSink(mask=0x1f)
+document manager associated with the window
+
+Window open and focused. Switch the input language to Vietnamese
+(Win+Space) and type Telex: aw -> a-breve, aws -> a-breve-acute,
+dd -> d-stroke, "tieengs vieejt" -> two words.
+
+What to watch for, and it is the opposite of spike B:
+  - SetText puts the COMPOSING characters into the document
+  - OnStartComposition marks them provisional, OnEndComposition commits
+  - every offset is UTF-16 code units, never bytes
+
+Close the window to finish.
+
+  -> RequestLock(0x6) -> granting [read/write]
+  -> GetSelection -> 0..0
+  -> RequestLock(0x6) -> granting [read/write]
+  -> GetText(0..-1) -> 0 utf16 units
+  -> RequestLock(0x6) -> granting [read/write]
+  -> GetTextExt -> screen (68,151)
+  -> RequestLock(0x6) -> granting [read/write]
+  -> GetTextExt -> screen (68,151)
+  -> RequestLock(0x6) -> granting [read/write]
+  -> RequestLock(0x6) -> granting [read/write]
+  -> RequestLock(0x3) -> granting [read only]
+  -> GetSelection -> 0..0
+  -> RequestLock(0x6) -> granting [read/write]
+  -> RequestLock(0x6) -> granting [read/write]

@@ -74,6 +74,10 @@ code exists:
   implemented directly in COM and **cross-compiled from Linux** with no MSVC or
   Windows SDK. **Narrator reads it**: 93 calls into the process, ending in
   `get_Value`.
+- [spikes/tsf-windows](spikes/tsf-windows/) — Windows IME via `ITextStoreACP`,
+  29 methods plus a lock protocol. TSF drives the store with real read and
+  read/write locks; composition is untested because the guest has no composing
+  IME installed.
 
 Together they surfaced the constraint that shapes the text field. **The same
 widget has to speak three different offset units:**
@@ -83,9 +87,21 @@ widget has to speak three different offset units:**
 | `zwp_text_input_v3` | UTF-8 bytes |
 | AT-SPI | codepoints |
 | Windows `BSTR` | UTF-16 code units |
+| TSF "ACP" | UTF-16 code units |
 
 `tiếng việt 🇻🇳` is 23 bytes, 13 codepoints and 15 UTF-16 units. ASCII hides all
 three mismatches, which is why none of this is testable in English.
+
+Windows turns out to be internally **consistent** — its accessibility and its
+input method both count UTF-16 code units. Linux is not: `text-input-v3` counts
+bytes while AT-SPI counts codepoints, so a Linux text field must convert between
+its own two platform protocols.
+
+And composition itself differs in kind, not just in units: on Wayland the
+preedit is a separate string that never enters the document, while under TSF the
+input processor writes the composing text *into* the buffer and marks it
+provisional. The document model has to support the Windows shape, because the
+Wayland shape cannot represent it.
 
 They also showed that the two accessibility backends have almost nothing in
 common, and the gap is measurable. Reading the same two-node tree costs:
