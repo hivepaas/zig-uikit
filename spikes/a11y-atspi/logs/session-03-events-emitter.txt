@@ -1,0 +1,47 @@
+zig-uikit a11y spike -- AT-SPI over DBus, implemented directly.
+
+  entry text  "tiếng việt"
+  bytes       14   <- what the IME protocol counts
+  characters  10   <- what AT-SPI counts
+a11y bus: unix:path=/run/user/1000/at-spi/bus,guid=48e75cc364d48295de1082006b03af52
+our bus name: :1.23
+Socket.Embed accepted by the registry
+registered event listeners: 0
+  (nothing is listening. A real toolkit gates emission on this rather
+   than flooding the a11y bus for users with no assistive tech.)
+
+--- emitting a session ---
+  <= org.a11y.atspi.Event.Window.Activate detail="" d1=0 d2=0 on /org/a11y/atspi/accessible/1
+  <= org.a11y.atspi.Event.Object.StateChanged detail="focused" d1=1 d2=0 on /org/a11y/atspi/accessible/2
+  <= org.a11y.atspi.Event.Focus.Focus detail="" d1=0 d2=0 on /org/a11y/atspi/accessible/2
+  [edit] insert "tiếng " -- 8 bytes / 6 chars at char offset 0
+  <= org.a11y.atspi.Event.Object.TextChanged detail="insert" d1=0 d2=6 on /org/a11y/atspi/accessible/2
+  <= org.a11y.atspi.Event.Object.TextCaretMoved detail="" d1=6 d2=0 on /org/a11y/atspi/accessible/2
+  [edit] insert "việt" -- 6 bytes / 4 chars at char offset 6
+  <= org.a11y.atspi.Event.Object.TextChanged detail="insert" d1=6 d2=4 on /org/a11y/atspi/accessible/2
+  <= org.a11y.atspi.Event.Object.TextCaretMoved detail="" d1=10 d2=0 on /org/a11y/atspi/accessible/2
+  [edit] delete "t" -- 1 bytes / 1 char at char offset 9
+  <= org.a11y.atspi.Event.Object.TextChanged detail="delete" d1=9 d2=1 on /org/a11y/atspi/accessible/2
+  <= org.a11y.atspi.Event.Object.TextCaretMoved detail="" d1=9 d2=0 on /org/a11y/atspi/accessible/2
+  <= org.a11y.atspi.Event.Object.StateChanged detail="focused" d1=0 d2=0 on /org/a11y/atspi/accessible/2
+  <= org.a11y.atspi.Event.Window.Deactivate detail="" d1=0 d2=0 on /org/a11y/atspi/accessible/1
+
+  final text "tiếng việ" -- 13 bytes / 9 chars
+
+Exported 3 nodes: application -> frame -> entry
+
+Inspect from another terminal:
+  busctl --user --address='unix:path=/run/user/1000/at-spi/bus,guid=48e75cc364d48295de1082006b03af52' \
+      introspect :1.23 /org/a11y/atspi/accessible/root
+
+Or read the entry's text the way a screen reader would:
+  gdbus call --address 'unix:path=/run/user/1000/at-spi/bus,guid=48e75cc364d48295de1082006b03af52' \
+      --dest :1.23 --object-path /org/a11y/atspi/accessible/2 \
+      --method org.a11y.atspi.Text.GetText 0 -1
+
+  -> org.freedesktop.DBus.Properties.Set on /org/a11y/atspi/accessible/root
+     registry assigned Application.Id = 18
+
+--- observed ---
+  dbus calls served  1
+  events emitted     11

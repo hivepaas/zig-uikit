@@ -769,6 +769,169 @@ fn a11yBusAddress(buf: []u8) ![]const u8 {
 
 /// Hands the registry our (bus name, root path) so the desktop tree includes
 /// us. Without this the objects are exported but nothing is looking at them.
+// --------------------------------------------------------------------- events
+
+// Interfaces confirmed from libatk-bridge-2.0.so.0, which is what a real ATK
+// application emits through. Signal signature `siiv(so)` confirmed from
+// libatspi.so.0 rather than from memory: detail string, detail1, detail2,
+// any_data variant, then a reference to the emitting application.
+const EV_OBJECT = "org.a11y.atspi.Event.Object";
+const EV_FOCUS = "org.a11y.atspi.Event.Focus";
+const EV_WINDOW = "org.a11y.atspi.Event.Window";
+
+const AnyData = union(enum) {
+    none,
+    int: i32,
+    str: [:0]const u8,
+};
+
+var n_events: u32 = 0;
+
+/// One AT-SPI event. The signal is emitted on the SOURCE object's path -- that
+/// is how a listener knows which element changed; the trailing `(so)` is the
+/// application, not the source.
+fn emitEvent(
+    path: [:0]const u8,
+    iface: [*c]const u8,
+    member: [*c]const u8,
+    detail: [*c]const u8,
+    d1: i32,
+    d2: i32,
+    any: AnyData,
+) void {
+    const msg = c.dbus_message_new_signal(path.ptr, iface, member) orelse return;
+    defer c.dbus_message_unref(msg);
+    var it: c.DBusMessageIter = undefined;
+    c.dbus_message_iter_init_append(msg, &it);
+    appendStr(&it, detail);
+    appendI32(&it, d1);
+    appendI32(&it, d2);
+    switch (any) {
+        .none => appendVariantI32(&it, 0),
+        .int => |v| appendVariantI32(&it, v),
+        .str => |v| appendVariantStr(&it, v.ptr),
+    }
+    appendRef(&it, unique_name, PATH_ROOT);
+    _ = c.dbus_connection_send(conn, msg, null);
+    _ = c.dbus_connection_flush(conn);
+    n_events += 1;
+    std.debug.print("  <= {s}.{s} detail=\"{s}\" d1={d} d2={d} on {s}\n", .{
+        std.mem.span(iface), std.mem.span(member), std.mem.span(detail), d1, d2, path,
+    });
+}
+
+/// Does anything actually want events? A toolkit that emits unconditionally
+/// floods the accessibility bus for every user who has no assistive technology
+/// running, which is almost all of them. Real implementations gate on this.
+fn registeredEventCount() i32 {
+    var err: DBusError = .{};
+    c.dbus_error_init(err.ptr());
+    const msg = c.dbus_message_new_method_call(
+        "org.a11y.atspi.Registry",
+        "/org/a11y/atspi/registry",
+        "org.a11y.atspi.Registry",
+        "GetRegisteredEvents",
+    ) orelse return -1;
+    defer c.dbus_message_unref(msg);
+    const reply = c.dbus_connection_send_with_reply_and_block(conn, msg, 2000, err.ptr());
+    if (reply == null) return -1;
+    defer c.dbus_message_unref(reply);
+    var it: c.DBusMessageIter = undefined;
+    if (c.dbus_message_iter_init(reply, &it) == 0) return 0;
+    if (c.dbus_message_iter_get_arg_type(&it) != c.DBUS_TYPE_ARRAY) return 0;
+    var sub: c.DBusMessageIter = undefined;
+    c.dbus_message_iter_recurse(&it, &sub);
+    var n: i32 = 0;
+    while (c.dbus_message_iter_get_arg_type(&sub) != c.DBUS_TYPE_INVALID) {
+        n += 1;
+        if (c.dbus_message_iter_next(&sub) == 0) break;
+    }
+    return n;
+}
+
+// ------------------------------------------------- a live, editable entry text
+
+/// The entry's text during the emit sequence. Byte-indexed, like spike B's
+/// document model, because that is what an input method needs. Every offset
+/// leaving this buffer for an AT-SPI event is converted to characters.
+var live_buf: [512]u8 = undefined;
+var live_len: usize = 0;
+
+fn liveSync() void {
+    live_buf[live_len] = 0;
+    nodes[2].text = live_buf[0..live_len :0];
+}
+
+/// Mirrors one `commit_string` from the input method. The IME hands us bytes;
+/// the event must carry characters.
+fn insertText(str: []const u8) void {
+    const at_chars = charCount(live_buf[0..live_len]);
+    @memcpy(live_buf[live_len..][0..str.len], str);
+    live_len += str.len;
+    liveSync();
+    const n_chars = charCount(str);
+    std.debug.print(
+        "  [edit] insert \"{s}\" -- {d} bytes / {d} chars at char offset {d}\n",
+        .{ str, str.len, n_chars, at_chars },
+    );
+    var tmp: [256]u8 = undefined;
+    @memcpy(tmp[0..str.len], str);
+    tmp[str.len] = 0;
+    // detail1 is the offset in CHARACTERS, detail2 the length in CHARACTERS.
+    emitEvent(nodes[2].path, EV_OBJECT, "TextChanged", "insert", at_chars, n_chars, .{
+        .str = tmp[0..str.len :0],
+    });
+    emitEvent(nodes[2].path, EV_OBJECT, "TextCaretMoved", "", charCount(live_buf[0..live_len]), 0, .none);
+}
+
+/// Mirrors a backspace: delete the last character, which may be several bytes.
+fn deleteLastChar() void {
+    if (live_len == 0) return;
+    var n: usize = 1;
+    while (n < live_len and (live_buf[live_len - n] & 0xC0) == 0x80) n += 1;
+    const removed = live_buf[live_len - n .. live_len];
+    var tmp: [8]u8 = undefined;
+    @memcpy(tmp[0..n], removed);
+    tmp[n] = 0;
+    live_len -= n;
+    liveSync();
+    const at_chars = charCount(live_buf[0..live_len]);
+    std.debug.print(
+        "  [edit] delete \"{s}\" -- {d} bytes / 1 char at char offset {d}\n",
+        .{ tmp[0..n], n, at_chars },
+    );
+    emitEvent(nodes[2].path, EV_OBJECT, "TextChanged", "delete", at_chars, 1, .{
+        .str = tmp[0..n :0],
+    });
+    emitEvent(nodes[2].path, EV_OBJECT, "TextCaretMoved", "", at_chars, 0, .none);
+}
+
+/// Replays spike B's actual Telex session as accessibility events. The two
+/// commits are the ones ibus-bamboo really produced: "tieng " then "viet".
+fn emitSession() void {
+    std.debug.print("\n--- emitting a session ---\n", .{});
+
+    emitEvent(nodes[1].path, EV_WINDOW, "Activate", "", 0, 0, .none);
+    emitEvent(nodes[2].path, EV_OBJECT, "StateChanged", "focused", 1, 0, .none);
+    // `focus:` is deprecated in favour of state-changed:focused, and Orca still
+    // listens for it. Emitting both is what real toolkits do.
+    emitEvent(nodes[2].path, EV_FOCUS, "Focus", "", 0, 0, .none);
+
+    live_len = 0;
+    liveSync();
+    insertText("ti\u{1ebf}ng ");
+    insertText("vi\u{1ec7}t");
+    deleteLastChar();
+
+    emitEvent(nodes[2].path, EV_OBJECT, "StateChanged", "focused", 0, 0, .none);
+    emitEvent(nodes[1].path, EV_WINDOW, "Deactivate", "", 0, 0, .none);
+
+    std.debug.print(
+        "\n  final text \"{s}\" -- {d} bytes / {d} chars\n",
+        .{ live_buf[0..live_len], live_len, charCount(live_buf[0..live_len]) },
+    );
+}
+
 fn embed() !void {
     var err: DBusError = .{};
     c.dbus_error_init(err.ptr());
@@ -794,11 +957,14 @@ fn embed() !void {
 
 pub fn main(init: std.process.Init.Minimal) !void {
     var seconds: u32 = 0;
+    var do_emit = false;
     var itr = std.process.Args.Iterator.init(init.args);
     _ = itr.next();
     while (itr.next()) |a| {
         if (std.mem.startsWith(u8, a, "--seconds=")) {
             seconds = std.fmt.parseInt(u32, a["--seconds=".len..], 10) catch 0;
+        } else if (std.mem.eql(u8, a, "--emit")) {
+            do_emit = true;
         }
     }
 
@@ -839,6 +1005,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     try embed();
 
+    const listeners = registeredEventCount();
+    std.debug.print("registered event listeners: {d}\n", .{listeners});
+    if (listeners == 0) std.debug.print(
+        "  (nothing is listening. A real toolkit gates emission on this rather\n" ++
+            "   than flooding the a11y bus for users with no assistive tech.)\n",
+        .{},
+    );
+
+    if (do_emit) emitSession();
+
     std.debug.print(
         \\
         \\Exported 3 nodes: application -> frame -> entry
@@ -869,5 +1045,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         elapsed += 200;
     }
 
-    std.debug.print("\n--- observed ---\n  dbus calls served  {d}\n", .{n_calls});
+    std.debug.print(
+        "\n--- observed ---\n  dbus calls served  {d}\n  events emitted     {d}\n",
+        .{ n_calls, n_events },
+    );
 }

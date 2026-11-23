@@ -1,0 +1,123 @@
+signal time=1795417915.248484 sender=org.freedesktop.DBus -> destination=:1.21 serial=2 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameAcquired
+   string ":1.21"
+signal time=1795417915.248520 sender=org.freedesktop.DBus -> destination=:1.21 serial=4 path=/org/freedesktop/DBus; interface=org.freedesktop.DBus; member=NameLost
+   string ":1.21"
+signal time=1795417918.292139 sender=:1.1 -> destination=(null destination) serial=5074 path=/org/a11y/atspi/accessible/root; interface=org.a11y.atspi.Event.Object; member=ChildrenChanged
+   string "add"
+   int32 11
+   int32 0
+   variant       struct {
+         string ":1.22"
+         object path "/org/a11y/atspi/accessible/root"
+      }
+   array [
+   ]
+signal time=1795417918.292259 sender=:1.22 -> destination=(null destination) serial=4 path=/org/a11y/atspi/accessible/1; interface=org.a11y.atspi.Event.Window; member=Activate
+   string ""
+   int32 0
+   int32 0
+   variant       int32 0
+   struct {
+      string ":1.22"
+      object path "/org/a11y/atspi/accessible/root"
+   }
+signal time=1795417918.292268 sender=:1.22 -> destination=(null destination) serial=5 path=/org/a11y/atspi/accessible/2; interface=org.a11y.atspi.Event.Object; member=StateChanged
+   string "focused"
+   int32 1
+   int32 0
+   variant       int32 0
+   struct {
+      string ":1.22"
+      object path "/org/a11y/atspi/accessible/root"
+   }
+signal time=1795417918.292275 sender=:1.22 -> destination=(null destination) serial=6 path=/org/a11y/atspi/accessible/2; interface=org.a11y.atspi.Event.Focus; member=Focus
+   string ""
+   int32 0
+   int32 0
+   variant       int32 0
+   struct {
+      string ":1.22"
+      object path "/org/a11y/atspi/accessible/root"
+   }
+signal time=1795417918.292301 sender=:1.22 -> destination=(null destination) serial=7 path=/org/a11y/atspi/accessible/2; interface=org.a11y.atspi.Event.Object; member=TextChanged
+   string "insert"
+   int32 0
+   int32 6
+   variant       string "tiếng "
+   struct {
+      string ":1.22"
+      object path "/org/a11y/atspi/accessible/root"
+   }
+signal time=1795417918.292307 sender=:1.22 -> destination=(null destination) serial=8 path=/org/a11y/atspi/accessible/2; interface=org.a11y.atspi.Event.Object; member=TextCaretMoved
+   string ""
+   int32 6
+   int32 0
+   variant       int32 0
+   struct {
+      string ":1.22"
+      object path "/org/a11y/atspi/accessible/root"
+   }
+signal time=1795417918.292313 sender=:1.22 -> destination=(null destination) serial=9 path=/org/a11y/atspi/accessible/2; interface=org.a11y.atspi.Event.Object; member=TextChanged
+   string "insert"
+   int32 6
+   int32 4
+   variant       string "việt"
+   struct {
+      string ":1.22"
+      object path "/org/a11y/atspi/accessible/root"
+   }
+signal time=1795417918.292319 sender=:1.22 -> destination=(null destination) serial=10 path=/org/a11y/atspi/accessible/2; interface=org.a11y.atspi.Event.Object; member=TextCaretMoved
+   string ""
+   int32 10
+   int32 0
+   variant       int32 0
+   struct {
+      string ":1.22"
+      object path "/org/a11y/atspi/accessible/root"
+   }
+signal time=1795417918.292342 sender=:1.22 -> destination=(null destination) serial=11 path=/org/a11y/atspi/accessible/2; interface=org.a11y.atspi.Event.Object; member=TextChanged
+   string "delete"
+   int32 9
+   int32 1
+   variant       string "t"
+   struct {
+      string ":1.22"
+      object path "/org/a11y/atspi/accessible/root"
+   }
+signal time=1795417918.292349 sender=:1.22 -> destination=(null destination) serial=12 path=/org/a11y/atspi/accessible/2; interface=org.a11y.atspi.Event.Object; member=TextCaretMoved
+   string ""
+   int32 9
+   int32 0
+   variant       int32 0
+   struct {
+      string ":1.22"
+      object path "/org/a11y/atspi/accessible/root"
+   }
+signal time=1795417918.292355 sender=:1.22 -> destination=(null destination) serial=13 path=/org/a11y/atspi/accessible/2; interface=org.a11y.atspi.Event.Object; member=StateChanged
+   string "focused"
+   int32 0
+   int32 0
+   variant       int32 0
+   struct {
+      string ":1.22"
+      object path "/org/a11y/atspi/accessible/root"
+   }
+signal time=1795417918.292361 sender=:1.22 -> destination=(null destination) serial=14 path=/org/a11y/atspi/accessible/1; interface=org.a11y.atspi.Event.Window; member=Deactivate
+   string ""
+   int32 0
+   int32 0
+   variant       int32 0
+   struct {
+      string ":1.22"
+      object path "/org/a11y/atspi/accessible/root"
+   }
+signal time=1795417923.898457 sender=:1.1 -> destination=(null destination) serial=5079 path=/org/a11y/atspi/accessible/root; interface=org.a11y.atspi.Event.Object; member=ChildrenChanged
+   string "remove"
+   int32 11
+   int32 0
+   variant       struct {
+         string ":1.22"
+         object path "/org/a11y/atspi/accessible/root"
+      }
+   array [
+   ]

@@ -86,23 +86,93 @@ this machine. That gates the GTK bridge; the AT-SPI bus and registry run anyway
 and accepted us regardless. A direct implementation does not depend on that
 setting.
 
-## Not verified, and the gap is significant
+## Events
 
-**A screen reader has not read this aloud.** Registration and queries work, but
-Orca needs *events* — `object:state-changed`, `object:text-caret-moved`,
-`object:text-changed`, `focus:` — emitted as DBus signals on
-`org.a11y.atspi.Event.*`. None are implemented. A static tree that answers
-queries is necessary and not sufficient, and the remaining work is not trivial:
-event emission is where the a11y bus traffic actually lives, and getting it
-wrong means either a silent screen reader or a flooded one.
+`./zig-out/bin/a11y-atspi --emit` replays [spike B](../ime-wayland/)'s actual
+Telex session as accessibility events: the two commits ibus-bamboo really
+produced, then a backspace.
+
+Signal signature is `siiv(so)` — detail string, detail1, detail2, any_data
+variant, then a reference to the emitting application. Confirmed from
+`libatspi.so.0` rather than from memory, and the interface names
+(`Event.Object`, `Event.Focus`, `Event.Window`) from `libatk-bridge-2.0.so.0`,
+which is what a real ATK application emits through.
+
+**The same character-offset rule applies to events, and this is where it bites.**
+Captured with `dbus-monitor` on the a11y bus:
+
+| edit | bytes / chars | emitted | note |
+| --- | --- | --- | --- |
+| insert `tiếng ` at 0 | 8 / 6 | `insert d1=0 d2=6` | length is 6 **characters**, not 8 bytes |
+| insert `việt` at char 6 | 6 / 4 | `insert d1=6 d2=4` | offset is **6**, while its byte offset is 8 |
+| backspace `t` | 1 / 1 | `delete d1=9 d2=1` | caret then moves to char 9 |
+
+Byte offsets here would put a screen reader's caret two characters off, silently.
+
+11 events emitted, all 11 decoded correctly by `dbus-monitor`:
+
+```
+path=/org/a11y/atspi/accessible/2; interface=org.a11y.atspi.Event.Object; member=TextChanged
+   string "insert"
+   int32 0
+   int32 6
+   variant       string "tiếng "
+   struct { string ":1.22"; object path "/org/a11y/atspi/accessible/root" }
+```
+
+`focus:` is emitted alongside `object:state-changed:focused`. It is deprecated,
+Orca still listens for it, and real toolkits send both.
+
+### The registry announces us, unprompted
+
+The capture caught something not emitted by this program at all. On `Embed`, the
+registry itself broadcast our arrival to the desktop tree, and on exit withdrew
+it:
+
+```
+sender=:1.1  path=.../accessible/root  member=ChildrenChanged
+   string "add"     int32 11
+   ...
+   string "remove"
+```
+
+That is third-party confirmation that registration is real — the registry put us
+at index 11 of the desktop and told every listening client.
+
+### One wire-format question left open
+
+The registry's own `ChildrenChanged` uses a **different** signature from the one
+this spike emits: `siiva{sv}`, with the object reference inside the variant and a
+trailing properties dictionary, instead of `siiv(so)`. Both strings are present
+in `libatspi.so.0`.
+
+`siiv(so)` is the documented application form, the bus accepted it, and
+`dbus-monitor` decoded it. Whether a current Orca *requires* the extended form
+from applications is **unverified**. Resolving it needs either Orca running or a
+bridged GTK application to compare against — and on this machine
+`toolkit-accessibility` is `false`, so no GTK app is currently emitting anything
+to compare with.
+
+## Not verified, and the gap is still real
+
+**A screen reader has not read this aloud.** Events are now on the bus in a form
+the bus accepts, but nothing has consumed them. Orca was not running during any
+of these sessions, and `GetRegisteredEvents` returned an empty array throughout —
+so these events went out to zero listeners.
+
+That last point is itself a design finding: a toolkit that emits
+unconditionally floods the accessibility bus for every user who has no assistive
+technology running, which is nearly all of them. This spike queries
+`GetRegisteredEvents` and reports the count, but does not yet gate emission on
+it. Real implementations do.
 
 Also absent:
 
 - `org.a11y.atspi.Cache`, which real toolkits implement so clients can fetch the
   tree in bulk instead of walking it one call at a time.
 - `EditableText`, so the screen reader cannot modify the field.
-- Focus tracking, selection, and any connection to a live document — the tree is
-  static and hardcoded.
+- Any connection to a live document — `--emit` replays a scripted sequence, and
+  the tree is otherwise static.
 - Hit testing (`GetAccessibleAtPoint`).
 - Windows (UI Automation) and macOS (NSAccessibility). Each is its own spike.
 
