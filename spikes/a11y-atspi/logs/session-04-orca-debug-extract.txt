@@ -1,0 +1,95 @@
+# Orca debug log extracts (orca as shipped with GNOME, Ubuntu 26.04)
+# full log was 2.1 MB; these are the lines that prove consumption
+
+-  12. pid: 114754     zig-uikit a11y spike      ./zig-out/bin/a11y-atspi --seconds=150 
+-  13. pid: 115546     zig-uikit a11y spike      ./zig-out/bin/a11y-atspi --seconds=90 
+                  app='zig-uikit a11y spike (zig-uikit 0.0.0-spike)' name='Spike window' role='frame' axid='/org/a11y/atspi/accessible/1' id=0x7d54aa1ee8c0
+- AXText: Text of [section (0x7d54aa2a8080)]  (0-169): 'Claude: False positive again — that's my own shell matching its own pattern. But: Orca's debug log is 2.1 MB with 100 mentions of zig-uikit. Let me verify both properly.'
+- AXUtilities: [frame: 'Spike window' (0x7d54aa595a00)]  from [application: 'zig-uikit a11y spike' (0x7d54aa597000)]  can be active window
+- AXUtilities: [frame: 'Spike window' (0x7d54aa595fc0)]  from [application: 'zig-uikit a11y spike' (0x7d54c08c8300)]  can be active window
+- AXUtilities: [frame: 'Spike window' (0x7d54c079f040)]  from [application: 'zig-uikit a11y spike' (0x7d54c079e440)]  can be active window
+- AXUtilities: [frame: 'Spike window' (0x7d54c08bd500)]  from [application: 'zig-uikit a11y spike' (0x7d54c079e240)]  can be active window
+- BRAILLE: Display message: 'Claude: False positive again — that's my own shell matching its own pattern. But: Orca's debug log is 2.1 MB with 100 mentions of zig-uikit. Let me verify both properly.' (flash_time: 5000)
+- BRAILLE: Line 0: 'Claude: False positive again — that's my own shell matching its own pattern. But: Orca's debug log is 2.1 MB with 100 mentions of zig-uikit. Let me verify both properly.' focusOffset: 0 [[0, 31], [31, 60], [60, 89], [89, 118], [118, 148], [148, 169]]
+- BRAILLE LINE:  'Claude: False positive again — that's my own shell matching its own pattern. But: Orca's debug log is 2.1 MB with 100 mentions of zig-uikit. Let me verify both properly.'
+- BRAILLE: Not contracting 'Claude: False positive again — that's my own shell matching its own pattern. But: Orca's debug log is 2.1 MB with 100 mentions of zig-uikit. Let me verify both properly.' because contracted braille is not enabled.
+- CLIPBOARD PRESENTER: Possible change event object:text-changed:delete for [entry: 'Name' (0x7d54aa241d80)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (9, 1, t)
+- CLIPBOARD PRESENTER: Possible change event object:text-changed:insert for [entry: 'Name' (0x7d54aa241fc0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (6, 4, việt)
+- CLIPBOARD PRESENTER: Possible change event object:text-changed:insert for [entry: 'Name' (0x7d54aa5d1e40)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 6, tiếng)
+- DEFAULT: Setting up commands for [application: 'zig-uikit a11y spike' (0x7d54c08603c0)] 
+- EVENT MANAGER: App for event source is [application: 'zig-uikit a11y spike' (0x7d54c08603c0)] 
+- EVENT MANAGER: Dequeued object:state-changed:focused for [entry: 'Name' (0x7d54c06e1cc0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (1, 0, 0) priority: 3, counter: 127
+- EVENT MANAGER: Dequeued window:activate for [frame: 'Spike window' (0x7d54aa2424c0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 0, 0) priority: 2, counter: 126
+- EVENT MANAGER: Dequeued window:deactivate for [frame: 'Spike window' (0x7d54aa242580)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 0, 0) priority: 2, counter: 135
+- EVENT MANAGER: Dequeueing object:state-changed:focused for [entry: 'Name' (0x7d54aa2422c0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (1, 0, 0)
+- EVENT MANAGER: Dequeueing window:activate for [frame: 'Spike window' (0x7d54aa241f00)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 0, 0)
+- EVENT MANAGER: Dequeueing window:deactivate for [frame: 'Spike window' (0x7d54aa5724c0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 0, 0)
+- EVENT MANAGER: Getting script for event for [application: 'zig-uikit a11y spike' (0x7d54c08603c0)]  [frame: 'Spike window' (0x7d54aa241cc0)] 
+- EVENT MANAGER: object:children-changed:add for [desktop frame: 'main' (0x7d54aa53cc40)]  in  (13, 0, [application: 'zig-uikit a11y spike' (0x7d54aa5acc40)])
+- EVENT MANAGER: object:state-changed:focused for [entry: 'Name' (0x7d54aa211d80)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (1, 0, 0)
+- EVENT MANAGER: object:state-changed:focused for [entry: 'Name' (0x7d54aa241cc0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 0, 0)
+- EVENT MANAGER: object:state-changed:focused for [entry: 'Name' (0x7d54aa242080)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 0, 0) has priority level: 3
+- EVENT MANAGER: object:state-changed:focused for [entry: 'Name' (0x7d54aa242880)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (1, 0, 0) obsoleted by object:state-changed:focused for [entry: 'Name' (0x7d54aa242880)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 0, 0) more recent event of same type for same object
+- EVENT MANAGER: object:state-changed:focused for [entry: 'Name' (0x7d54aa5d1e40)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (1, 0, 0) has priority level: 3
+- EVENT MANAGER: object:text-caret-moved for [entry: 'Name' (0x7d54aa212380)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (10, 0, 0)
+- EVENT MANAGER: object:text-caret-moved for [entry: 'Name' (0x7d54aa242100)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (6, 0, 0) has priority level: 4
+- EVENT MANAGER: object:text-caret-moved for [entry: 'Name' (0x7d54aa2422c0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (10, 0, 0) has priority level: 4
+- EVENT MANAGER: object:text-caret-moved for [entry: 'Name' (0x7d54aa242300)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (9, 0, 0)
+- EVENT MANAGER: object:text-caret-moved for [entry: 'Name' (0x7d54aa5a1dc0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (6, 0, 0)
+- EVENT MANAGER: object:text-caret-moved for [entry: 'Name' (0x7d54aa6ca3c0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (9, 0, 0) has priority level: 4
+- EVENT MANAGER: object:text-changed:delete for [entry: 'Name' (0x7d54aa241d80)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (9, 1, t)
+- EVENT MANAGER: object:text-changed:delete for [entry: 'Name' (0x7d54aa6ca3c0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (9, 1, t) has priority level: 4
+- EVENT MANAGER: object:text-changed:insert for [entry: 'Name' (0x7d54aa211f40)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 6, tiếng) has priority level: 4
+- EVENT MANAGER: object:text-changed:insert for [entry: 'Name' (0x7d54aa241dc0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 6, tiếng)
+- EVENT MANAGER: object:text-changed:insert for [entry: 'Name' (0x7d54aa241f40)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (6, 4, việt)
+- EVENT MANAGER: object:text-changed:insert for [entry: 'Name' (0x7d54aa242340)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (6, 4, việt) has priority level: 4
+- EVENT MANAGER: Queued object:state-changed:focused for [entry: 'Name' (0x7d54aa2124c0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 0, 0) priority: 3, counter: 134
+- EVENT MANAGER: Queued object:state-changed:focused for [entry: 'Name' (0x7d54aa241f40)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (1, 0, 0) priority: 3, counter: 127
+- EVENT MANAGER: Queued object:text-caret-moved for [entry: 'Name' (0x7d54aa241fc0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (6, 0, 0) priority: 4, counter: 129
+- EVENT MANAGER: Queued object:text-caret-moved for [entry: 'Name' (0x7d54aa2422c0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (10, 0, 0) priority: 4, counter: 131
+- EVENT MANAGER: Queued object:text-caret-moved for [entry: 'Name' (0x7d54aa6ca3c0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (9, 0, 0) priority: 4, counter: 133
+- EVENT MANAGER: Queued object:text-changed:delete for [entry: 'Name' (0x7d54aa242080)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (9, 1, t) priority: 4, counter: 132
+- EVENT MANAGER: Queued object:text-changed:insert for [entry: 'Name' (0x7d54aa5a1e40)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 6, tiếng) priority: 4, counter: 128
+- EVENT MANAGER: Queued object:text-changed:insert for [entry: 'Name' (0x7d54c073a300)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (6, 4, việt) priority: 4, counter: 130
+- EVENT MANAGER: Queued window:activate for [frame: 'Spike window' (0x7d54aa241d40)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 0, 0) priority: 2, counter: 126
+- EVENT MANAGER: Queued window:deactivate for [frame: 'Spike window' (0x7d54aa241cc0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 0, 0) priority: 2, counter: 135
+- EVENT MANAGER: Queueing object:state-changed:focused for [entry: 'Name' (0x7d54aa227fc0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (1, 0, 0)
+- EVENT MANAGER: Queueing object:state-changed:focused for [entry: 'Name' (0x7d54aa241f00)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 0, 0)
+- EVENT MANAGER: Queueing object:text-caret-moved for [entry: 'Name' (0x7d54aa211d80)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (6, 0, 0)
+- EVENT MANAGER: Queueing object:text-caret-moved for [entry: 'Name' (0x7d54c072a2c0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (10, 0, 0)
+- EVENT MANAGER: Queueing object:text-caret-moved for [entry: 'Name' (0x7d54c073a300)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (9, 0, 0)
+- EVENT MANAGER: Queueing object:text-changed:delete for [entry: 'Name' (0x7d54aa242300)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (9, 1, t)
+- EVENT MANAGER: Queueing object:text-changed:insert for [entry: 'Name' (0x7d54aa211d80)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 6, tiếng)
+- EVENT MANAGER: Queueing object:text-changed:insert for [entry: 'Name' (0x7d54aa242100)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (6, 4, việt)
+- EVENT MANAGER: Queueing window:activate for [frame: 'Spike window' (0x7d54aa5a03c0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 0, 0)
+- EVENT MANAGER: Queueing window:deactivate for [frame: 'Spike window' (0x7d54aa242500)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 0, 0)
+- EVENT MANAGER: Script for event is zig-uikit a11y spike (module=orca.scripts.default)
+- EVENT MANAGER: window:activate for [frame: 'Spike window' (0x7d54aa241e00)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 0, 0) has priority level: 2
+- EVENT MANAGER: window:activate for [frame: 'Spike window' (0x7d54aa242080)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 0, 0) obsoleted by window:deactivate for [frame: 'Spike window' (0x7d54aa242080)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 0, 0) more recent window (de)activation event
+- EVENT MANAGER: window:activate for [frame: 'Spike window' (0x7d54c073a300)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 0, 0)
+- EVENT MANAGER: window:deactivate for [frame: 'Spike window' (0x7d54aa5724c0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 0, 0)
+- EVENT MANAGER: window:deactivate for [frame: 'Spike window' (0x7d54aa5724c0)]  in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 0, 0) has priority level: 2
+- SCRIPT MANAGER: Creating app script for [application: 'zig-uikit a11y spike' (0x7d54c08603c0)] 
+- SCRIPT MANAGER: Default script created for [application: 'zig-uikit a11y spike' (0x7d54c08603c0)]  (obj:  None)
+- SCRIPT MANAGER: Getting script for [application: 'zig-uikit a11y spike' (0x7d54c08603c0)]  [entry: 'Name' (0x7d54aa211cc0)] 
+- SCRIPT MANAGER: Getting script for [application: 'zig-uikit a11y spike' (0x7d54c08603c0)]  [entry: 'Name' (0x7d54aa241cc0)] 
+- SCRIPT MANAGER: Getting script for [application: 'zig-uikit a11y spike' (0x7d54c08603c0)]  [entry: 'Name' (0x7d54aa241f40)] 
+- SCRIPT MANAGER: Getting script for [application: 'zig-uikit a11y spike' (0x7d54c08603c0)]  [entry: 'Name' (0x7d54aa242240)] 
+- SCRIPT MANAGER: Getting script for [application: 'zig-uikit a11y spike' (0x7d54c08603c0)]  [entry: 'Name' (0x7d54aa242300)] 
+- SCRIPT MANAGER: Getting script for [application: 'zig-uikit a11y spike' (0x7d54c08603c0)]  [entry: 'Name' (0x7d54aa54cac0)] 
+- SCRIPT MANAGER: Getting script for [application: 'zig-uikit a11y spike' (0x7d54c08603c0)]  [entry: 'Name' (0x7d54aa569dc0)] 
+- SCRIPT MANAGER: Getting script for [application: 'zig-uikit a11y spike' (0x7d54c08603c0)]  [entry: 'Name' (0x7d54aa5a1dc0)] 
+- SCRIPT MANAGER: Getting script for [application: 'zig-uikit a11y spike' (0x7d54c08603c0)]  [frame: 'Spike window' (0x7d54aa241cc0)] 
+- SCRIPT MANAGER: Getting script for [application: 'zig-uikit a11y spike' (0x7d54c08603c0)]  [frame: 'Spike window' (0x7d54aa242540)] 
+- SCRIPT MANAGER: Getting script for [application: 'zig-uikit a11y spike' (0x7d54c08603c0)]  [frame: 'Spike window' (0x7d54aa5a04c0)] 
+- SCRIPT MANAGER: Mapped [application: 'zig-uikit a11y spike' (0x7d54c08603c0)]  to zig-uikit a11y spike
+- SCRIPT MANAGER: Old script for app found: zig-uikit a11y spike (module=orca.scripts.default) [DEAD (0x7d54c08603c0)] 
+- SCRIPT MANAGER: Script is app script zig-uikit a11y spike (module=orca.scripts.default)
+- SCRIPT: zig-uikit a11y spike (module=orca.scripts.default) initialized
+- SPEECH DISPATCHER: Speaking '<speak><mark name="0:7"/>Claude: <mark name="8:13"/>False <mark name="14:22"/>positive <mark name="23:28"/>again <mark name="29:30"/>— <mark name="31:37"/>that's <mark name="38:40"/>my <mark name="41:44"/>own <mark name="45:50"/>shell <mark name="51:59"/>matching <mark name="60:63"/>its <mark name="64:67"/>own <mark name="68:76"/>pattern. <mark name="77:81"/>But: <mark name="82:88"/>Orca's <mark name="89:94"/>debug <mark name="95:98"/>log <mark name="99:101"/>is <mark name="102:105"/>2.1 <mark name="106:108"/>MB <mark name="109:113"/>with <mark name="114:117"/>100 <mark name="118:126"/>mentions <mark name="127:129"/>of <mark name="130:140"/>zig-uikit. <mark name="141:144"/>Let <mark name="145:147"/>me <mark name="148:154"/>verify <mark name="155:159"/>both <mark name="160:169"/>properly.</speak>' 
+- SPEECH DISPATCHER: Speaking 'Claude: False positive again — that's my own shell matching its own pattern. But: Orca's debug log is 2.1 MB with 100 mentions of zig-uikit. Let me verify both properly.' as string
+- SPEECH OUTPUT: 'Claude: False positive again — that's my own shell matching its own pattern. But: Orca's debug log is 2.1 MB with 100 mentions of zig-uikit. Let me verify both properly.' {'established': False}
+- SPEECH PRESENTER: Adjusted text: 'Claude: False positive again — that's my own shell matching its own pattern. But: Orca's debug log is 2.1 MB with 100 mentions of zig-uikit. Let me verify both properly.'
+- SPEECH PRESENTER: Adjusting 'Claude: False positive again — that's my own shell matching its own pattern. But: Orca's debug log is 2.1 MB with 100 mentions of zig-uikit. Let me verify both properly.' from None start_offset: None
+- SPEECH: Speak 'Claude: False positive again — that's my own shell matching its own pattern. But: Orca's debug log is 2.1 MB with 100 mentions of zig-uikit. Let me verify both properly.' acss: {'established': False}
+- WARNING: [application: 'zig-uikit a11y spike' (0x7d54c08603c0)]  is not in the accessible desktop

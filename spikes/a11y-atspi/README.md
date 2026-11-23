@@ -120,9 +120,6 @@ path=/org/a11y/atspi/accessible/2; interface=org.a11y.atspi.Event.Object; member
    struct { string ":1.22"; object path "/org/a11y/atspi/accessible/root" }
 ```
 
-`focus:` is emitted alongside `object:state-changed:focused`. It is deprecated,
-Orca still listens for it, and real toolkits send both.
-
 ### The registry announces us, unprompted
 
 The capture caught something not emitted by this program at all. On `Embed`, the
@@ -139,37 +136,102 @@ sender=:1.1  path=.../accessible/root  member=ChildrenChanged
 That is third-party confirmation that registration is real — the registry put us
 at index 11 of the desktop and told every listening client.
 
-### One wire-format question left open
+### Orca reads it
 
-The registry's own `ChildrenChanged` uses a **different** signature from the one
-this spike emits: `siiva{sv}`, with the object reference inside the variant and a
-trailing properties dictionary, instead of `siiv(so)`. Both strings are present
-in `libatspi.so.0`.
+Tested with Orca running (`toolkit-accessibility` temporarily enabled, speech
+disabled, both restored afterwards). This closes the wire-format question that
+was previously open here.
 
-`siiv(so)` is the documented application form, the bus accepted it, and
-`dbus-monitor` decoded it. Whether a current Orca *requires* the extended form
-from applications is **unverified**. Resolving it needs either Orca running or a
-bridged GTK application to compare against — and on this machine
-`toolkit-accessibility` is `false`, so no GTK app is currently emitting anything
-to compare with.
+**Orca lists the application**, alongside gnome-shell, Chrome, VS Code and
+Nautilus:
 
-## Not verified, and the gap is still real
+```
+Desktop has 12 app(s):
+  pid: 115546   zig-uikit a11y spike   ./zig-out/bin/a11y-atspi
+```
 
-**A screen reader has not read this aloud.** Events are now on the bus in a form
-the bus accepts, but nothing has consumed them. Orca was not running during any
-of these sessions, and `GetRegisteredEvents` returned an empty array throughout —
-so these events went out to zero listeners.
+**Orca decoded every text event correctly**, from its own debug log:
 
-That last point is itself a design finding: a toolkit that emits
-unconditionally floods the accessibility bus for every user who has no assistive
-technology running, which is nearly all of them. This spike queries
-`GetRegisteredEvents` and reports the count, but does not yet gate emission on
-it. Real implementations do.
+```
+CLIPBOARD PRESENTER: Possible change event object:text-changed:insert
+  for [entry: 'Name'] in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (0, 6, tiếng)
+CLIPBOARD PRESENTER: Possible change event object:text-changed:insert
+  for [entry: 'Name'] in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (6, 4, việt)
+CLIPBOARD PRESENTER: Possible change event object:text-changed:delete
+  for [entry: 'Name'] in zig-uikit a11y spike (zig-uikit 0.0.0-spike) (9, 1, t)
+```
+
+`(6, 4, việt)` is the whole character-offset argument, confirmed by a real
+screen reader: Orca placed the insertion at character 6, where the byte offset
+is 8.
+
+It also recognised the structure and reacted:
+
+```
+AXUtilities: [frame: 'Spike window'] from [application: 'zig-uikit a11y spike']
+             can be active window
+DEFAULT: Setting up commands for [application: 'zig-uikit a11y spike']
+EVENT MANAGER: App for event source is [application: 'zig-uikit a11y spike']
+```
+
+And it queried back — 31 calls in one session (`GetAttributes` ×11,
+`Properties.Get` ×11, `GetRole` ×3, `GetState`, `GetRelationSet`), with **zero
+unhandled methods**.
+
+**`siiv(so)` is the right signature for applications.** The registry's own
+events use `siiva{sv}`, both strings exist in `libatspi.so.0`, and Orca consumed
+`siiv(so)` without complaint. The question is settled.
+
+### Two things Orca demanded that guesswork had missed
+
+Running Orca found two gaps that reading the protocol had not:
+
+**1. `org.a11y.atspi.Cache.GetItems`, at `/org/a11y/atspi/cache`.** This is
+Orca's *first* move on a new application — it pulls the whole tree in one call
+rather than walking `Accessible` node by node. The first Orca run failed with
+
+```
+AT-SPI: Error in GetItems, error=Method "GetItems" with signature ""
+        on interface "org.a11y.atspi.Cache" doesn't exist
+```
+
+and the application was listed by name and then unreadable. Note the path is a
+*sibling* of the accessible subtree, not inside it, so the DBus fallback had to
+be registered one level higher at `/org/a11y/atspi` — otherwise the call never
+even reaches the handler and libdbus answers the error itself.
+
+The cache item signature is `((so)(so)(so)iiassusau)` — object, application,
+parent, index in parent, child count, interfaces, name, role, description,
+states — taken from the introspection XML embedded in
+`libatk-bridge-2.0.so.0`, which is the reference implementation.
+
+**2. `org.a11y.atspi.Application.GetApplicationBusAddress`.** Asked before Orca
+reads anything. An empty string means "I am on the main accessibility bus". An
+error here makes a client believe the app has a private bus it cannot reach.
+
+### Correction: Orca does not listen for `focus:`
+
+This spike previously emitted the deprecated `focus:` event, on the stated
+belief that "Orca still listens for it, and real toolkits send both." **That is
+false here.** With Orca running, `GetRegisteredEvents` returns 39 listeners and
+`Focus:` is not among them — only `Object:StateChanged:Focused`. The emission
+was removed; it was traffic to nobody.
+
+The 39 listeners do include every other event this spike sends:
+`Object:StateChanged:Focused`, `Object:TextChanged:Insert`,
+`Object:TextChanged:Delete`, `Object:TextCaretMoved:`, `Window:Activate:`,
+`Window:Deactivate:`, `Object:ChildrenChanged:Add`/`Remove`.
+
+### Still absent
+
+With Orca not running, `GetRegisteredEvents` returns an **empty array** — so
+outside a test, every event this spike emits goes to zero listeners. A toolkit
+that emits unconditionally floods the accessibility bus for the great majority
+of users who run no assistive technology. This spike queries the count and
+reports it; it does not yet gate emission on it. Real implementations do.
 
 Also absent:
 
-- `org.a11y.atspi.Cache`, which real toolkits implement so clients can fetch the
-  tree in bulk instead of walking it one call at a time.
 - `EditableText`, so the screen reader cannot modify the field.
 - Any connection to a live document — `--emit` replays a scripted sequence, and
   the tree is otherwise static.

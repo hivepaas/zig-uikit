@@ -66,8 +66,9 @@ code exists:
   Telex composes correctly and byte-exactly; `delete_surrounding_text` is still
   untested.
 - [spikes/a11y-atspi](spikes/a11y-atspi/) — AT-SPI implemented directly over
-  DBus. The running registry accepts us and the desktop tree includes us; no
-  events yet, so no screen reader has read it aloud.
+  DBus. **Orca reads it**: it lists the application, pulls the tree through
+  `Cache.GetItems`, and decodes the text events correctly, including the
+  character offsets on multi-byte Vietnamese.
 
 Together they surfaced the constraint that shapes the text field: **AT-SPI
 counts characters, `text-input-v3` counts bytes.** One widget, two offset units,

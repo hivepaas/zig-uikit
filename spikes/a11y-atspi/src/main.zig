@@ -71,6 +71,10 @@ const PATH_ROOT = "/org/a11y/atspi/accessible/root";
 /// AT-SPI's explicit null reference. A parent or child slot that has no object
 /// is this, not an empty path.
 const PATH_NULL = "/org/a11y/atspi/null";
+/// The cache lives at its own path, a SIBLING of the accessible subtree. Orca
+/// asks here first; see handleCache.
+const PATH_CACHE = "/org/a11y/atspi/cache";
+const IF_CACHE = "org.a11y.atspi.Cache";
 
 // ----------------------------------------------------------------------- tree
 
@@ -430,6 +434,10 @@ fn handleProps(msg: ?*c.DBusMessage, n: *Node, member: []const u8) bool {
                 appendVariantStr(&it, "0.0.0-spike");
             } else if (std.mem.eql(u8, prop, "AtspiVersion")) {
                 appendVariantStr(&it, "2.1");
+            } else if (std.mem.eql(u8, prop, "ToolkitVersion")) {
+                appendVariantStr(&it, "0.0.0-spike");
+            } else if (std.mem.eql(u8, prop, "InterfaceVersion")) {
+                appendVariantI32(&it, 1);
             } else if (std.mem.eql(u8, prop, "Id")) {
                 appendVariantI32(&it, app_id);
             } else {
@@ -688,6 +696,91 @@ fn handleText(msg: ?*c.DBusMessage, n: *Node, member: []const u8) bool {
     return false;
 }
 
+/// A node's position among its parent's children, or -1 at the root.
+fn indexInParent(n: *const Node) i32 {
+    if (n.parent < 0) return -1;
+    const p = nodes[@intCast(n.parent)];
+    for (p.children, 0..) |ci, k| {
+        if (std.mem.eql(u8, nodes[ci].path, n.path)) return @intCast(k);
+    }
+    return -1;
+}
+
+/// One cache item: ((so)(so)(so)iiassusau) -- object, application, parent,
+/// index in parent, child count, interfaces, name, role, description, states.
+/// Signature taken from the introspection XML embedded in
+/// libatk-bridge-2.0.so.0, which is the reference implementation.
+fn appendCacheItem(arr: *c.DBusMessageIter, n: *const Node) void {
+    var st: c.DBusMessageIter = undefined;
+    _ = c.dbus_message_iter_open_container(arr, c.DBUS_TYPE_STRUCT, null, &st);
+
+    appendRef(&st, unique_name, n.path.ptr);
+    appendRef(&st, unique_name, PATH_ROOT);
+    if (n.parent < 0)
+        appendRef(&st, "", PATH_NULL)
+    else
+        appendRef(&st, unique_name, nodes[@intCast(n.parent)].path.ptr);
+
+    appendI32(&st, indexInParent(n));
+    appendI32(&st, @intCast(n.children.len));
+
+    var ifs: c.DBusMessageIter = undefined;
+    _ = c.dbus_message_iter_open_container(&st, c.DBUS_TYPE_ARRAY, "s", &ifs);
+    appendStr(&ifs, IF_ACCESSIBLE);
+    if (n.parent < 0) appendStr(&ifs, IF_APPLICATION);
+    if (n.w > 0) appendStr(&ifs, IF_COMPONENT);
+    if (n.has_text) appendStr(&ifs, IF_TEXT);
+    _ = c.dbus_message_iter_close_container(&st, &ifs);
+
+    appendStr(&st, n.name.ptr);
+    appendU32(&st, n.role);
+    appendStr(&st, "");
+
+    var sts: c.DBusMessageIter = undefined;
+    _ = c.dbus_message_iter_open_container(&st, c.DBUS_TYPE_ARRAY, "u", &sts);
+    appendU32(&sts, @truncate(n.states));
+    appendU32(&sts, @truncate(n.states >> 32));
+    _ = c.dbus_message_iter_close_container(&st, &sts);
+
+    _ = c.dbus_message_iter_close_container(arr, &st);
+}
+
+/// Orca's FIRST move on a new application is Cache.GetItems -- it pulls the
+/// whole tree in one call rather than walking Accessible node by node. Without
+/// this an app is listed by name and then unreadable, which is exactly what
+/// the first Orca run showed.
+fn handleCache(msg: ?*c.DBusMessage, iface: []const u8, member: []const u8) bool {
+    if (std.mem.eql(u8, iface, IF_CACHE) and std.mem.eql(u8, member, "GetItems")) {
+        const reply = c.dbus_message_new_method_return(msg);
+        var it: c.DBusMessageIter = undefined;
+        c.dbus_message_iter_init_append(reply, &it);
+        var arr: c.DBusMessageIter = undefined;
+        _ = c.dbus_message_iter_open_container(
+            &it,
+            c.DBUS_TYPE_ARRAY,
+            "((so)(so)(so)iiassusau)",
+            &arr,
+        );
+        for (&nodes) |*n| appendCacheItem(&arr, n);
+        _ = c.dbus_message_iter_close_container(&it, &arr);
+        send(reply);
+        std.debug.print("     served the whole tree ({d} nodes) in one call\n", .{nodes.len});
+        return true;
+    }
+    if (std.mem.eql(u8, iface, IF_PROPS) and std.mem.eql(u8, member, "Get")) {
+        const reply = c.dbus_message_new_method_return(msg);
+        var it: c.DBusMessageIter = undefined;
+        c.dbus_message_iter_init_append(reply, &it);
+        var v: c.DBusMessageIter = undefined;
+        _ = c.dbus_message_iter_open_container(&it, c.DBUS_TYPE_VARIANT, "u", &v);
+        appendU32(&v, 2);
+        _ = c.dbus_message_iter_close_container(&it, &v);
+        send(reply);
+        return true;
+    }
+    return false;
+}
+
 fn onMessage(
     _: ?*c.DBusConnection,
     msg: ?*c.DBusMessage,
@@ -714,7 +807,35 @@ fn onMessage(
         return c.DBUS_HANDLER_RESULT_HANDLED;
     }
 
+    if (std.mem.eql(u8, path, PATH_CACHE)) {
+        if (handleCache(msg, iface, member)) return c.DBUS_HANDLER_RESULT_HANDLED;
+        std.debug.print("     (unhandled on cache)\n", .{});
+        return c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+    }
+
     const n = nodeByPath(path) orelse return c.DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
+
+    // Asked by Orca before it reads anything: an empty string means "I am on
+    // the main accessibility bus, talk to me there". Returning an error here
+    // makes a client think the app has a private bus it cannot reach.
+    if (std.mem.eql(u8, iface, IF_APPLICATION)) {
+        if (std.mem.eql(u8, member, "GetApplicationBusAddress")) {
+            const reply = c.dbus_message_new_method_return(msg);
+            var it: c.DBusMessageIter = undefined;
+            c.dbus_message_iter_init_append(reply, &it);
+            appendStr(&it, "");
+            send(reply);
+            return c.DBUS_HANDLER_RESULT_HANDLED;
+        }
+        if (std.mem.eql(u8, member, "GetLocale")) {
+            const reply = c.dbus_message_new_method_return(msg);
+            var it: c.DBusMessageIter = undefined;
+            c.dbus_message_iter_init_append(reply, &it);
+            appendStr(&it, "vi_VN.UTF-8");
+            send(reply);
+            return c.DBUS_HANDLER_RESULT_HANDLED;
+        }
+    }
 
     const ok = if (std.mem.eql(u8, iface, IF_PROPS))
         handleProps(msg, n, member)
@@ -776,7 +897,11 @@ fn a11yBusAddress(buf: []u8) ![]const u8 {
 // libatspi.so.0 rather than from memory: detail string, detail1, detail2,
 // any_data variant, then a reference to the emitting application.
 const EV_OBJECT = "org.a11y.atspi.Event.Object";
+/// Kept for reference only; see emitSession for why nothing is sent here.
 const EV_FOCUS = "org.a11y.atspi.Event.Focus";
+comptime {
+    _ = EV_FOCUS;
+}
 const EV_WINDOW = "org.a11y.atspi.Event.Window";
 
 const AnyData = union(enum) {
@@ -913,9 +1038,14 @@ fn emitSession() void {
 
     emitEvent(nodes[1].path, EV_WINDOW, "Activate", "", 0, 0, .none);
     emitEvent(nodes[2].path, EV_OBJECT, "StateChanged", "focused", 1, 0, .none);
-    // `focus:` is deprecated in favour of state-changed:focused, and Orca still
-    // listens for it. Emitting both is what real toolkits do.
-    emitEvent(nodes[2].path, EV_FOCUS, "Focus", "", 0, 0, .none);
+    // NOT emitted, and this corrects an earlier assumption in this file. The
+    // deprecated `focus:` event was emitted here on the belief that Orca still
+    // listens for it. It does not: GetRegisteredEvents with Orca running
+    // returns 39 listeners and `Focus:` is not among them -- only
+    // `Object:StateChanged:Focused`. Emitting it would be traffic to nobody.
+    // (at-spi2-core 2.60.4, Orca as shipped with GNOME on Ubuntu 26.04.)
+    //
+    //   emitEvent(nodes[2].path, EV_FOCUS, "Focus", "", 0, 0, .none);
 
     live_len = 0;
     liveSync();
@@ -999,7 +1129,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // re-registering paths as elements come and go would be pure overhead.
     var vtable = std.mem.zeroes(c.DBusObjectPathVTable);
     vtable.message_function = onMessage;
-    if (c.dbus_connection_register_fallback(conn, "/org/a11y/atspi/accessible", &vtable, null) == 0) {
+    // Registered on /org/a11y/atspi rather than /org/a11y/atspi/accessible, so
+    // the same handler also receives the cache path, which is a sibling of the
+    // accessible subtree and not under it.
+    if (c.dbus_connection_register_fallback(conn, "/org/a11y/atspi", &vtable, null) == 0) {
         return error.RegisterPathFailed;
     }
 
