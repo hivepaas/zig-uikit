@@ -56,18 +56,23 @@ pub const Editable = struct {
     label: Index,
     /// Behind the text, so it is created before the label.
     selection: Overlay,
-    caret: Overlay,
     /// Under the provisional text while an input method is composing, and
-    /// zero-width otherwise.
+    /// zero-width otherwise. `docs/text-and-accessibility.md` §2 says
+    /// provisional text is drawn differently and is part of the laid-out
+    /// line, which is what a byte range over one shaped run buys.
     underline: Overlay,
+    caret: Overlay,
     run_h: f32,
 };
 pub var editable: ?Editable = null;
 
-/// What the editable field starts out holding. Chosen so that the field is
-/// interesting before anyone types: multi-byte characters, a word boundary
-/// that an ASCII word-scan would get wrong, and a colon to step over.
-pub const editable_initial = "Gõ vào đây: tiếng Việt";
+/// What the editable field starts out holding.
+///
+/// Chosen so that the field is interesting before anyone types: multi-byte
+/// characters, a word boundary an ASCII word-scan would get wrong, and a colon
+/// to step over. It ends on a space so that a composition started at the caret
+/// reads as a new word rather than running into the last one.
+pub const editable_initial = "Gõ vào đây: tiếng ";
 
 pub const caret_color = Color.white;
 pub const selection_color = Color.hex(0x2F4B8F);
@@ -79,25 +84,53 @@ pub const selection_color = Color.hex(0x2F4B8F);
 /// here rather than in `window_demo.zig` so that the software demo and the GPU
 /// demo can call it too, and so that the cost is measured in one place.
 ///
-/// Provisional text is underlined from `doc.composing`: the shape a Mac or
-/// Windows input method produces, where the marked text is in the document.
-/// A Wayland preedit is not shown here yet, because nothing feeds one to this
-/// field; when something does, this shapes `displayText` instead.
-pub fn refreshEditable(t: *Tree, fonts: *Fonts, doc: *const ui.Document) !void {
+/// Provisional text is underlined whichever shape it arrives in.
+/// `displayText` returns the document unchanged on macOS and Windows, where
+/// the input method has already written into it, and the document with the
+/// Wayland preedit spliced in at the caret otherwise -- with the provisional
+/// byte range either way. Nothing below learns which protocol it is talking
+/// to, which is the whole reason that function exists.
+pub fn refreshEditable(
+    t: *Tree,
+    fonts: *Fonts,
+    doc: *const ui.Document,
+    scratch: *std.ArrayList(u8),
+) !void {
     const e = editable orelse return;
-    const run = try fonts.ui.shape(&fonts.atlas, doc.text());
-    const sel = doc.selection();
-    const r = run.rangeRect(sel.start, sel.end);
-    try moveOverlay(t, e.selection, r.x, r.w);
-    try moveOverlay(t, e.caret, run.caretX(doc.focus), 1);
-    if (doc.composing) |c| {
-        const u = run.rangeRect(c.start, c.end);
+
+    const shown = try doc.displayText(scratch);
+    const run = try fonts.ui.shape(&fonts.atlas, shown.text);
+
+    // The selection's offsets index the document. When a Wayland preedit has
+    // been spliced into the laid-out line they no longer index *it*, so the
+    // highlight is dropped rather than drawn over the wrong bytes. Nothing is
+    // spliced in the macOS and Windows shape -- the provisional text is in the
+    // document already -- so there the selection stays.
+    if (doc.preedit.items.len > 0) {
+        try moveOverlay(t, e.selection, 0, 0);
+    } else {
+        const sel = doc.selection();
+        const r = run.rangeRect(sel.start, sel.end);
+        try moveOverlay(t, e.selection, r.x, r.w);
+    }
+
+    if (shown.composing) |cmp| {
+        const u = run.rangeRect(cmp.start, cmp.end);
         try moveOverlay(t, e.underline, u.x, u.w);
     } else {
         try moveOverlay(t, e.underline, 0, 0);
     }
+
+    // Null when the input method asked for no caret while its candidate list
+    // is up. A zero-width quad is culled, so that needs no other special case.
+    if (doc.displayCaret()) |at| {
+        try moveOverlay(t, e.caret, run.caretX(at), 1);
+    } else {
+        try moveOverlay(t, e.caret, 0, 0);
+    }
+
     // Last, because it copies the run out of the font's scratch buffer and the
-    // two calls above read it.
+    // calls above read it.
     try t.setText(e.label, run);
 }
 
@@ -543,28 +576,28 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
         // `refreshEditable` when something changed. Nothing about the
         // keyboard reaches this file.
         //
-        // On a Mac an input method is attached to it, through
-        // `NSTextInputClient`, and provisional text in it is underlined by
-        // `refreshEditable`. On Wayland what arrives is still raw keystrokes:
-        // `zwp_text_input_v3` is the next slice there, and the row above
-        // stands in for composition until it lands.
-        _ = try label(t, content, ui_font, atlas, "Gõ được thật — bàn phím, xkb, và Document:", dim);
+        // An input method is attached on both platforms now, through
+        // `NSTextInputClient` on a Mac and `zwp_text_input_v3` on Wayland,
+        // and provisional text in it is underlined by `refreshEditable`.
+        // The two protocols disagree about where that text lives and this
+        // file never finds out which one it is drawing.
+        _ = try label(t, content, ui_font, atlas, "Gõ được thật — bàn phím, bộ gõ, và Document:", dim);
 
         const field = try textField(t, content);
         if (ui_font) |f| {
             const run = try f.shape(atlas.?, editable_initial);
             const h = run.height();
             const sel = try overlayParts(t, field, 0, 0, 0, h, h, selection_color);
-            const caret = try overlayParts(t, field, run.width, 0, 1, h, h, caret_color);
             // The same place and thickness as the composition row above.
             const under = try overlayParts(t, field, 0, run.ascent + 2, 0, 1, h, accent);
+            const caret = try overlayParts(t, field, run.width, 0, 1, h, h, caret_color);
             const lbl = try label(t, field, ui_font, atlas, editable_initial, Color.white);
             editable = .{
                 .field = field,
                 .label = lbl,
                 .selection = sel,
-                .caret = caret,
                 .underline = under,
+                .caret = caret,
                 .run_h = h,
             };
         } else {

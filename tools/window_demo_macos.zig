@@ -280,6 +280,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Mac's text system edits it directly.
     var doc = ui.Document.init(gpa);
     defer doc.deinit();
+
+    // Scratch for `displayText`, which the field now shapes instead of the
+    // document's own bytes. On this platform nothing is ever spliced -- marked
+    // text is written into the document -- so this stays empty here and is
+    // used on Wayland, where the preedit is not in the document. One call for
+    // both shapes is the point of that function.
+    var shown: std.ArrayList(u8) = .empty;
+    defer shown.deinit(gpa);
     _ = try doc.insert(.application, demo.editable_initial);
     win.setTextTarget(.{ .doc = &doc, .rect = rangeRect, .ctx = &t });
     defer win.setTextTarget(null);
@@ -375,7 +383,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 t.deinit();
                 t = try ui.Tree.init(gpa);
                 try demo.buildUi(&t, &fonts);
-                try demo.refreshEditable(&t, &fonts, &doc);
+                try demo.refreshEditable(&t, &fonts, &doc, &shown);
                 try renderer.setAtlas(fonts.atlas.view());
                 atlas_gen = fonts.atlas.generation;
                 scene.setPixelScale(win.scale);
@@ -417,7 +425,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
         if (win.text_changed) {
             win.text_changed = false;
-            demo.refreshEditable(&t, &fonts, &doc) catch |e| switch (e) {
+            demo.refreshEditable(&t, &fonts, &doc, &shown) catch |e| switch (e) {
                 error.AtlasFull => std.debug.print("atlas full -- text stopped updating\n", .{}),
                 else => return e,
             };

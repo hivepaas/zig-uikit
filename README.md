@@ -4,16 +4,16 @@ A declarative GPU UI toolkit for Zig.
 
 > **Status: pre-alpha.** The layout core, the scene layer, a Vulkan renderer
 > with a Wayland window, a Metal renderer with a macOS window, a shaped-text
-> stack and a keyboard that types into a document exist and are tested. Both
-> backends draw text; the keyboard is Wayland-only.
+> stack, a keyboard and a Wayland input method that both type into one document
+> exist and are tested. Both backends draw text; input is Wayland-only.
 > There are no widgets. Expect the API to change without notice.
 
 ```sh
-zig build test                           # 113 tests, no platform dependencies
+zig build test                           # 127 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
 zig build test-text                      # 15 tests, needs a font installed
-zig build test-input                     # 7 tests, needs xkbcommon and a layout
+zig build test-input                     # 14 tests, needs xkbcommon and a layout
 zig build test-gpu                       # Vulkan: 7 tests; Metal: 11 tests
 zig build gpu-demo                       # renders on the GPU, diffs against the reference
 zig build window                         # opens a window and renders into it
@@ -407,10 +407,14 @@ backspace, which deletes a character rather than a byte for the same reason.
 
 The second field in the demo is that document, with a Telex composition caught
 mid-word: `tiếng Vi` committed, `ệt` provisional and underlined, the caret after
-it. All four spikes could compose text and none could draw it; this is the
+it. All four spikes could compose text and none could draw it; this was the
 first picture of it. The image is a 3× nearest-neighbour crop written by
 `zig build demo` from the same framebuffer as the screenshot above, because a
 one-pixel underline in a 900×560 image is a claim nobody can check.
+
+That row is a still life: the document is built by hand and nothing drives it.
+The third field is the same thing with `zwp_text_input_v3` attached, and it is
+further down.
 
 ### Text on Metal
 
@@ -485,11 +489,17 @@ piece of work on top of it rather than something to half-do inside it.
 
 Of the eight requirements in
 [docs/text-and-accessibility.md](docs/text-and-accessibility.md), §1 (unit
-conversion), §2 (the provisional range) and §6 (the edit guard) now exist, and
-§7 exists in run coordinates. What does not: converting a caret rectangle from
-run coordinates to *screen* coordinates, which needs the window to say where it
-is; and the adapters themselves, which is where §3, §4, §5 and §8 live. The
-keyboard now drives the document — see below — but no input method does yet.
+conversion), §2 (the provisional range), §6 (the edit guard) and §7 (cursor
+geometry) now exist, and §3 exists on Wayland. What does not: §4 and §5, the
+accessibility adapters, and §8; and §3 on the other two platforms.
+
+**One thing §7 said that turned out to be wrong.** This README claimed the
+caret rectangle still needed converting to *screen* coordinates, and that this
+needed the window to say where it is. Not for Wayland:
+`set_cursor_rectangle` is **surface-local**, so the rectangle the element tree
+already produces is the one to send. Screen coordinates are what UIA and AT-SPI
+want, and that is a statement about those two protocols rather than about the
+caret.
 
 ## The keyboard
 
@@ -627,17 +637,132 @@ hiding it.
 
 ### What the keyboard does not do yet
 
-`zwp_text_input_v3` is not attached to this document, so the field takes raw
-keystrokes and no input method — Vietnamese goes in through the keymap or not
-at all, and the composition row above it is still a still life rather than a
-live preedit. That is the next slice, and spike B is the working reference for
-it. Nothing here sends a `set_cursor_rectangle` either, which needs the caret
-rectangle converted from run coordinates to screen coordinates, which needs the
-window to say where it is.
-
 On macOS the platform half is written again, as this section predicted, and
 `keys.zig` and `editing.zig` were reused — with one change to `editing.zig`
-that the Mac forced; see "The keyboard and an input method on macOS".
+that the Mac forced; see "The keyboard and an input method on macOS". Both
+platforms now also have an input method attached to the same document; the
+Wayland one is below and the Mac one is further down still.
+
+## The input method
+
+`zwp_text_input_v3` is how a Wayland client talks to an input method, and it is
+the protocol `docs/native-vs-drawn.md` says the whole argument for drawing our
+own widgets stands or falls on. Spike B wrote it against ibus-bamboo first,
+precisely so that this could be written from a log rather than from the
+specification.
+
+![a composition in progress in the editable field: "Vie" underlined at the caret](docs/demo-preedit.png)
+
+That is the frame the compositor was handed, magnified 3×, with a composition
+live in the field: `Gõ vào đây: tiếng ` is the document, `Vie` is a preedit
+that **is not in it**, underlined because §2 says provisional text is drawn
+differently, and the caret is inside the preedit where the input method asked
+for it. A few frames later the composition commits and the keyboard types into
+the same document:
+
+![the same field after the composition committed and the keyboard typed into it](docs/demo-typing.png)
+
+### Double-buffered in both directions, and the trap is in one predicate
+
+Requests do nothing until `commit`; events do nothing until `done`. Five of the
+six events only accumulate pending state, and applying each one as it arrives
+is the bug that produces flicker and doubled characters during composition —
+an input method rewrites its preedit several times per keystroke, and the user
+never asked to see the intermediate states.
+
+The order on `done` is fixed by the protocol and is not arbitrary:
+
+1. drop the old preedit
+2. delete the surrounding text
+3. insert the commit string
+4. recompute the surrounding text
+5. install the new preedit
+
+Doing the delete *after* the insert is what makes Telex eat the wrong
+character, because ibus-bamboo asks to delete what is already committed before
+committing its replacement. `a` + `delete(1)` + `commit("ă")` has to leave `ă`
+and nothing else, and `ă` is two bytes where `a` is one.
+
+**And then there is the resync.** The natural reading of "the document changed,
+so tell the input method" is to call `set_surrounding_text` from the `done`
+handler. Our commit makes the compositor emit another `done`, which resyncs
+again: spike B's first version spun at full speed on an empty document. So the
+whole rule is one predicate, which exists as a named function because it is the
+thing that must not be got wrong:
+
+```zig
+pub fn shouldResync(r: ui.input_method.Result, stale: bool) bool {
+    return r.document_changed and !stale;
+}
+```
+
+A preedit is not part of surrounding text, so a preedit change has nothing new
+to say. A stale `done` — one whose serial is not our commit count — describes a
+state we have already moved past, and answering it races a commit already in
+flight that will produce its own `done`. It terminates because the `done` our
+own resync provokes carries no changes, and a test asserts exactly that rather
+than leaving it to reasoning.
+
+That rule lives in the window, not in the application, which is the one place
+the usual split is broken on purpose. Everything else here produces plain data
+for core to act on; this does not, because a rule each application has to
+re-derive is a rule each application gets wrong once.
+
+### Bytes, and the half of this that typing cannot reach
+
+`delete_surrounding_text` counts **bytes**. An implementation that treats them
+as characters passes every ASCII test and corrupts text the moment a diacritic
+appears. The counts come from another process, so they are aligned to character
+boundaries rather than trusted — a buffer holding half of `ế` is not UTF-8, and
+everything downstream, shaping included, is then decoding garbage.
+
+This project snaps **outward**, to the whole character, where spike B snapped
+inward and deleted nothing. An input method sending a split count has miscounted
+bytes for characters, so it believes a character is gone; deleting nothing
+leaves its idea of the document permanently ahead of the real one and every
+later offset it sends is wrong. Deleting the character it meant costs at most
+two bytes more than it asked for and keeps the two in step.
+
+None of that is reachable by typing. ibus-bamboo's default input mode keeps the
+whole syllable in the preedit and commits only the finished result, so it sends
+`delete_surrounding_text` **zero** times — spike B typed an entire session and
+never reached the more dangerous of its two hazards. So the protocol's state
+machine is split from the socket: `Pending` and `shouldResync` hold it, with no
+Wayland objects in them, and `zig build test-input` drives them the way a
+compositor would. Fourteen tests, no compositor, no seat.
+
+### Surrounding text never carries the preedit
+
+Sending it back is what produces doubled characters that only appear
+mid-composition: the input method sees its own uncommitted text returned as
+context. `ui.input_method.surrounding` reads the document and only the
+document, and windows it to 2 000 bytes around the cursor because a Wayland
+message cannot exceed 4 096 — snapped outward to character boundaries, with
+the anchor clamped into the window when a long selection is open, since an
+offset past the end of the text that was sent is not representable at all.
+
+### What ran, and what did not
+
+| | |
+| --- | --- |
+| `zwp_text_input_manager_v3` present | yes |
+| text-input focus gained | 1 |
+| `done` events received | 29 |
+| stale serials | 0 |
+| `preedit_string` / `commit_string` from a real input method | **0** |
+
+The first four say the request path is live: `enable`, `set_surrounding_text`,
+`set_cursor_rectangle` and `commit` all went out, the compositor answered
+twenty-nine times, and every serial matched. The last row is the limit. Driving
+a real composition needs a person typing — `--type` pushes its keystrokes
+straight into the client's own queue, so they never reach the compositor and
+never reach ibus — and this session had no way to do that. What the composition
+in the picture above exercises is `ui.input_method.apply` and everything above
+it, which is the same function `done` calls; what it does not exercise is the
+compositor and ibus-bamboo themselves.
+
+`ibus engine` reports `Bamboo` on this machine, so trying it is one command:
+`zig build window`, click into the third field, and type `tieengs`.
 
 ## The Vulkan backend
 

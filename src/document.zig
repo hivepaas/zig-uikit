@@ -135,6 +135,16 @@ pub const Document = struct {
     /// Windows, always. Displayed at the caret by `displayText`.
     preedit: std.ArrayList(u8) = .empty,
 
+    /// Where the caret goes *inside* the preedit, as a byte range within
+    /// `preedit` itself -- not within the document.
+    ///
+    /// Null means the input method asked for no caret, which
+    /// `zwp_text_input_v3` spells as a begin of -1. That is a real request and
+    /// not an absence: an input method showing a candidate list often wants
+    /// the caret hidden while the list is up, and a field that drew one anyway
+    /// would be showing a caret the user cannot move.
+    preedit_cursor: ?Range = null,
+
     /// True between `OnStartComposition` and `OnEndComposition`, or between the
     /// first non-empty preedit and the commit. Separate from `composing` being
     /// non-null because Wayland is composing with no range.
@@ -282,6 +292,21 @@ pub const Document = struct {
         self.preedit.clearRetainingCapacity();
         try self.preedit.appendSlice(self.gpa, s);
         self.composition_active = s.len > 0;
+        // Cleared rather than kept: the old caret position was an offset into
+        // the old preedit, and carrying it over would point into a different
+        // string. The input method sends a new one in the same event when it
+        // wants one.
+        self.preedit_cursor = null;
+    }
+
+    /// The caret position the input method asked for inside the preedit, in
+    /// bytes within the preedit string. Aligned rather than trusted, for the
+    /// same reason `deleteSurrounding` aligns its counts.
+    pub fn setPreeditCursor(self: *Document, begin: usize, end: usize) void {
+        const s = self.preedit.items;
+        const b = offsets.alignToChar(s, @min(begin, s.len));
+        const e = offsets.alignToChar(s, @min(@max(end, b), s.len));
+        self.preedit_cursor = .{ .start = b, .end = e };
     }
 
     /// `OnEndComposition`, or a Wayland `commit_string` having been applied.
@@ -289,6 +314,7 @@ pub const Document = struct {
     pub fn endComposition(self: *Document) void {
         self.composing = null;
         self.preedit.clearRetainingCapacity();
+        self.preedit_cursor = null;
         self.composition_active = false;
     }
 
@@ -319,6 +345,19 @@ pub const Document = struct {
             .text = scratch.items,
             .composing = .{ .start = at, .end = at + self.preedit.items.len },
         };
+    }
+
+    /// Where to draw the caret in the string `displayText` returned.
+    ///
+    /// Null when an input method asked for no caret. With no preedit this is
+    /// the ordinary caret; with one it is the position the input method chose
+    /// inside it, which is not always the end -- an input method that lets you
+    /// edit the preedit puts it in the middle.
+    pub fn displayCaret(self: *const Document) ?usize {
+        const at = self.selection().start;
+        if (self.preedit.items.len == 0) return at;
+        const pc = self.preedit_cursor orelse return null;
+        return at + pc.start;
     }
 
     // ------------------------------------------------------------ selection

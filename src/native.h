@@ -12,6 +12,7 @@
 // than keeping two parallel surface types in step.
 #include <wayland-client.h>
 #include "xdg-shell-client-protocol.h"
+#include "text-input-unstable-v3-client-protocol.h"
 
 // The keymap a compositor sends is a string in xkb's own text format, and
 // turning a keycode into a character means compiling it. There is no way to

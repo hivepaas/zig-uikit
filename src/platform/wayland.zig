@@ -1,5 +1,5 @@
-//! A Wayland window: `xdg_shell` surface, configure handling, the pointer and
-//! the keyboard.
+//! A Wayland window: `xdg_shell` surface, configure handling, the pointer, the
+//! keyboard and the input method.
 //!
 //! Heap-allocated and returned by pointer, which is not a style choice. Every
 //! Wayland listener is given a `void *` that it keeps for the life of the
@@ -77,6 +77,70 @@ pub const Window = struct {
     layout_buf: [64]u8 = @splat(0),
     layout_len: u8 = 0,
 
+    // --- the input method ---
+    //
+    // `zwp_text_input_v3` is double-buffered in both directions. Requests do
+    // nothing until `commit`; events do nothing until `done`. Everything
+    // below with `pend_` in its name is state the compositor has sent that
+    // must not be applied yet, and applying each event as it arrives is the
+    // bug that produces flicker and doubled characters mid-composition.
+    ti_manager: ?*c.struct_zwp_text_input_manager_v3 = null,
+    text_input: ?*c.struct_zwp_text_input_v3 = null,
+
+    /// The document that has text-input focus.
+    ///
+    /// A pointer and not a queue of events, unlike the keyboard, because this
+    /// is what the protocol itself models: `zwp_text_input_v3` is per-seat and
+    /// refers to whichever field is focused. It also puts the resync rule
+    /// below somewhere it cannot be got wrong once per application.
+    ime_doc: ?*ui.Document = null,
+    /// Whether the compositor has given this surface text-input focus.
+    ti_entered: bool = false,
+    ime_enabled: bool = false,
+
+    /// Commits issued so far. `done` carries the one the compositor saw, and a
+    /// mismatch means a commit of ours is still in flight.
+    ime_serial: u32 = 0,
+    stale_dones: u32 = 0,
+
+    pending: Pending = .{},
+
+    /// Resyncs this window decided to send. Counted because the decision is
+    /// the protocol trap: too many is an infinite loop, too few is an input
+    /// method working from a document that no longer exists.
+    ime_resyncs: u32 = 0,
+    /// How many times this surface was given text-input focus. Zero at exit
+    /// means the input method never saw the field at all, which looks exactly
+    /// like a broken implementation and is usually a window that was never
+    /// focused.
+    ime_enters: u32 = 0,
+
+    /// One counter per event the input method sends, in the same shape spike B
+    /// printed on exit. They are how a session that produced nothing is told
+    /// apart from one the protocol never reached: `done` arriving at all means
+    /// the requests went out and the compositor answered, and a preedit count
+    /// of zero after typing means the input method is not engaged.
+    ime_events: Counters = .{},
+
+    /// Set when a `done` changed the document or the preedit; the application
+    /// clears it with `takeImeDirty`.
+    ime_dirty: bool = false,
+    /// The first failure applying a `done`. A libwayland callback has nowhere
+    /// to return an error to, so it is kept here instead of swallowed.
+    ime_error: ?anyerror = null,
+
+    /// The caret, in **surface** coordinates.
+    ///
+    /// Surface and not screen, which is worth saying because the other three
+    /// protocols this toolkit has to answer want screen coordinates and this
+    /// one does not. `set_cursor_rectangle` is surface-local, so placing a
+    /// candidate window correctly needs the text layout and nothing from the
+    /// compositor about where the window is.
+    ime_caret: ui.Rect = .{},
+    /// A NUL-terminated copy of the surrounding text, because the protocol
+    /// takes a C string and the document is a slice.
+    surround_z: std.ArrayList(u8) = .empty,
+
     surface: ?*c.struct_wl_surface = null,
     xdg_surface: ?*c.struct_xdg_surface = null,
     toplevel: ?*c.struct_xdg_toplevel = null,
@@ -117,6 +181,17 @@ pub const Window = struct {
 
         if (self.compositor == null or self.wm_base == null) return Error.MissingGlobal;
 
+        // Both globals are known by now, which is why this is here and not in
+        // the registry handler: a text input is created from the manager *and*
+        // the seat, and the two arrive in whichever order the compositor
+        // chooses to advertise them.
+        if (self.ti_manager) |mgr| {
+            if (self.seat) |seat| {
+                self.text_input = c.zwp_text_input_manager_v3_get_text_input(mgr, seat);
+                _ = c.zwp_text_input_v3_add_listener(self.text_input, &text_input_listener, self);
+            }
+        }
+
         self.surface = c.wl_compositor_create_surface(self.compositor) orelse return Error.SurfaceFailed;
         self.xdg_surface = c.xdg_wm_base_get_xdg_surface(self.wm_base, self.surface) orelse
             return Error.SurfaceFailed;
@@ -147,6 +222,10 @@ pub const Window = struct {
         if (self.surface) |s| c.wl_surface_destroy(s);
         if (self.pointer) |p| c.wl_pointer_destroy(p);
         if (self.keyboard) |k| c.wl_keyboard_release(k);
+        if (self.text_input) |t| c.zwp_text_input_v3_destroy(t);
+        if (self.ti_manager) |m| c.zwp_text_input_manager_v3_destroy(m);
+        self.pending.deinit(self.gpa);
+        self.surround_z.deinit(self.gpa);
         if (self.xkb_state) |x| c.xkb_state_unref(x);
         if (self.xkb_keymap) |k| c.xkb_keymap_unref(k);
         if (self.xkb_ctx) |x| c.xkb_context_unref(x);
@@ -224,7 +303,208 @@ pub const Window = struct {
     pub fn layoutName(self: *const Window) []const u8 {
         return self.layout_buf[0..self.layout_len];
     }
+
+    // ------------------------------------------------------- input method
+
+    /// Whether the compositor offers `zwp_text_input_manager_v3` at all.
+    ///
+    /// Worth asking before anything else: when it is absent, no client on that
+    /// compositor can talk to an input method, and a text field that silently
+    /// took raw keystrokes instead would look like a bug in this toolkit.
+    pub fn hasInputMethod(self: *const Window) bool {
+        return self.text_input != null;
+    }
+
+    /// Gives a document text-input focus, or takes it away.
+    ///
+    /// The document is borrowed for as long as it is focused, and the
+    /// compositor may write into it from inside `pump`.
+    pub fn focusTextInput(self: *Window, doc: ?*ui.Document) void {
+        if (self.ime_doc == doc) return;
+        self.ime_doc = doc;
+        if (doc == null) self.disableTextInput() else self.enableTextInput();
+    }
+
+    /// Where the caret is, in surface coordinates, so the input method can put
+    /// its candidate window beside it instead of at the window's origin --
+    /// which is what all four spikes did, because none of them had a text
+    /// layout to ask.
+    ///
+    /// Stored rather than sent: it goes out with the next state update, and
+    /// every edit sends one.
+    pub fn setCaretRect(self: *Window, r: ui.Rect) void {
+        self.ime_caret = r;
+    }
+
+    /// Called after the *application* changed the focused document -- a
+    /// keystroke, a click that moved the caret, a paste.
+    ///
+    /// The input method has to be told, because its next offsets are relative
+    /// to text it believes is there. The change cause distinguishes this from
+    /// the input method's own edits, which are not news to it.
+    pub fn notifyTextChanged(self: *Window) void {
+        self.sendState(.other);
+    }
+
+    /// Whether a `done` changed the focused document since this was last
+    /// asked, and clears the flag.
+    pub fn takeImeDirty(self: *Window) bool {
+        defer self.ime_dirty = false;
+        return self.ime_dirty;
+    }
+
+    fn enableTextInput(self: *Window) void {
+        const ti = self.text_input orelse return;
+        if (self.ime_enabled or !self.ti_entered or self.ime_doc == null) return;
+        c.zwp_text_input_v3_enable(ti);
+        c.zwp_text_input_v3_set_content_type(
+            ti,
+            c.ZWP_TEXT_INPUT_V3_CONTENT_HINT_NONE,
+            c.ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_NORMAL,
+        );
+        self.ime_enabled = true;
+        // `enable` does nothing until a commit, and `sendState` ends with one.
+        self.sendState(.other);
+    }
+
+    fn disableTextInput(self: *Window) void {
+        const ti = self.text_input orelse return;
+        if (!self.ime_enabled) return;
+        c.zwp_text_input_v3_disable(ti);
+        c.zwp_text_input_v3_commit(ti);
+        self.ime_serial += 1;
+        self.ime_enabled = false;
+    }
+
+    /// Sends the whole state the protocol wants and commits it.
+    ///
+    /// All of it every time, because the requests are a double-buffered set
+    /// rather than a stream of deltas: a commit replaces the pending state
+    /// with what was sent since the last one, so a request left out is a
+    /// request that reverts.
+    fn sendState(self: *Window, cause: ui.input_method.ChangeCause) void {
+        const ti = self.text_input orelse return;
+        if (!self.ime_enabled) return;
+        const doc = self.ime_doc orelse return;
+
+        const s = ui.input_method.surrounding(doc, ui.input_method.max_surrounding);
+        self.surround_z.clearRetainingCapacity();
+        self.surround_z.appendSlice(self.gpa, s.text) catch {
+            self.ime_error = error.OutOfMemory;
+            return;
+        };
+        self.surround_z.append(self.gpa, 0) catch {
+            self.ime_error = error.OutOfMemory;
+            return;
+        };
+
+        c.zwp_text_input_v3_set_surrounding_text(
+            ti,
+            @ptrCast(self.surround_z.items.ptr),
+            @intCast(s.cursor),
+            @intCast(s.anchor),
+        );
+        c.zwp_text_input_v3_set_text_change_cause(ti, switch (cause) {
+            .input_method => c.ZWP_TEXT_INPUT_V3_CHANGE_CAUSE_INPUT_METHOD,
+            .other => c.ZWP_TEXT_INPUT_V3_CHANGE_CAUSE_OTHER,
+        });
+        c.zwp_text_input_v3_set_cursor_rectangle(
+            ti,
+            @intFromFloat(self.ime_caret.x),
+            @intFromFloat(self.ime_caret.y),
+            @intFromFloat(@max(1, self.ime_caret.w)),
+            @intFromFloat(@max(1, self.ime_caret.h)),
+        );
+        c.zwp_text_input_v3_commit(ti);
+        self.ime_serial += 1;
+    }
 };
+
+/// The double-buffered half of `zwp_text_input_v3`, with no Wayland objects in
+/// it.
+///
+/// Separate from `Window` so the protocol's state machine can be driven by a
+/// test: the five events below do nothing but fill this in, and `done` turns
+/// it into one `Change`. What is left in the listeners is the part that calls
+/// libwayland, which a test could not reach anyway.
+pub const Pending = struct {
+    commit: std.ArrayList(u8) = .empty,
+    preedit: std.ArrayList(u8) = .empty,
+    has_commit: bool = false,
+    has_preedit: bool = false,
+    cursor: ?ui.Range = null,
+    delete_before: u32 = 0,
+    delete_after: u32 = 0,
+    /// An allocation that failed inside a callback with nowhere to return to.
+    failed: bool = false,
+
+    pub fn deinit(self: *Pending, gpa: Allocator) void {
+        self.commit.deinit(gpa);
+        self.preedit.deinit(gpa);
+    }
+
+    pub fn setCommit(self: *Pending, gpa: Allocator, text: []const u8) void {
+        self.has_commit = true;
+        self.commit.clearRetainingCapacity();
+        self.commit.appendSlice(gpa, text) catch {
+            self.failed = true;
+        };
+    }
+
+    pub fn setPreedit(self: *Pending, gpa: Allocator, text: []const u8, begin: i32, end: i32) void {
+        self.has_preedit = true;
+        self.preedit.clearRetainingCapacity();
+        self.preedit.appendSlice(gpa, text) catch {
+            self.failed = true;
+        };
+        // -1 is the protocol's "draw no cursor", which is a request and not an
+        // absence: an input method showing a candidate list often wants the
+        // caret hidden while the list is up.
+        self.cursor = if (begin < 0) null else .{
+            .start = @intCast(begin),
+            .end = @intCast(@max(end, begin)),
+        };
+    }
+
+    pub fn change(self: *const Pending) ui.input_method.Change {
+        return .{
+            .delete_before = self.delete_before,
+            .delete_after = self.delete_after,
+            .commit = if (self.has_commit) self.commit.items else null,
+            .preedit = if (self.has_preedit) self.preedit.items else null,
+            .preedit_cursor = self.cursor,
+        };
+    }
+
+    pub fn reset(self: *Pending) void {
+        self.commit.clearRetainingCapacity();
+        self.preedit.clearRetainingCapacity();
+        self.has_commit = false;
+        self.has_preedit = false;
+        self.cursor = null;
+        self.delete_before = 0;
+        self.delete_after = 0;
+    }
+};
+
+pub const Counters = struct {
+    done: u32 = 0,
+    preedit: u32 = 0,
+    commit: u32 = 0,
+    delete: u32 = 0,
+};
+
+/// Whether a `done` should be answered with fresh state.
+///
+/// **This one predicate is the protocol trap.** Returning true for a preedit
+/// change is an infinite loop: the resync is a commit, the commit makes the
+/// compositor send another `done`, and that `done` would resync again. Spike B
+/// spun at full speed on an empty document before this rule existed. Returning
+/// true for a stale `done` races a commit that is already in flight and will
+/// produce its own `done` with the current serial.
+pub fn shouldResync(r: ui.input_method.Result, stale: bool) bool {
+    return r.document_changed and !stale;
+}
 
 fn nowNs() u64 {
     var ts: std.os.linux.timespec = undefined;
@@ -249,6 +529,11 @@ fn regGlobal(
     } else if (std.mem.eql(u8, s, "xdg_wm_base")) {
         self.wm_base = @ptrCast(c.wl_registry_bind(reg, name, &c.xdg_wm_base_interface, 1));
         _ = c.xdg_wm_base_add_listener(self.wm_base, &wm_base_listener, self);
+    } else if (std.mem.eql(u8, s, "zwp_text_input_manager_v3")) {
+        // Absent on a compositor with no input-method support, which is worth
+        // reporting rather than crashing on: it means Wayland IME is
+        // impossible for *any* client there, not just this one.
+        self.ti_manager = @ptrCast(c.wl_registry_bind(reg, name, &c.zwp_text_input_manager_v3_interface, 1));
     } else if (std.mem.eql(u8, s, "wl_seat")) {
         // Version 5: enough for scroll frames, and short of the events that
         // only exist from version 8, which this listener does not handle.
@@ -654,6 +939,119 @@ const keyboard_listener: c.struct_wl_keyboard_listener = .{
     .repeat_info = kbRepeatInfo,
 };
 
+// -------------------------------------------------------------- input method
+//
+// Six events, and only one of them does anything: `done`. The other five
+// accumulate pending state. That is the protocol's own shape, and the reason
+// it has that shape is composition -- an input method rewrites its preedit
+// several times per keystroke, and a client that redrew on each event would
+// flicker through states the user never asked to see.
+
+fn tiEnter(
+    data: ?*anyopaque,
+    _: ?*c.struct_zwp_text_input_v3,
+    surface: ?*c.struct_wl_surface,
+) callconv(.c) void {
+    const self: *Window = @ptrCast(@alignCast(data.?));
+    if (surface != self.surface) return;
+    self.ti_entered = true;
+    self.ime_enters += 1;
+    self.enableTextInput();
+}
+
+fn tiLeave(
+    data: ?*anyopaque,
+    _: ?*c.struct_zwp_text_input_v3,
+    _: ?*c.struct_wl_surface,
+) callconv(.c) void {
+    const self: *Window = @ptrCast(@alignCast(data.?));
+    self.ti_entered = false;
+    self.ime_enabled = false;
+    self.pending.reset();
+    // A composition in progress is over, and its preedit was never in the
+    // document. Leaving it on screen would draw text that nothing can commit
+    // and that the next keystroke would have to interleave with.
+    if (self.ime_doc) |doc| {
+        if (doc.composition_active) {
+            doc.endComposition();
+            self.ime_dirty = true;
+        }
+    }
+}
+
+fn tiPreedit(
+    data: ?*anyopaque,
+    _: ?*c.struct_zwp_text_input_v3,
+    text: [*c]const u8,
+    cursor_begin: i32,
+    cursor_end: i32,
+) callconv(.c) void {
+    const self: *Window = @ptrCast(@alignCast(data.?));
+    // A null string is the protocol's way of saying "no preedit", which is not
+    // the same as not sending the event at all.
+    const t: []const u8 = if (text) |p| std.mem.span(p) else "";
+    self.ime_events.preedit += 1;
+    self.pending.setPreedit(self.gpa, t, cursor_begin, cursor_end);
+}
+
+fn tiCommit(data: ?*anyopaque, _: ?*c.struct_zwp_text_input_v3, text: [*c]const u8) callconv(.c) void {
+    const self: *Window = @ptrCast(@alignCast(data.?));
+    const t: []const u8 = if (text) |p| std.mem.span(p) else "";
+    self.ime_events.commit += 1;
+    self.pending.setCommit(self.gpa, t);
+}
+
+fn tiDelete(
+    data: ?*anyopaque,
+    _: ?*c.struct_zwp_text_input_v3,
+    before: u32,
+    after: u32,
+) callconv(.c) void {
+    const self: *Window = @ptrCast(@alignCast(data.?));
+    self.ime_events.delete += 1;
+    self.pending.delete_before = before;
+    self.pending.delete_after = after;
+}
+
+fn tiDone(data: ?*anyopaque, _: ?*c.struct_zwp_text_input_v3, serial: u32) callconv(.c) void {
+    const self: *Window = @ptrCast(@alignCast(data.?));
+    defer self.pending.reset();
+    self.ime_events.done += 1;
+
+    // A `done` whose serial is not our commit count describes a state we have
+    // already moved past: a commit of ours is still in flight.
+    const stale = serial != self.ime_serial;
+    if (stale) self.stale_dones += 1;
+    if (self.pending.failed) {
+        self.ime_error = error.OutOfMemory;
+        self.pending.failed = false;
+        return;
+    }
+
+    const doc = self.ime_doc orelse return;
+    const r = ui.input_method.apply(doc, self.pending.change()) catch |e| {
+        self.ime_error = e;
+        return;
+    };
+    if (r.document_changed or r.preedit_changed) self.ime_dirty = true;
+
+    // The resync rule, which is in `shouldResync` so that a test can drive it
+    // without a compositor.
+    if (shouldResync(r, stale)) {
+        self.ime_resyncs += 1;
+        self.sendState(.input_method);
+    }
+}
+
+const text_input_listener: c.struct_zwp_text_input_v3_listener = .{
+    .enter = tiEnter,
+    .leave = tiLeave,
+    .preedit_string = tiPreedit,
+    .commit_string = tiCommit,
+    .delete_surrounding_text = tiDelete,
+    .done = tiDone,
+};
+
 // ---------------------------------------------------------------------- tests
 //
 // These need no compositor, no seat and no window. `xkbcommon` will compile a
@@ -847,4 +1245,151 @@ test "a keystroke goes through editing into a document" {
     km.release(KEY_LEFTCTRL);
     try testing.expect(!saved.handled);
     try testing.expectEqualStrings("A", doc.text());
+}
+
+// --------------------------------------------------- the input-method events
+//
+// `Pending` plus `shouldResync` is the whole protocol state machine with the
+// libwayland calls taken out, so these drive it the way a compositor would and
+// assert on the document that comes out. This is spike B's self test, which
+// exists because ibus-bamboo in its default input mode keeps a whole syllable
+// in the preedit and never sends `delete_surrounding_text` at all -- so no
+// amount of typing reaches the half of this that corrupts text when it is
+// wrong.
+
+/// One `done`: the pending state as the five events left it, applied.
+fn deliver(p: *Pending, doc: *ui.Document, stale: bool) !struct {
+    result: ui.input_method.Result,
+    resync: bool,
+} {
+    defer p.reset();
+    const r = try ui.input_method.apply(doc, p.change());
+    return .{ .result = r, .resync = shouldResync(r, stale) };
+}
+
+test "a preedit is accumulated and applied only on done" {
+    var p: Pending = .{};
+    defer p.deinit(testing.allocator);
+    var doc = ui.Document.init(testing.allocator);
+    defer doc.deinit();
+
+    // Three preedit events before a done, which is what an input method sends
+    // while a syllable is being built. Only the last survives.
+    p.setPreedit(testing.allocator, "a", 1, 1);
+    p.setPreedit(testing.allocator, "ă", 2, 2);
+    p.setPreedit(testing.allocator, "ắ", 3, 3);
+    try testing.expectEqualStrings("", doc.text());
+
+    const d = try deliver(&p, &doc, false);
+    try testing.expectEqualStrings("", doc.text());
+    try testing.expectEqualStrings("ắ", doc.preedit.items);
+    try testing.expect(d.result.preedit_changed);
+    try testing.expect(!d.resync);
+}
+
+test "a preedit change asks for no resync and a commit asks for exactly one" {
+    var p: Pending = .{};
+    defer p.deinit(testing.allocator);
+    var doc = ui.Document.init(testing.allocator);
+    defer doc.deinit();
+
+    p.setPreedit(testing.allocator, "tieengs", 7, 7);
+    try testing.expect(!(try deliver(&p, &doc, false)).resync);
+
+    p.setCommit(testing.allocator, "tiếng");
+    p.setPreedit(testing.allocator, "", -1, -1);
+    const d = try deliver(&p, &doc, false);
+    try testing.expect(d.resync);
+    try testing.expectEqualStrings("tiếng", doc.text());
+
+    // And the `done` that the resync's own commit provokes carries nothing,
+    // so it does not resync again. That is what makes the rule terminate
+    // rather than merely slow the loop down.
+    try testing.expect(!(try deliver(&p, &doc, false)).resync);
+}
+
+test "a stale done is applied but not answered" {
+    var p: Pending = .{};
+    defer p.deinit(testing.allocator);
+    var doc = ui.Document.init(testing.allocator);
+    defer doc.deinit();
+
+    p.setCommit(testing.allocator, "ắ");
+    const d = try deliver(&p, &doc, true);
+    try testing.expectEqualStrings("ắ", doc.text());
+    try testing.expect(d.result.document_changed);
+    // Applied, because the text is real; unanswered, because a commit of ours
+    // is already in flight and will produce its own `done`.
+    try testing.expect(!d.resync);
+}
+
+test "delete_surrounding_text and commit_string in one done are the Telex case" {
+    var p: Pending = .{};
+    defer p.deinit(testing.allocator);
+    var doc = ui.Document.init(testing.allocator);
+    defer doc.deinit();
+    _ = try doc.insert(.application, "a");
+
+    // bamboo input mode 2: delete what is already committed, then commit the
+    // replacement, in one `done`. One byte out, two bytes in.
+    p.delete_before = 1;
+    p.setCommit(testing.allocator, "ă");
+    _ = try deliver(&p, &doc, false);
+    try testing.expectEqualStrings("ă", doc.text());
+}
+
+test "a null string is an event that arrived carrying nothing" {
+    var p: Pending = .{};
+    defer p.deinit(testing.allocator);
+    var doc = ui.Document.init(testing.allocator);
+    defer doc.deinit();
+    _ = try doc.insert(.application, "x");
+
+    // `tiPreedit` turns a null pointer into an empty slice, which still means
+    // "there is a preedit event and it is empty" -- different from no event,
+    // and the difference is whether a live preedit gets cleared.
+    p.setPreedit(testing.allocator, "abc", 3, 3);
+    _ = try deliver(&p, &doc, false);
+    try testing.expectEqualStrings("abc", doc.preedit.items);
+
+    p.setPreedit(testing.allocator, "", -1, -1);
+    _ = try deliver(&p, &doc, false);
+    try testing.expectEqualStrings("", doc.preedit.items);
+    try testing.expect(!doc.composition_active);
+    try testing.expectEqualStrings("x", doc.text());
+}
+
+test "the preedit caret survives the round trip from the protocol's -1" {
+    var p: Pending = .{};
+    defer p.deinit(testing.allocator);
+    var doc = ui.Document.init(testing.allocator);
+    defer doc.deinit();
+
+    p.setPreedit(testing.allocator, "ếng", -1, -1);
+    _ = try deliver(&p, &doc, false);
+    try testing.expectEqual(@as(?usize, null), doc.displayCaret());
+
+    p.setPreedit(testing.allocator, "ếng", 3, 3);
+    _ = try deliver(&p, &doc, false);
+    try testing.expectEqual(@as(?usize, 3), doc.displayCaret());
+}
+
+test "surrounding text follows the document and never carries the preedit" {
+    var p: Pending = .{};
+    defer p.deinit(testing.allocator);
+    var doc = ui.Document.init(testing.allocator);
+    defer doc.deinit();
+    _ = try doc.insert(.application, "tiếng ");
+
+    p.setPreedit(testing.allocator, "Vieejt", 6, 6);
+    _ = try deliver(&p, &doc, false);
+    const before = ui.input_method.surrounding(&doc, ui.input_method.max_surrounding);
+    try testing.expectEqualStrings("tiếng ", before.text);
+
+    p.setCommit(testing.allocator, "Việt");
+    p.setPreedit(testing.allocator, "", -1, -1);
+    _ = try deliver(&p, &doc, false);
+    const after = ui.input_method.surrounding(&doc, ui.input_method.max_surrounding);
+    try testing.expectEqualStrings("tiếng Việt", after.text);
+    try testing.expectEqual(@as(u32, "tiếng Việt".len), after.cursor);
 }

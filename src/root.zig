@@ -29,6 +29,7 @@ pub const document = @import("document.zig");
 pub const keys = @import("keys.zig");
 pub const editing = @import("editing.zig");
 pub const input_client = @import("input_client.zig");
+pub const input_method = @import("input_method.zig");
 pub const scene = @import("scene.zig");
 pub const raster = @import("raster.zig");
 
@@ -84,6 +85,7 @@ test {
     _ = keys;
     _ = editing;
     _ = input_client;
+    _ = input_method;
     _ = scene;
     _ = raster;
     _ = @import("layout_test.zig");

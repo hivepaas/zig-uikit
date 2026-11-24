@@ -11,10 +11,12 @@
 //!   - a frame where the pointer did not move does nothing on the CPU at all,
 //!     and the scene build returns after one integer comparison
 //!
-//! The third text field is typeable. Keystrokes arrive as `ui.KeyEvent`s in
-//! the window's queue, `ui.editing.apply` turns them into edits on a
-//! `Document`, and `demo.refreshEditable` reshapes the line and moves the
-//! caret. That path is the one thing in this program that is NOT free on an
+//! The third text field is typeable, by the keyboard and by an input method.
+//! Keystrokes arrive as `ui.KeyEvent`s in the window's queue and
+//! `ui.editing.apply` turns them into edits on a `Document`; a composition
+//! arrives as `zwp_text_input_v3` events that the window applies to the same
+//! document. Either way `demo.refreshEditable` reshapes the line, underlines
+//! whatever is provisional and moves the caret. That path is the one thing in this program that is NOT free on an
 //! unchanged frame, and the counters say what it costs.
 //!
 //! Frame pacing comes from FIFO present, so the loop runs at the display's
@@ -43,11 +45,11 @@ fn checkPresentedFrame(
     scene: *const ui.Scene,
     atlas: ui.AtlasView,
     t: *const ui.Tree,
-    /// Whether to also write the magnified crop of the editable field. Only
-    /// under `--type`, so that the committed image is of a field something
-    /// actually typed into and a plain `--capture` does not quietly replace it
-    /// with an untouched one.
-    crop: bool,
+    /// Where to write the magnified crop of the editable field, or null for
+    /// none. Only under `--type`, so that the committed images are of a field
+    /// something actually happened to and a plain `--capture` does not quietly
+    /// replace them with untouched ones.
+    crop: ?[]const u8,
 ) !void {
     const w = swapchain.extent.width;
     const h = swapchain.extent.height;
@@ -78,15 +80,15 @@ fn checkPresentedFrame(
     // And a magnified crop of the editable field, out of the same frame the
     // compositor was handed. The caret is one pixel wide; in a 900x560
     // screenshot it is a claim nobody can check.
-    if (crop) if (demo.editable) |ed| {
+    if (crop) |path| if (demo.editable) |ed| {
         const b = t.bounds(ed.field);
         try demo.writeCrop(gpa, io, &fb, .{
             .x = b.x,
             .y = b.y - 30,
             .w = @min(b.w, 420),
             .h = b.h + 30,
-        }, 3, "docs/demo-typing.png");
-        std.debug.print("wrote docs/demo-typing.png\n", .{});
+        }, 3, path);
+        std.debug.print("wrote {s}\n", .{path});
     };
     std.debug.print(
         "presented frame vs software reference: largest channel difference {d}\nwrote docs/demo-window.png\n\n",
@@ -122,6 +124,25 @@ fn typeScript(gpa: std.mem.Allocator) ![]ui.KeyEvent {
     try list.append(gpa, ui.KeyEvent.named(.backspace).withMods(ctrl));
     return list.toOwnedSlice(gpa);
 }
+
+/// A composition, as ibus-bamboo sends one in its default input mode: the
+/// whole syllable lives in the preedit and only the finished result is
+/// committed.
+///
+/// Fed through `ui.input_method.apply` -- the same function `tiDone` calls --
+/// so everything above the socket runs: the document keeps the preedit out of
+/// its buffer, `displayText` splices it in at the caret, and the field
+/// underlines the provisional range. What this cannot exercise is the
+/// compositor and the input method themselves; those need a person typing.
+const ime_script = [_]ui.input_method.Change{
+    .{ .preedit = "V", .preedit_cursor = .{ .start = 1, .end = 1 } },
+    .{ .preedit = "Vi", .preedit_cursor = .{ .start = 2, .end = 2 } },
+    .{ .preedit = "Vie", .preedit_cursor = .{ .start = 3, .end = 3 } },
+    .{ .preedit = "Viee", .preedit_cursor = .{ .start = 4, .end = 4 } },
+    .{ .preedit = "Việ", .preedit_cursor = .{ .start = 4, .end = 4 } },
+    .{ .preedit = "Việt", .preedit_cursor = .{ .start = 5, .end = 5 } },
+    .{ .commit = "Việt", .preedit = "" },
+};
 
 fn nowNs() u64 {
     var ts: std.os.linux.timespec = undefined;
@@ -191,6 +212,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer doc.deinit();
     _ = try doc.insert(.application, demo.editable_initial);
 
+    // Scratch for `displayText`, which splices the preedit in at the caret.
+    var shown: std.ArrayList(u8) = .empty;
+    defer shown.deinit(gpa);
+
+    // Where the candidate window should go. Surface coordinates, which is
+    // what `set_cursor_rectangle` takes -- so this needs the text layout and
+    // nothing from the compositor about where the window is. All four spikes
+    // reported a fixed box here and had their candidate windows appear at the
+    // window's origin; this is the first time the real rectangle is available
+    // to send.
+    if (demo.editable) |ed| win.setCaretRect(t.bounds(ed.caret.box));
+
+    // Hands the document to the input method. From here the compositor may
+    // write into it from inside `win.pump`.
+    win.focusTextInput(&doc);
+
     // The GPU's copy of the atlas is current as of here. Typing a character
     // the font has not rasterised yet changes the atlas, and this is how that
     // is noticed without re-uploading a texture every frame.
@@ -204,6 +241,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         \\{d}x{d}, {s}{s}
         \\
         \\keyboard: {s}{s}
+        \\input method: {s}
         \\
         \\move the pointer over the list, type into the third field, Escape to
         \\close; the counters are printed on the way out.
@@ -217,6 +255,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (swapchain.bgra) " (BGRA in memory; only the capture reorders)" else "",
         if (win.keyboard == null) "none on this seat" else win.layoutName(),
         if (win.keyboard == null) "" else " layout, repeating after the compositor's delay",
+        if (win.hasInputMethod())
+            "zwp_text_input_v3 available"
+        else
+            "no zwp_text_input_manager_v3: this compositor offers no input method to any client",
     });
 
     var hovered: ui.Index = 0;
@@ -244,6 +286,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const script: []ui.KeyEvent = if (type_test) try typeScript(gpa) else &.{};
     defer if (type_test) gpa.free(script);
     var script_at: usize = 0;
+    var ime_at: usize = 0;
 
     while (!win.closed) {
         win.pump();
@@ -274,11 +317,32 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // 16 ms, and a fast typist with key repeat on can put several
         // keystrokes in one; taking one and leaving the rest would make the
         // field lag behind the keyboard by a frame per character.
-        if (type_test and script_at < script.len and frames % 4 == 0) {
-            win.keys.push(script[script_at]);
-            script_at += 1;
+        // A composition the compositor applied to the document from inside
+        // `pump`, above. Kept apart from `app_changed` because only an
+        // application edit has to be told back to the input method -- the
+        // input method's own edit is not news to it, and `tiDone` has already
+        // answered it.
+        var text_dirty = win.takeImeDirty();
+        var app_changed = false;
+
+        if (type_test and frames % 4 == 0) {
+            if (ime_at < ime_script.len) {
+                // Applied to the document directly, through the same function
+                // `tiDone` calls. Only the socket is missing.
+                const r = try ui.input_method.apply(&doc, ime_script[ime_at]);
+                ime_at += 1;
+                if (r.document_changed or r.preedit_changed) text_dirty = true;
+                // Counted as an application change, which is what it is from
+                // the real input method's point of view: ibus is attached to
+                // this document and did not cause this, so the change cause it
+                // is told is `other` and not `input_method`.
+                if (r.document_changed) app_changed = true;
+            } else if (script_at < script.len) {
+                win.keys.push(script[script_at]);
+                script_at += 1;
+            }
         }
-        var text_dirty = false;
+
         while (win.keys.pop()) |ev| {
             if (ev.key == .escape) {
                 win.closed = true;
@@ -290,18 +354,27 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 // rather than ignored, because if it ever happens it means the
                 // text-input path landed and this loop needs to decide what to
                 // do about it.
+                // Reachable now that an input method is attached: a key the
+                // input method did not consume, arriving while its preedit is
+                // live. Spike B's "two writers to one document". Refused
+                // rather than interleaved, and said out loud rather than
+                // swallowed, because the right recovery depends on which key
+                // it was.
                 error.Locked => {
-                    std.debug.print("edit refused: the document is locked\n", .{});
+                    std.debug.print("key refused: a composition is in progress\n", .{});
                     continue;
                 },
                 else => return e,
             };
             if (r.handled) keystrokes += 1 else unhandled += 1;
-            if (r.edited or r.moved) text_dirty = true;
+            if (r.edited or r.moved) {
+                text_dirty = true;
+                app_changed = true;
+            }
         }
         if (text_dirty) {
             const e0 = nowNs();
-            demo.refreshEditable(&t, &fonts, &doc) catch |e| switch (e) {
+            demo.refreshEditable(&t, &fonts, &doc, &shown) catch |e| switch (e) {
                 // 512x512 holds thousands of glyphs at this size, so this
                 // needs a lot of distinct characters to reach. It is caught
                 // rather than propagated because losing the window over it
@@ -397,6 +470,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
         const built = try scene.build(&t);
         const cpu = nowNs() - t0;
 
+        // Outside the timed region on purpose: this writes to the Wayland
+        // socket, and the CPU figure is about layout and scene building.
+        //
+        // Only for an application edit. An edit the input method made has
+        // already been answered inside `tiDone`, and answering it again here
+        // would be the second half of the resync loop.
+        if (app_changed) {
+            if (demo.editable) |ed| win.setCaretRect(t.bounds(ed.caret.box));
+            win.notifyTextChanged();
+        }
+
         cpu_total_ns += cpu;
         cpu_worst_ns = @max(cpu_worst_ns, cpu);
         frames += 1;
@@ -413,7 +497,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // was presented against the scene as it is a frame later, which under
         // `--sweep` is a different scene and shows up as a difference of 21
         // rather than of 1.
-        if (capture and frames == 9) swapchain.capture_request = true;
+        // Two of them under `--type`: one while a composition is live, and
+        // one after the keyboard has typed into the same field. Both are
+        // diffed against the software reference, so each is also a check that
+        // the GPU and the reference agree on the frame.
+        if (capture and (frames == 9 or (type_test and frames == 60))) {
+            swapchain.capture_request = true;
+        }
 
         const ok = swapchain.drawAndPresent(&renderer, &scene, bg) catch |e| {
             if (e == vk.Error.SurfaceHasNoArea) continue;
@@ -433,10 +523,22 @@ pub fn main(init: std.process.Init.Minimal) !void {
             continue;
         }
 
-        if (capture and frames == 9) {
-            try checkPresentedFrame(gpa, &swapchain, &scene, fonts.atlas.view(), &t, type_test);
-            capture = false;
-            if (sweep == 0) break;
+        if (capture and (frames == 9 or (type_test and frames == 60))) {
+            try checkPresentedFrame(
+                gpa,
+                &swapchain,
+                &scene,
+                fonts.atlas.view(),
+                &t,
+                if (!type_test) null else if (frames == 9)
+                    "docs/demo-preedit.png"
+                else
+                    "docs/demo-typing.png",
+            );
+            if (!type_test or frames == 60) {
+                capture = false;
+                if (sweep == 0 and !type_test) break;
+            }
         }
         if (sweep > 0 and frames >= sweep) break;
         // Long enough after the last scripted keystroke for the frame it
@@ -459,6 +561,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         \\  {d} edits: mean {d} ns each, worst {d} ns
         \\  the same line shaped again, hot         {d} ns ({d} samples)
         \\  atlas re-uploads                        {d}, mean {d} ns each
+        \\  text-input focus gained {d} times, {d} resyncs sent, {d} stale `done` events
+        \\  input-method events: {d} done, {d} preedit, {d} commit, {d} delete_surrounding
         \\
         \\The CPU figure is everything between the pointer moving and the quads
         \\being ready to upload: hit test, layout flush, scene build. Timing the
@@ -487,5 +591,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
         hot_shapes,
         atlas_uploads,
         if (atlas_uploads == 0) 0 else upload_ns_total / atlas_uploads,
+        win.ime_enters,
+        win.ime_resyncs,
+        win.stale_dones,
+        win.ime_events.done,
+        win.ime_events.preedit,
+        win.ime_events.commit,
+        win.ime_events.delete,
     });
+    if (win.ime_error) |e| std.debug.print("the input-method path reported {s}\n", .{@errorName(e)});
 }

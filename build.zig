@@ -121,17 +121,33 @@ fn addLinux(
     // a .c file of interface tables. Both are needed: the header to call
     // through, the tables to link against.
     const proto_dir = "/usr/share/wayland-protocols";
-    const xdg_header_cmd = b.addSystemCommand(&.{ "wayland-scanner", "client-header", proto_dir ++ "/stable/xdg-shell/xdg-shell.xml" });
-    const xdg_header = xdg_header_cmd.addOutputFileArg("xdg-shell-client-protocol.h");
-    const xdg_code_cmd = b.addSystemCommand(&.{ "wayland-scanner", "private-code", proto_dir ++ "/stable/xdg-shell/xdg-shell.xml" });
-    const xdg_code = xdg_code_cmd.addOutputFileArg("xdg-shell-protocol.c");
+    const Generated = struct { header: std.Build.LazyPath, code: std.Build.LazyPath };
+    const scan = struct {
+        fn run(bb: *std.Build, xml: []const u8, stem: []const u8) Generated {
+            const h = bb.addSystemCommand(&.{ "wayland-scanner", "client-header", xml });
+            const header = h.addOutputFileArg(bb.fmt("{s}-client-protocol.h", .{stem}));
+            const code = bb.addSystemCommand(&.{ "wayland-scanner", "private-code", xml });
+            return .{ .header = header, .code = code.addOutputFileArg(bb.fmt("{s}-protocol.c", .{stem})) };
+        }
+    }.run;
+
+    const xdg = scan(b, proto_dir ++ "/stable/xdg-shell/xdg-shell.xml", "xdg-shell");
+    // Still "unstable" after seven years, and still the only way a Wayland
+    // client talks to an input method. There is no stable successor to wait
+    // for.
+    const ti = scan(
+        b,
+        proto_dir ++ "/unstable/text-input/text-input-unstable-v3.xml",
+        "text-input-unstable-v3",
+    );
 
     const vk_c = b.addTranslateC(.{
         .root_source_file = b.path("src/native.h"),
         .target = target,
         .optimize = optimize,
     });
-    vk_c.addIncludePath(xdg_header.dirname());
+    vk_c.addIncludePath(xdg.header.dirname());
+    vk_c.addIncludePath(ti.header.dirname());
     const c_mod = vk_c.createModule();
 
     const gpu_mod = b.addModule("zig-uikit-vulkan", .{
@@ -166,7 +182,8 @@ fn addLinux(
     // into a character; the renderer never asks, so it never links it.
     wl_mod.linkSystemLibrary("xkbcommon", .{});
     // The generated interface tables are plain C and have to be compiled in.
-    wl_mod.addCSourceFile(.{ .file = xdg_code, .flags = &.{"-std=c99"} });
+    wl_mod.addCSourceFile(.{ .file = xdg.code, .flags = &.{"-std=c99"} });
+    wl_mod.addCSourceFile(.{ .file = ti.code, .flags = &.{"-std=c99"} });
 
     const window_demo = b.addExecutable(.{
         .name = "window_demo",
