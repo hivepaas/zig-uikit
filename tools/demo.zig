@@ -274,6 +274,102 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
         _ = try label(t, c, ui_font, atlas, cell[2], dim);
     }
 
+    // --- a caret and a selection, drawn from the run's own answers ---
+    //
+    // The structure here is a workaround and says something true about the
+    // toolkit. The scene builder paints an element's box, then its glyphs,
+    // then its children -- so there is no way to put a rectangle BEHIND an
+    // element's own text. A selection highlight therefore has to be a
+    // preceding sibling, positioned by a zero-width anchor and a spacer, the
+    // same trick the popover above uses for the same missing feature:
+    // absolute positioning.
+    //
+    // The numbers come from `TextRun.caretX`, which is the function
+    // `docs/text-and-accessibility.md` §7 is about. All four spikes answer
+    // "where is the caret" with a fixed rectangle, which is why their
+    // candidate windows appear in the wrong place on screen.
+    {
+        const field_text = "Nháy chuột vào đây: tiếng Việt";
+        const sel = "tiếng Việt";
+        const sel_start = std.mem.indexOf(u8, field_text, sel).?;
+        const sel_end = sel_start + sel.len;
+
+        const field = try t.appendChild(content, .{
+            .axis = .row,
+            .height = .{ .fixed = 34 },
+            .flex_shrink = 0,
+            .padding = 8,
+            .align_items = .center,
+        });
+        t.setPaint(field, .{
+            .background = card,
+            .border_color = line,
+            .border_width = 1,
+            .corner_radius = 8,
+        });
+
+        if (ui_font) |f| {
+            // Shaped once up here because the highlight has to be created
+            // before the label that it sits behind, and its position comes
+            // from the shaped run. `setText` below shapes again -- 2 us, with
+            // every glyph already in the atlas -- rather than the demo
+            // reaching into the element's run after the fact.
+            const run = try f.shape(atlas.?, field_text);
+            const r = run.rangeRect(sel_start, sel_end);
+
+            const anchor = try t.appendChild(field, .{
+                .axis = .row,
+                // Zero width so it takes no room on the row, but the run's
+                // full height so that `align_items: .center` centres it the
+                // same way it centres the label. A zero-height anchor is
+                // centred as a point, and its children then hang DOWN from
+                // the middle of the row instead of sitting behind the text --
+                // which is what the first version of this did, and what the
+                // rendered image showed.
+                .width = .{ .fixed = 0 },
+                .height = .{ .fixed = r.h },
+                .flex_shrink = 0,
+            });
+            _ = try t.appendChild(anchor, .{
+                .width = .{ .fixed = r.x },
+                .height = .{ .fixed = 1 },
+                .flex_shrink = 0,
+            });
+            const highlight = try t.appendChild(anchor, .{
+                .width = .{ .fixed = r.w },
+                .height = .{ .fixed = r.h },
+                .flex_shrink = 0,
+            });
+            t.setPaint(highlight, .{ .background = Color.hex(0x2F4B8F), .corner_radius = 2 });
+        }
+
+        const field_label = try label(t, field, ui_font, atlas, field_text, bright);
+
+        if (ui_font != null) {
+            // The caret, after the selection, at the far end of it.
+            const run = t.text(field_label);
+            const anchor = try t.appendChild(field, .{
+                .axis = .row,
+                .width = .{ .fixed = 0 },
+                .height = .{ .fixed = run.height() },
+                .flex_shrink = 0,
+            });
+            _ = try t.appendChild(anchor, .{
+                // Back up by the label's full width, because this anchor sits
+                // after it rather than at the field's content origin.
+                .width = .{ .fixed = run.caretX(sel_end) - run.width },
+                .height = .{ .fixed = 1 },
+                .flex_shrink = 0,
+            });
+            const caret = try t.appendChild(anchor, .{
+                .width = .{ .fixed = 1 },
+                .height = .{ .fixed = run.height() },
+                .flex_shrink = 0,
+            });
+            t.setPaint(caret, .{ .background = Color.white });
+        }
+    }
+
     // --- the scrolling list: more rows than fit, clipped and culled ---
     const list = try t.appendChild(content, .{
         .axis = .col,

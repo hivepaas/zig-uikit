@@ -224,18 +224,23 @@ pub const Font = struct {
             const gx = @round(pen_x + f26dot6(pos.x_offset));
             const gy = @round(pen_y - f26dot6(pos.y_offset));
 
-            if (entry.slot.width() > 0) {
-                self.scratch.appendAssumeCapacity(.{
-                    .dx = gx + @as(f32, @floatFromInt(entry.left)),
-                    .dy = self.ascent + gy - @as(f32, @floatFromInt(entry.top)),
-                    .w = @floatFromInt(entry.slot.width()),
-                    .h = @floatFromInt(entry.slot.height()),
-                    .u0 = entry.slot.u0,
-                    .v0 = entry.slot.v0,
-                    .u1 = entry.slot.u1,
-                    .v1 = entry.slot.v1,
-                });
-            }
+            // Every shaped glyph goes in the run, including the ones with no
+            // ink. A space advances the pen and draws nothing, and dropping it
+            // would leave a hole in the cluster sequence exactly where a caret
+            // has to be able to sit. The scene builder skips the ones with no
+            // ink, so this costs entries in the run and no quads in the scene.
+            self.scratch.appendAssumeCapacity(.{
+                .dx = gx + @as(f32, @floatFromInt(entry.left)),
+                .dy = self.ascent + gy - @as(f32, @floatFromInt(entry.top)),
+                .w = @floatFromInt(entry.slot.width()),
+                .h = @floatFromInt(entry.slot.height()),
+                .u0 = entry.slot.u0,
+                .v0 = entry.slot.v0,
+                .u1 = entry.slot.u1,
+                .v1 = entry.slot.v1,
+                .cluster = infos[i].cluster,
+                .pen_x = pen_x,
+            });
 
             pen_x += f26dot6(pos.x_advance);
             pen_y -= f26dot6(pos.y_advance);
@@ -386,6 +391,73 @@ test "shaping produces glyphs, an advance, and an atlas that fills up" {
     try testing.expect(atlas.used > 0);
 }
 
+test "clusters are byte offsets into the string that was shaped" {
+    var lib = try Library.init();
+    defer lib.deinit();
+    var font = try openSans(&lib, testing.allocator);
+    defer font.deinit();
+    var atlas = try Atlas.init(testing.allocator, 512, 512);
+    defer atlas.deinit();
+
+    const s = "tiếng Việt";
+    const run = try font.shape(&atlas, s);
+
+    // Every cluster is a real byte offset and a character boundary. A cluster
+    // pointing into the middle of a multi-byte character would place a caret
+    // somewhere the document cannot be split.
+    for (run.glyphs) |g| {
+        try testing.expect(g.cluster < s.len);
+        try testing.expectEqual(
+            @as(usize, g.cluster),
+            ui.offsets.alignToChar(s, g.cluster),
+        );
+    }
+
+    // Left to right, so clusters do not go backwards.
+    var last: u32 = 0;
+    for (run.glyphs) |g| {
+        try testing.expect(g.cluster >= last);
+        last = g.cluster;
+    }
+
+    // The first glyph starts at byte zero and the pen starts at zero.
+    try testing.expectEqual(@as(u32, 0), run.glyphs[0].cluster);
+    try testing.expectEqual(@as(f32, 0), run.glyphs[0].pen_x);
+}
+
+test "a caret can be placed at every character boundary" {
+    var lib = try Library.init();
+    defer lib.deinit();
+    var font = try openSans(&lib, testing.allocator);
+    defer font.deinit();
+    var atlas = try Atlas.init(testing.allocator, 512, 512);
+    defer atlas.deinit();
+
+    const s = "tiếng Việt";
+    const run = try font.shape(&atlas, s);
+
+    // Walking the string forwards, the caret must never go backwards and must
+    // reach the full width at the end. `ế` is three bytes and `Việt` has a
+    // mark, so this is the case where a per-codepoint model drifts.
+    var prev: f32 = -1;
+    var b: usize = 0;
+    while (b <= s.len) : (b += 1) {
+        if (b != ui.offsets.alignToChar(s, b)) continue;
+        const x = run.caretX(b);
+        try testing.expect(x >= prev);
+        prev = x;
+    }
+    try testing.expectEqual(run.width, run.caretX(s.len));
+
+    // And a click on each caret comes back to the byte it was made from.
+    b = 0;
+    while (b <= s.len) : (b += 1) {
+        if (b != ui.offsets.alignToChar(s, b)) continue;
+        const back = run.byteAt(run.caretX(b), s.len);
+        try testing.expectEqual(b, back);
+    }
+}
+
 test "a space advances the pen and emits no glyph" {
     var lib = try Library.init();
     defer lib.deinit();
@@ -396,15 +468,21 @@ test "a space advances the pen and emits no glyph" {
 
     const one = try font.shape(&atlas, "ab");
     const w_one = one.width;
-    const n_one = one.glyphs.len;
 
     const two = try font.shape(&atlas, "a b");
-    // Shaping saw three characters...
+    // Shaping saw three characters, and all three are in the run: the space is
+    // kept because a caret has to be able to sit on either side of it.
     try testing.expectEqual(@as(usize, 3), font.glyphCount("a b"));
-    // ...and the run carries two drawable glyphs, because a space has no ink.
-    try testing.expectEqual(n_one, two.glyphs.len);
-    // The space still took width.
+    try testing.expectEqual(@as(usize, 3), two.glyphs.len);
+    // Exactly one of them has nothing to draw.
+    var inked: usize = 0;
+    for (two.glyphs) |g| {
+        if (g.hasInk()) inked += 1;
+    }
+    try testing.expectEqual(@as(usize, 2), inked);
+    // The space still took width, and the caret after it is past the gap.
     try testing.expect(two.width > w_one);
+    try testing.expect(two.caretX(2) > two.caretX(1));
 }
 
 test "glyphs are cached, so the atlas does not grow on a repeat" {

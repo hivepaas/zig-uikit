@@ -24,6 +24,7 @@ pub const style = @import("style.zig");
 pub const tree = @import("tree.zig");
 pub const paint = @import("paint.zig");
 pub const glyph = @import("glyph.zig");
+pub const offsets = @import("offsets.zig");
 pub const scene = @import("scene.zig");
 pub const raster = @import("raster.zig");
 
@@ -66,6 +67,7 @@ test {
     _ = tree;
     _ = paint;
     _ = glyph;
+    _ = offsets;
     _ = scene;
     _ = raster;
     _ = @import("layout_test.zig");

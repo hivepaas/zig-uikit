@@ -8,10 +8,10 @@ A declarative GPU UI toolkit for Zig.
 > There are no widgets. Expect the API to change without notice.
 
 ```sh
-zig build test                           # 54 tests, no platform dependencies
+zig build test                           # 66 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
-zig build test-text                      # 12 tests, needs a font installed
+zig build test-text                      # 14 tests, needs a font installed
 zig build test-gpu                       # Vulkan: 7 tests; Metal: 8 tests
 zig build gpu-demo                       # renders on the GPU, diffs against the reference
 zig build window                         # opens a window and renders into it
@@ -243,6 +243,78 @@ So a single label's box is ascent plus descent, the bound that cannot clip ink,
 which matters most for exactly the text this project has to set correctly. A
 line breaker, when there is one, will stack lines at `line_height` instead.
 
+### The caret, and the three units four protocols count in
+
+A shaped run now carries, per glyph, the **byte offset it came from** and the
+**pen position before it**. The first version of this file carried neither,
+and that was a bug rather than a missing feature: shaping is not a one-to-one
+map — a ligature is one glyph for several bytes, a decomposed `ế` is two glyphs
+for one character — so the shaper is the only thing that knows which bytes
+produced which glyph, and throwing the answer away means it cannot be recovered
+afterwards. The same version dropped glyphs with no ink from the run, which
+left a hole in the cluster sequence exactly where a caret has to be able to
+sit: after a space.
+
+The pen position is separate from the bitmap position for a reason that is
+visible the moment you draw it. `dx` is the left edge of the *ink*, which sits
+wherever the outline does and is often to the left of the pen; a caret drawn
+there lands inside the letter.
+
+From those two numbers the run answers the three questions a text field asks:
+
+```zig
+run.caretX(byte)                 // where a caret before this byte goes
+run.byteAt(x, text.len)          // what a click at x selects
+run.rangeRect(start, end)        // the selection highlight, or the caret
+```
+
+`docs/text-and-accessibility.md` §7 is why: `set_cursor_rectangle` on Wayland,
+`GetTextExt` in TSF and `get_BoundingRectangle` in UIA are the same question
+three times, and all four spikes answer it with a fixed rectangle — which is
+why their candidate windows appear in the wrong part of the screen. These are
+the functions that answer it properly.
+
+They are **left to right only**, and the run says so rather than pretending
+otherwise. A mixed-direction line needs the glyphs grouped into runs of one
+direction each and the arithmetic done per run. A toolkit that got Vietnamese
+right by shaping properly should not then get Arabic wrong by assuming.
+
+`src/offsets.zig` is the other half, and it is §1 of the spec made executable:
+
+```
+zwp_text_input_v3   UTF-8 bytes
+AT-SPI              codepoints
+Windows BSTR (UIA)  UTF-16 code units
+TSF "ACP"           UTF-16 code units
+```
+
+`tiếng việt 🇻🇳` is **23 bytes, 13 codepoints, 15 UTF-16 code units**, and that
+string is in the tests because it is the shortest one that separates all three.
+ASCII collapses them to one number, Vietnamese separates bytes from codepoints,
+and only a non-BMP character separates codepoints from UTF-16 units — so a
+toolkit tested in English passes everything it has and then edits the wrong
+characters on one platform. Windows is internally consistent; **Linux is not**,
+because `text-input-v3` counts bytes while AT-SPI counts codepoints.
+
+Writing those four functions took two tries, and the tests are why that is
+knowable. `utf16ToByte` stopped once the running count had *passed* the
+requested offset, which steps over the character an offset inside a surrogate
+pair belongs to and answers with the byte after it. `alignToChar` asked whether
+the *previous* byte was a continuation, which is a different question and true
+at a boundary that follows a multi-byte character. Both are the kind of bug
+that does not crash: it silently reads or edits the wrong characters, on one
+platform, in one language.
+
+The demo draws a selection and a caret from those functions, and the first
+render of it was wrong in a way worth keeping here. The highlight has to be a
+preceding sibling of the label — the scene builder paints a box, then its
+glyphs, then its children, so there is no way to put a rectangle behind an
+element's *own* text — and the anchor holding it was given zero height. Under
+`align_items: .center` a zero-height element is centred as a point, so its
+children hung down from the middle of the row instead of sitting behind the
+text. Giving the anchor the run's height fixed it. That the demo is a picture
+is the only reason it was noticed.
+
 ### Text is Vulkan-only so far
 
 The Metal backend has no glyph atlas yet, and until it does the macOS demo is
@@ -268,13 +340,17 @@ range. The answer on a 2× display is to shape at the device pixel size — a
 
 ### What text does not do yet
 
-Line breaking, bidirectional text, font fallback for a glyph the matched family
-lacks, and the document model that
-[docs/text-and-accessibility.md](docs/text-and-accessibility.md) specifies —
-UTF-8 storage with conversion at four protocol boundaries, a provisional
-composition range, and caret geometry in screen coordinates. One shaped line is
-the unit here. Each of those is a separate piece of work on top of it rather
-than something to half-do inside it.
+Line breaking, bidirectional text, and font fallback for a glyph the matched
+family lacks. One shaped line is the unit here, and each of those is a separate
+piece of work on top of it rather than something to half-do inside it.
+
+Of the document model that
+[docs/text-and-accessibility.md](docs/text-and-accessibility.md) specifies, the
+unit conversions (§1) and caret geometry in run coordinates (§7) now exist.
+What does not: the document itself — a byte buffer with a selection, a
+provisional composition range (§2) and the `canEditNow()` guard the TSF lock
+protocol needs (§6) — and converting a caret rectangle from run coordinates to
+screen coordinates, which needs the window to say where it is.
 
 ## The Vulkan backend
 

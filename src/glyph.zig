@@ -16,6 +16,8 @@
 
 const std = @import("std");
 
+const Rect = @import("geometry.zig").Rect;
+
 /// One positioned, already-rasterised glyph.
 ///
 /// Positions are integral. Subpixel glyph positioning would mean either a
@@ -33,15 +35,40 @@ pub const Glyph = extern struct {
     w: f32,
     h: f32,
 
-    /// Top-left texel in the atlas, and one past the bottom-right.
+    /// Top-left texel in the atlas, and one past the bottom-right. Equal
+    /// values mean no ink: a space is a real glyph with a real advance and
+    /// nothing to draw.
     u0: u16,
     v0: u16,
     u1: u16,
     v1: u16,
+
+    /// The byte offset in the source string this glyph came from.
+    ///
+    /// Carried because without it a caret cannot be placed. Shaping is not a
+    /// one-to-one map: a ligature is one glyph for several bytes, a decomposed
+    /// `ế` is two glyphs for one character, and reordering means the nth glyph
+    /// is not the nth character. The shaper is the only thing that knows which
+    /// bytes produced which glyph, so throwing the answer away means it cannot
+    /// be recovered afterwards -- which is what an earlier version of this
+    /// file did.
+    cluster: u32,
+
+    /// The pen position before this glyph, which is where a caret in front of
+    /// it goes.
+    ///
+    /// Not the same as `dx`: that is the left edge of the *bitmap*, which sits
+    /// wherever the outline does and is frequently negative relative to the
+    /// pen. A caret drawn at `dx` lands inside the letter.
+    pen_x: f32,
+
+    pub fn hasInk(self: Glyph) bool {
+        return self.u1 > self.u0 and self.v1 > self.v0;
+    }
 };
 
 comptime {
-    std.debug.assert(@sizeOf(Glyph) == 24);
+    std.debug.assert(@sizeOf(Glyph) == 32);
 }
 
 /// A shaped line of text: where its glyphs sit, and the metrics layout needs.
@@ -86,6 +113,67 @@ pub const TextRun = struct {
 
     pub fn isEmpty(self: TextRun) bool {
         return self.glyphs.len == 0;
+    }
+
+    // ------------------------------------------------------------- the caret
+    //
+    // `docs/text-and-accessibility.md` §7: three protocols ask the same
+    // question in three ways -- `set_cursor_rectangle` on Wayland,
+    // `GetTextExt` in TSF, `get_BoundingRectangle` in UIA -- and all four
+    // spikes answer it with a fixed rectangle, which is why their candidate
+    // windows appear in the wrong place. These are the functions that answer
+    // it properly, and the adapters convert their own units into bytes with
+    // `offsets.zig` before asking.
+    //
+    // **Left to right only.** The run carries no direction, so a right-to-left
+    // or mixed line would need the glyphs grouped into runs of one direction
+    // each and the arithmetic done per run. Saying so is better than an
+    // implementation that is quietly wrong for Arabic and Hebrew; a toolkit
+    // that got Vietnamese right by shaping properly should not then get
+    // direction wrong by assuming.
+
+    /// Where a caret immediately before byte `b` sits, measured from the run's
+    /// origin.
+    ///
+    /// A byte inside a cluster resolves to that cluster's start. One glyph can
+    /// cover several bytes -- a ligature, or a precomposed character built
+    /// from a base and a mark -- and there is no position *inside* a glyph
+    /// that corresponds to a byte. Splitting the advance proportionally is
+    /// what a text editor does for a long ligature; it is a refinement of this
+    /// and not a different answer.
+    pub fn caretX(self: TextRun, b: usize) f32 {
+        for (self.glyphs) |g| {
+            if (g.cluster >= b) return g.pen_x;
+        }
+        return self.width;
+    }
+
+    /// The byte offset a caret should move to for a click at `x`.
+    ///
+    /// Rounds to the nearer edge of whichever glyph `x` falls in, because a
+    /// click in the left half of a letter means "before it" and in the right
+    /// half means "after it". Clicking past the end gives the end.
+    pub fn byteAt(self: TextRun, x: f32, len: usize) usize {
+        if (self.glyphs.len == 0 or x <= 0) return 0;
+        for (self.glyphs, 0..) |g, i| {
+            const next_x = if (i + 1 < self.glyphs.len)
+                self.glyphs[i + 1].pen_x
+            else
+                self.width;
+            if (x >= next_x) continue;
+            const mid = (g.pen_x + next_x) * 0.5;
+            if (x < mid) return g.cluster;
+            return if (i + 1 < self.glyphs.len) self.glyphs[i + 1].cluster else len;
+        }
+        return len;
+    }
+
+    /// The rectangle covering bytes `start..end`, relative to the run's
+    /// origin. A zero-width rectangle is a caret; a wide one is a selection.
+    pub fn rangeRect(self: TextRun, start: usize, end: usize) Rect {
+        const x0 = self.caretX(@min(start, end));
+        const x1 = self.caretX(@max(start, end));
+        return .{ .x = x0, .y = 0, .w = x1 - x0, .h = self.height() };
     }
 };
 

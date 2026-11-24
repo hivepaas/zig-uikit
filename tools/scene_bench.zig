@@ -306,6 +306,8 @@ pub fn main() !void {
                 .v0 = 0,
                 .u1 = at + 6,
                 .v1 = 10,
+                .cluster = @intCast(i),
+                .pen_x = @floatFromInt(at),
             };
         }
         const run: ui.TextRun = .{ .glyphs = &glyphs, .width = 36, .ascent = 8, .descent = 2 };

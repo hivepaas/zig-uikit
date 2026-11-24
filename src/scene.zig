@@ -364,6 +364,11 @@ pub const Scene = struct {
                     const ox = e.bounds.x + e.style.padding;
                     const oy = e.bounds.y + e.style.padding;
                     for (e.text.glyphs) |g| {
+                        // A space is a glyph with an advance and no ink. It is
+                        // in the run because a caret has to be able to sit
+                        // after it; it is not in the scene because there is
+                        // nothing to draw.
+                        if (!g.hasInk()) continue;
                         self.quads.appendAssumeCapacity(.{
                             // Snapped to the pixel grid. Element bounds are
                             // fractional in general -- flex division produces

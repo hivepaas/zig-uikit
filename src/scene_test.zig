@@ -571,6 +571,11 @@ fn fakeRun(glyphs: []ui.Glyph, size: u16) ui.TextRun {
             .v0 = 0,
             .u1 = at + size,
             .v1 = size,
+            // One byte per glyph: these stand in for ASCII, which is the case
+            // where the three offset units agree and the caret arithmetic can
+            // be checked without a shaper.
+            .cluster = @intCast(i),
+            .pen_x = @floatFromInt(at),
         };
     }
     return .{
@@ -777,4 +782,162 @@ test "a textured quad with no atlas draws nothing" {
     };
     ui.raster.drawQuad(&fb, q, null);
     try testing.expectEqual(@as(u8, 0), fb.at(2, 2).r);
+}
+
+test "a caret sits at the pen, not at the ink" {
+    // Bitmaps offset two pixels left of the pen, which is what an italic or an
+    // overhanging letter does. A caret placed at `dx` would land inside the
+    // glyph; it belongs at `pen_x`.
+    var glyphs: [3]ui.Glyph = undefined;
+    for (&glyphs, 0..) |*g, i| {
+        const pen: f32 = @floatFromInt(i * 10);
+        g.* = .{
+            .dx = pen - 2,
+            .dy = 0,
+            .w = 8,
+            .h = 10,
+            .u0 = 0,
+            .v0 = 0,
+            .u1 = 8,
+            .v1 = 10,
+            .cluster = @intCast(i),
+            .pen_x = pen,
+        };
+    }
+    const run: ui.TextRun = .{ .glyphs = &glyphs, .width = 30, .ascent = 8, .descent = 2 };
+
+    try testing.expectEqual(@as(f32, 0), run.caretX(0));
+    try testing.expectEqual(@as(f32, 10), run.caretX(1));
+    try testing.expectEqual(@as(f32, 20), run.caretX(2));
+    // Past the last glyph is the end of the run, not the last pen position.
+    try testing.expectEqual(@as(f32, 30), run.caretX(3));
+    try testing.expectEqual(@as(f32, 30), run.caretX(99));
+}
+
+test "clicking rounds to the nearer side of the glyph" {
+    var glyphs: [3]ui.Glyph = undefined;
+    for (&glyphs, 0..) |*g, i| {
+        const pen: f32 = @floatFromInt(i * 10);
+        g.* = .{
+            .dx = pen,
+            .dy = 0,
+            .w = 10,
+            .h = 10,
+            .u0 = 0,
+            .v0 = 0,
+            .u1 = 10,
+            .v1 = 10,
+            .cluster = @intCast(i),
+            .pen_x = pen,
+        };
+    }
+    const run: ui.TextRun = .{ .glyphs = &glyphs, .width = 30, .ascent = 8, .descent = 2 };
+
+    try testing.expectEqual(@as(usize, 0), run.byteAt(-5, 3));
+    try testing.expectEqual(@as(usize, 0), run.byteAt(1, 3));
+    // Right half of the first glyph means "after it".
+    try testing.expectEqual(@as(usize, 1), run.byteAt(9, 3));
+    try testing.expectEqual(@as(usize, 1), run.byteAt(11, 3));
+    try testing.expectEqual(@as(usize, 2), run.byteAt(19, 3));
+    // Past the end is the end, and the end is a byte count the run does not
+    // itself know -- there is no string here.
+    try testing.expectEqual(@as(usize, 3), run.byteAt(100, 3));
+}
+
+test "a click round-trips through the caret it produces" {
+    var glyphs: [4]ui.Glyph = undefined;
+    for (&glyphs, 0..) |*g, i| {
+        const pen: f32 = @floatFromInt(i * 7);
+        g.* = .{
+            .dx = pen,
+            .dy = 0,
+            .w = 7,
+            .h = 10,
+            .u0 = 0,
+            .v0 = 0,
+            .u1 = 7,
+            .v1 = 10,
+            .cluster = @intCast(i),
+            .pen_x = pen,
+        };
+    }
+    const run: ui.TextRun = .{ .glyphs = &glyphs, .width = 28, .ascent = 8, .descent = 2 };
+
+    // Clicking exactly on a caret must leave it there, for every caret
+    // position. This is the property a text field's click handling rests on.
+    for (0..5) |b| {
+        const x = run.caretX(b);
+        try testing.expectEqual(b, run.byteAt(x, 4));
+    }
+}
+
+test "a selection rectangle spans the bytes it was asked for" {
+    var glyphs: [4]ui.Glyph = undefined;
+    for (&glyphs, 0..) |*g, i| {
+        const pen: f32 = @floatFromInt(i * 5);
+        g.* = .{
+            .dx = pen,
+            .dy = 0,
+            .w = 5,
+            .h = 10,
+            .u0 = 0,
+            .v0 = 0,
+            .u1 = 5,
+            .v1 = 10,
+            .cluster = @intCast(i),
+            .pen_x = pen,
+        };
+    }
+    const run: ui.TextRun = .{ .glyphs = &glyphs, .width = 20, .ascent = 8, .descent = 2 };
+
+    const r = run.rangeRect(1, 3);
+    try testing.expectEqual(@as(f32, 5), r.x);
+    try testing.expectEqual(@as(f32, 10), r.w);
+    try testing.expectEqual(run.height(), r.h);
+
+    // Backwards is the same rectangle: a selection dragged right to left is
+    // the same selection.
+    const back = run.rangeRect(3, 1);
+    try testing.expectEqual(r.x, back.x);
+    try testing.expectEqual(r.w, back.w);
+
+    // An empty range is a caret.
+    try testing.expectEqual(@as(f32, 0), run.rangeRect(2, 2).w);
+}
+
+test "a glyph with no ink stays in the run and out of the scene" {
+    var glyphs: [3]ui.Glyph = undefined;
+    for (&glyphs, 0..) |*g, i| {
+        const pen: f32 = @floatFromInt(i * 6);
+        const ink = i != 1; // the middle one is a space
+        g.* = .{
+            .dx = pen,
+            .dy = 0,
+            .w = if (ink) 6 else 0,
+            .h = if (ink) 10 else 0,
+            .u0 = 0,
+            .v0 = 0,
+            .u1 = if (ink) 6 else 0,
+            .v1 = if (ink) 10 else 0,
+            .cluster = @intCast(i),
+            .pen_x = pen,
+        };
+    }
+
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    const label = try t.appendChild(t.root(), .{});
+    try t.setText(label, .{ .glyphs = &glyphs, .width = 18, .ascent = 8, .descent = 2 });
+    t.layout(.{ .w = 100, .h = 50 });
+
+    var sc = Scene.init(testing.allocator);
+    defer sc.deinit();
+    const st = try sc.build(&t);
+
+    // Three glyphs in the run, two quads in the scene.
+    try testing.expectEqual(@as(usize, 3), t.text(label).glyphs.len);
+    try testing.expectEqual(@as(u32, 2), st.glyphs);
+    // And the caret can still be placed after the space, which is the whole
+    // reason it is kept.
+    try testing.expectEqual(@as(f32, 12), t.text(label).caretX(2));
 }
