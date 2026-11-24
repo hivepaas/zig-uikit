@@ -79,47 +79,78 @@ document manager associated with the window
   It is confirmed correct: a wrong value fails `CoCreateInstance` with
   `REGDB_E_CLASSNOTREG`, and `ITfThreadMgr created` is the proof that it did not.
 
-## NOT verified: composition
+## Verified — composition, with Telex
 
-No `SetText`, `OnStartComposition` or `OnEndComposition` was ever observed,
-because **the guest has no functional composing IME installed**. Two separate
-reasons, and both are worth recording because they are not obvious:
+`Language.Basic~~~vi-VN~0.0.1.0` installed into the guest with DISM, and
+Windows 11's own **Vietnamese Telex** TIP
+(`{C2CB2CF0-AF47-413E-9780-8BC3A3C16068}` profile
+`{5FB02EC5-0A77-4684-B4FA-DEF8A2195628}`) selected as the input method. Telex is
+therefore the shared test case across all four tier-A spikes, which makes this
+directly comparable with spike B.
 
-**1. Windows' built-in Vietnamese is a keyboard layout, not an IME.** On Linux,
-Vietnamese goes through `ibus-bamboo`, a real input method with preedit — which
-is what made spike B testable. On Windows, the shipped Vietnamese support maps
-keys directly and never composes. Telex on Windows needs third-party software
-(UniKey, EVKey). So the test case that carried spikes B, C and D cannot test
-composition here at all.
-
-**2. The Japanese IME is registered but not installed.** 20 TSF TIP GUIDs are in
-the registry, including MS-IME Japanese `{03B5835F-F03C-411B-9CE2-AA23E1171E36}`.
-Adding `ja` to the user language list succeeds. But:
+Typing `a`, `w`, `s` — the same three keystrokes spike B used:
 
 ```
-=== MS-IME Japanese files present? ===
-Windows.Globalization.JapanesePhoneme.dll
+-> OnStartComposition at 0
+-> SetText(flags=0x0 0..0 <- "a" 1 utf16 units)
+   [doc] "a" | acp sel 1..1 | COMPOSING | 1 utf16 = 1 bytes = 1 codepoints
+-> SetText(flags=0x0 0..1 <- "ă" 1 utf16 units)
+   [doc] "ă" | acp sel 1..1 | COMPOSING | 1 utf16 = 2 bytes = 1 codepoints
+-> OnEndComposition -- the text in the document is now committed
 ```
 
-One stub DLL. A working MS-IME has dictionaries and `imjp*` modules. The
-capability needs an online download, so switching to Japanese silently falls
-back to a direct layout and nothing composes.
+Set against spike B's log for the identical keystrokes:
 
-Keystrokes injected with `VBoxManage controlvm keyboardputstring` reached the
-guest and the window was brought to the foreground, but with no composing IME
-there was nothing to compose. **Three attempts; the cause is environmental, not
-a defect in the store.**
+```
+<- preedit_string("a")    doc=""  preedit="a"     <- document UNTOUCHED
+<- preedit_string("ă")    doc=""  preedit="ă"
+<- commit_string("ă")     doc="ă"
+```
 
-To actually close this, one of:
+**The prediction in this file's header is confirmed on both sides.** On Wayland
+the document stays empty for the whole composition and the preedit is a separate
+string. On Windows the provisional text is in the document from the first
+keystroke, and the retroactive diacritic is applied by *replacing a range of our
+buffer* — `SetText(0..1 <- "ă")` overwrites the `a` that was already there.
+There is no preedit string anywhere in the Windows path.
 
-- install the Japanese language features in the guest (an online download), or
-- install a third-party Vietnamese TSF IME such as UniKey, which would also
-  restore Telex as the shared test case across all four spikes, or
-- run it on a Windows machine that already has a composing IME.
+And the unit divergence is visible in the same line: `ă` is **1 UTF-16 unit, 2
+bytes, 1 codepoint**. The replace range `0..1` is correct in ACP and would have
+been wrong in bytes.
 
-Until then this spike proves TSF accepts and drives the text store, and does not
-prove the composition path. Spike C is the reason to keep that distinction
-sharp: running Orca found two gaps that reading the protocol had not.
+Session totals: **173 ITextStoreACP calls, 23 `SetText`, 5 compositions, 27
+read/write lock grants.**
+
+### Correction: Windows does have a Vietnamese IME
+
+An earlier version of this file said Windows' built-in Vietnamese "is a keyboard
+layout, not an IME" and that Telex on Windows "needs third-party software". That
+is **wrong**, and the distinction matters:
+
+- Windows *does* ship a Vietnamese Telex **TSF TIP**, listed above. It is simply
+  not installed by default — the registry carries the profile with `Enable = 0x0`
+  and no COM server until the language capability is added.
+- Third-party tools such as UniKey and EVKey are keyboard-hook based rather than
+  TSF, so installing one would **not** have exercised this code path at all. The
+  first plan for this spike would have proved nothing.
+
+The earlier claim was made before the capability was installed and before the
+registry was searched for a `0x0000042A` language profile. Both of those were
+cheap, and neither was done.
+
+### Still not exercised
+
+- **Queued locks.** `RequestLock` while a lock is held, returning `TS_S_ASYNC`,
+  never fired: 0 occurrences across 27 grants. The path is implemented and
+  untested, and it is the part most likely to be wrong.
+- **Read-only locks during composition.** All 27 grants in the Telex session were
+  read/write; the read-only path (`0x3`) appeared only during start-up queries.
+- **Longer phrases.** `keyboardputstring` delivers keys far faster than a human,
+  and the Telex engine stopped transforming after the first syllable when fed a
+  whole phrase that way — the buffer filled with literal `tieengs` rather than
+  `tiếng`. That is the injection harness outrunning the IME's own state machine,
+  not a text-store fault, but it means only short sequences are actually
+  verified.
 
 ## A bug this found in itself
 

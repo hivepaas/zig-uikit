@@ -1,0 +1,222 @@
+zig-uikit TSF spike -- Windows IME via ITextStoreACP.
+Cross-compiled on Linux: no MSVC, no Windows SDK.
+
+  ACP = Application Character Position = UTF-16 CODE UNITS,
+  the same unit as a BSTR. Windows is internally consistent;
+  Linux is not (text-input-v3 counts bytes, AT-SPI counts codepoints).
+
+ITfThreadMgr created
+activated, client id 32
+  -> AdviseSink(mask=0x1f)
+document manager associated with the window
+
+  -> RequestLock(0x6) -> granting [read/write]
+  -> GetSelection -> 0..0
+  -> RequestLock(0x6) -> granting [read/write]
+  -> GetText(0..-1) -> 0 utf16 units
+Window open and focused. Switch the input language to Vietnamese
+(Win+Space) and type Telex: aw -> a-breve, aws -> a-breve-acute,
+dd -> d-stroke, "tieengs vieejt" -> two words.
+
+What to watch for, and it is the opposite of spike B:
+  - SetText puts the COMPOSING characters into the document
+  - OnStartComposition marks them provisional, OnEndComposition commits
+  - every offset is UTF-16 code units, never bytes
+
+Close the window to finish.
+
+  -> RequestLock(0x6) -> granting [read/write]
+  -> GetTextExt -> screen (42,125)
+  -> RequestLock(0x6) -> granting [read/write]
+  -> RequestLock(0x6) -> granting [read/write]
+  -> RequestLock(0x6) -> granting [read/write]
+  -> GetSelection -> 0..0
+  -> GetSelection -> 0..0
+  -> OnStartComposition at 0
+  -> SetText(flags=0x0 0..0 <- "a" 1 utf16 units)
+  [doc] "a" | acp sel 1..1 | COMPOSING | 1 utf16 = 1 bytes = 1 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(1..1)
+  -> GetTextExt -> screen (42,125)
+  -> GetTextExt -> screen (42,125)
+  -> GetSelection -> 1..1
+  -> RequestLock(0x6) -> granting [read/write]
+  -> SetText(flags=0x0 0..1 <- "ă" 1 utf16 units)
+  [doc] "ă" | acp sel 1..1 | COMPOSING | 1 utf16 = 2 bytes = 1 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(1..1)
+  -> GetTextExt -> screen (42,125)
+  -> GetSelection -> 1..1
+  -> RequestLock(0x7) -> granting [read/write]
+  -> SetText(flags=0x0 0..1 <- "ă" 1 utf16 units)
+  [doc] "ă" | acp sel 1..1 | COMPOSING | 1 utf16 = 2 bytes = 1 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(1..1)
+  -> GetSelection -> 1..1
+  -> OnEndComposition -- the text in the document is now committed
+  [doc] "ă" | acp sel 1..1 | 1 utf16 = 2 bytes = 1 codepoints
+  -> RequestLock(0x6) -> granting [read/write]
+  -> GetTextExt -> screen (42,125)
+  -> RequestLock(0x6) -> granting [read/write]
+  -> RequestLock(0x6) -> granting [read/write]
+  -> GetTextExt -> screen (42,125)
+  -> RequestLock(0x6) -> granting [read/write]
+  -> RequestLock(0x6) -> granting [read/write]
+  -> SetSelection(0..1)
+  -> GetSelection -> 0..1
+  -> GetSelection -> 0..1
+  -> OnStartComposition at 0
+  -> SetText(flags=0x0 0..1 <- "ă" 1 utf16 units)
+  [doc] "ă" | acp sel 1..1 | COMPOSING | 1 utf16 = 2 bytes = 1 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(1..1)
+  -> SetText(flags=0x0 0..1 <- "ắ" 1 utf16 units)
+  [doc] "ắ" | acp sel 1..1 | COMPOSING | 1 utf16 = 3 bytes = 1 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(1..1)
+  -> GetTextExt -> screen (552,412)
+  -> GetTextExt -> screen (552,412)
+  -> GetTextExt -> screen (552,412)
+  -> GetTextExt -> screen (552,412)
+  -> GetSelection -> 1..1
+  -> RequestLock(0x6) -> granting [read/write]
+  -> SetText(flags=0x0 0..1 <- "ắ" 1 utf16 units)
+  [doc] "ắ" | acp sel 1..1 | COMPOSING | 1 utf16 = 3 bytes = 1 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(1..1)
+  -> OnEndComposition -- the text in the document is now committed
+  [doc] "ắ" | acp sel 1..1 | 1 utf16 = 3 bytes = 1 codepoints
+  -> GetTextExt -> screen (552,412)
+  -> GetTextExt -> screen (552,412)
+  -> GetSelection -> 1..1
+  -> RequestLock(0x6) -> granting [read/write]
+  -> SetSelection(0..1)
+  -> GetSelection -> 0..1
+  -> GetSelection -> 0..1
+  -> OnStartComposition at 0
+  -> SetText(flags=0x0 0..1 <- "ắ" 1 utf16 units)
+  [doc] "ắ" | acp sel 1..1 | COMPOSING | 1 utf16 = 3 bytes = 1 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(1..1)
+  -> SetText(flags=0x0 0..1 <- "ắt" 2 utf16 units)
+  [doc] "ắt" | acp sel 2..2 | COMPOSING | 2 utf16 = 4 bytes = 2 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(2..2)
+  -> GetTextExt -> screen (552,412)
+  -> GetTextExt -> screen (552,412)
+  -> GetTextExt -> screen (552,412)
+  -> GetTextExt -> screen (552,412)
+  -> GetSelection -> 2..2
+  -> RequestLock(0x6) -> granting [read/write]
+  -> SetText(flags=0x0 0..2 <- "ắti" 3 utf16 units)
+  [doc] "ắti" | acp sel 3..3 | COMPOSING | 3 utf16 = 5 bytes = 3 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(3..3)
+  -> GetTextExt -> screen (552,412)
+  -> GetSelection -> 3..3
+  -> RequestLock(0x6) -> granting [read/write]
+  -> SetText(flags=0x0 0..3 <- "ắtie" 4 utf16 units)
+  [doc] "ắtie" | acp sel 4..4 | COMPOSING | 4 utf16 = 6 bytes = 4 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(4..4)
+  -> GetTextExt -> screen (552,412)
+  -> GetSelection -> 4..4
+  -> RequestLock(0x6) -> granting [read/write]
+  -> SetText(flags=0x0 0..4 <- "ắtiee" 5 utf16 units)
+  [doc] "ắtiee" | acp sel 5..5 | COMPOSING | 5 utf16 = 7 bytes = 5 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(5..5)
+  -> GetTextExt -> screen (552,412)
+  -> GetSelection -> 5..5
+  -> RequestLock(0x6) -> granting [read/write]
+  -> SetText(flags=0x0 0..5 <- "ắtieen" 6 utf16 units)
+  [doc] "ắtieen" | acp sel 6..6 | COMPOSING | 6 utf16 = 8 bytes = 6 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(6..6)
+  -> GetTextExt -> screen (552,412)
+  -> GetSelection -> 6..6
+  -> RequestLock(0x6) -> granting [read/write]
+  -> SetText(flags=0x0 0..6 <- "ắtieeng" 7 utf16 units)
+  [doc] "ắtieeng" | acp sel 7..7 | COMPOSING | 7 utf16 = 9 bytes = 7 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(7..7)
+  -> GetTextExt -> screen (552,412)
+  -> GetSelection -> 7..7
+  -> RequestLock(0x6) -> granting [read/write]
+  -> SetText(flags=0x0 0..7 <- "ắtieengs" 8 utf16 units)
+  [doc] "ắtieengs" | acp sel 8..8 | COMPOSING | 8 utf16 = 10 bytes = 8 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(8..8)
+  -> GetTextExt -> screen (552,412)
+  -> GetSelection -> 8..8
+  -> RequestLock(0x6) -> granting [read/write]
+  -> SetText(flags=0x0 0..8 <- "ắtieengs" 8 utf16 units)
+  [doc] "ắtieengs" | acp sel 8..8 | COMPOSING | 8 utf16 = 10 bytes = 8 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(8..8)
+  -> OnEndComposition -- the text in the document is now committed
+  [doc] "ắtieengs" | acp sel 8..8 | 8 utf16 = 10 bytes = 8 codepoints
+  -> GetTextExt -> screen (552,412)
+  -> GetTextExt -> screen (552,412)
+  -> GetSelection -> 8..8
+  -> RequestLock(0x6) -> granting [read/write]
+  -> SetSelection(0..8)
+  -> GetSelection -> 0..8
+  -> GetSelection -> 0..8
+  -> OnStartComposition at 0
+  -> SetText(flags=0x0 0..8 <- "ắtieengs" 8 utf16 units)
+  [doc] "ắtieengs" | acp sel 8..8 | COMPOSING | 8 utf16 = 10 bytes = 8 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(8..8)
+  -> SetText(flags=0x0 0..8 <- "ắtieengsv" 9 utf16 units)
+  [doc] "ắtieengsv" | acp sel 9..9 | COMPOSING | 9 utf16 = 11 bytes = 9 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(9..9)
+  -> GetTextExt -> screen (552,412)
+  -> GetTextExt -> screen (552,412)
+  -> GetTextExt -> screen (552,412)
+  -> GetTextExt -> screen (552,412)
+  -> GetSelection -> 9..9
+  -> RequestLock(0x6) -> granting [read/write]
+  -> SetText(flags=0x0 0..9 <- "ắtieengsvi" 10 utf16 units)
+  [doc] "ắtieengsvi" | acp sel 10..10 | COMPOSING | 10 utf16 = 12 bytes = 10 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(10..10)
+  -> GetTextExt -> screen (552,412)
+  -> GetSelection -> 10..10
+  -> RequestLock(0x6) -> granting [read/write]
+  -> SetText(flags=0x0 0..10 <- "ắtieengsvie" 11 utf16 units)
+  [doc] "ắtieengsvie" | acp sel 11..11 | COMPOSING | 11 utf16 = 13 bytes = 11 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(11..11)
+  -> GetTextExt -> screen (552,412)
+  -> GetSelection -> 11..11
+  -> RequestLock(0x6) -> granting [read/write]
+  -> SetText(flags=0x0 0..11 <- "ắtieengsviee" 12 utf16 units)
+  [doc] "ắtieengsviee" | acp sel 12..12 | COMPOSING | 12 utf16 = 14 bytes = 12 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(12..12)
+  -> GetTextExt -> screen (552,412)
+  -> GetSelection -> 12..12
+  -> RequestLock(0x6) -> granting [read/write]
+  -> SetText(flags=0x0 0..12 <- "ắtieengsvieej" 13 utf16 units)
+  [doc] "ắtieengsvieej" | acp sel 13..13 | COMPOSING | 13 utf16 = 15 bytes = 13 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(13..13)
+  -> GetTextExt -> screen (552,412)
+  -> GetSelection -> 13..13
+  -> RequestLock(0x6) -> granting [read/write]
+  -> SetText(flags=0x0 0..13 <- "ắtieengsvieejt" 14 utf16 units)
+  [doc] "ắtieengsvieejt" | acp sel 14..14 | COMPOSING | 14 utf16 = 16 bytes = 14 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(14..14)
+  -> GetTextExt -> screen (552,412)
+  -> GetSelection -> 14..14
+  -> RequestLock(0x7) -> granting [read/write]
+  -> SetText(flags=0x0 0..14 <- "ắtieengsvieejt" 14 utf16 units)
+  [doc] "ắtieengsvieejt" | acp sel 14..14 | COMPOSING | 14 utf16 = 16 bytes = 14 codepoints
+  -> OnUpdateComposition
+  -> SetSelection(14..14)
+  -> GetSelection -> 14..14
+  -> OnEndComposition -- the text in the document is now committed
+  [doc] "ắtieengsvieejt" | acp sel 14..14 | 14 utf16 = 16 bytes = 14 codepoints

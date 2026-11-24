@@ -75,9 +75,8 @@ code exists:
   Windows SDK. **Narrator reads it**: 93 calls into the process, ending in
   `get_Value`.
 - [spikes/tsf-windows](spikes/tsf-windows/) — Windows IME via `ITextStoreACP`,
-  29 methods plus a lock protocol. TSF drives the store with real read and
-  read/write locks; composition is untested because the guest has no composing
-  IME installed.
+  29 methods plus a lock protocol. **Telex composes correctly** through
+  Windows 11's own Vietnamese TSF IME: 173 calls, 23 `SetText`, 5 compositions.
 
 Together they surfaced the constraint that shapes the text field. **The same
 widget has to speak three different offset units:**
