@@ -51,6 +51,43 @@ fn expectIncrementalMatchesFull(t: *Tree) !void {
 
 // --------------------------------------------------------------- basic layout
 
+test "an overflowing child does not enlarge its line" {
+    // CSS 9.4 step 8: a single-line container's line cross size is the
+    // container's inner cross size. Taking the maximum over the children
+    // instead lets one overflowing child move every centred sibling, which is
+    // what a popover anchor did to a toolbar row in `tools/demo.zig`.
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    const row = try t.appendChild(t.root(), .{
+        .axis = .row,
+        .height = .{ .fixed = 28 },
+        .flex_shrink = 0,
+        .padding = 7,
+        .gap = 8,
+        .align_items = .center,
+    });
+    const icon = try t.appendChild(row, .{
+        .width = .{ .fixed = 14 },
+        .height = .{ .fixed = 14 },
+        .flex_shrink = 0,
+    });
+    // Four times taller than the row's inner box, and invisible.
+    const anchor = try t.appendChild(row, .{
+        .width = .{ .fixed = 0 },
+        .height = .{ .fixed = 56 },
+        .flex_shrink = 0,
+    });
+    t.layout(viewport);
+
+    // The icon exactly fills the row's 14-pixel inner height, so centring puts
+    // it at the padding edge and nowhere else.
+    try testing.expectEqual(@as(f32, 7), t.bounds(icon).y);
+    try testing.expectEqual(@as(f32, 7), t.bounds(anchor).y);
+    try testing.expectEqual(@as(f32, 28), t.bounds(row).h);
+}
+
+
+
 test "a column stacks children and sums their heights" {
     var t = try Tree.init(testing.allocator);
     defer t.deinit();

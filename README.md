@@ -2,12 +2,22 @@
 
 A declarative GPU UI toolkit for Zig.
 
-> **Status: pre-alpha.** The layout core exists and is tested; there is no
-> renderer, no text and no widgets. Expect the API to change without notice.
+> **Status: pre-alpha.** The layout core and the scene layer exist and are
+> tested; there is no GPU renderer, no text and no widgets. Expect the API to
+> change without notice.
 
 ```sh
-zig build test    # 18 tests, no platform dependencies
+zig build test                           # 46 tests, no platform dependencies
+zig build demo                           # renders docs/demo.png in software
+zig build bench -Doptimize=ReleaseFast   # what it costs
 ```
+
+![a window's worth of interface, rendered by the software rasteriser](docs/demo.png)
+
+Everything above is drawn by this repository: layout, clipping, culling, the
+popover escaping the panel that owns it, and the pixels themselves. There is no
+window and no GPU involved, and no text — labels are the bars a design tool uses
+where text will go, which is honest about what exists.
 
 ```zig
 var t = try ui.Tree.init(gpa);
@@ -17,11 +27,16 @@ try t.setStyle(t.root(), .{ .axis = .col, .padding = 8, .gap = 4 });
 const row = try t.appendChild(t.root(), .{ .axis = .row, .height = .{ .fixed = 32 } });
 const label = try t.appendChild(row, .{ .width = .{ .grow = 1 } });
 
+t.setPaint(row, .{ .background = ui.Color.hex(0x2F3135), .corner_radius = 6 });
+
 t.layout(.{ .w = 1280, .h = 720 });
 
 // Later. Only what changed is recomputed; an unchanged frame does nothing.
 try t.setStyle(label, .{ .width = .{ .grow = 2 } });
 const cost = t.flush();   // .intrinsic, .position, .fast_path, .slow_path
+
+var scene = ui.Scene.init(gpa);
+_ = try scene.build(&t);  // a flat list of 48-byte quads, ready to upload
 ```
 
 The tree is **retained and mutated**, not rebuilt per frame. That is the whole
@@ -29,6 +44,65 @@ point: a frame arena reset wholesale cannot reuse last frame's subtrees, which
 is where the saving comes from. A declarative layer belongs on top of this, and
 `setStyle` compares before marking dirty so that re-setting an unchanged style
 every frame costs nothing.
+
+## The scene layer
+
+`Paint` is a separate struct from `Style`, reached by a separate setter, and
+that separation is the point rather than tidiness. `Style.eql` is what decides
+whether an element is dirty for layout, so a background colour living in `Style`
+would mean that recolouring a button runs the flexbox engine over its container.
+Measured on this library, 1 641 elements:
+
+| | cost | for comparison |
+| --- | --- | --- |
+| `flush()`, nothing changed | **1.3 ns** | GPUI unchanged frame: 2.32 ms of CPU |
+| `setPaint` a leaf + `flush()` | **1.9 ns** | GPUI leaf style: 3.9 ms |
+| `setStyle` a leaf's *size* + `flush()` | 142 ns | propagates; no GPUI equivalent |
+| full `layout()` | 24 us | GPUI full refresh: 3.50 ms |
+| `Scene.build`, nothing changed | 3.8 ns | one integer comparison |
+| `Scene.build`, full rebuild | 8.4 us | 0.35% of GPUI's unchanged frame |
+
+This is the first time the shipped library has been measured rather than the
+prototype in the benchmark repository, and the point of running it was that it
+could have failed. It did not.
+
+The scene is **rebuilt whole, never patched**. A full rebuild is 8.4 us against
+the 2.32 ms it is competing with, so a second dirty-tracking system would be
+maintaining bugs in exchange for microseconds. What keeps the headline claim
+true end to end is instead a revision counter: `Scene.build` returns after one
+integer comparison when nothing has changed.
+
+There is one primitive, a 48-byte rounded bordered rectangle, and it carries its
+own absolute clip rectangle rather than relying on push/pop state — so the list
+survives being bucketed by painting layer, the GPU gets one draw call, and a
+subtree outside its clip is skipped in a single test.
+
+`src/raster.zig` is a software rasteriser. It is **not** the renderer: it exists
+because paint is the one part of a toolkit that cannot be checked by asserting
+on numbers, and `coverage` in it is the signed distance field the GPU shader
+will be written from, so the two cannot quietly disagree.
+
+### Two bugs the picture found that the tests did not
+
+Rendering the demo immediately falsified something the test suite had been happy
+with for 46 tests. A single non-wrapping flex line was taking its cross size as
+the *largest child*, where CSS 9.4 step 8 says it is the *container's inner
+cross size*. An invisible 116-pixel popover anchor inside a 28-pixel toolbar row
+was therefore pushing that row's icon and label 51 pixels down. Fixing it also
+deleted a per-element cache: the correct rule needs no maximum over siblings, so
+the fast path got smaller as well as right.
+
+The second: `clip_children` was clipping at the element's outer edge, so the
+first overflowing child painted straight over the border meant to contain it.
+CSS clips to the padding box. Both now have regression tests, but neither was
+going to be found by writing more assertions.
+
+### A known divergence from CSS
+
+`align_items` defaults to `start` here, where CSS defaults it to `stretch`. Every
+container that should fill its parent across its axis has to say so. Whether
+that is the right default is still open; it is written down rather than
+discovered later.
 
 ## What it is meant to be
 

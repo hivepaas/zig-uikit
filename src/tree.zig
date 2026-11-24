@@ -18,6 +18,10 @@
 //!
 //!   - The tree is RETAINED. A frame arena that is reset wholesale cannot reuse
 //!     last frame's subtrees, which is the entire saving.
+//!   - The cross extent of a single non-wrapping line is the container's own
+//!     inner cross size, not the tallest child's. That is what CSS 9.4 step 8
+//!     says, and it is also the only version the fast path can compute without
+//!     scanning siblings -- the correct rule turned out to be the cheap one.
 //!   - `sum_main` is maintained incrementally so the overflow test is O(1).
 //!     Testing it the obvious way means scanning every sibling, which is the
 //!     work being avoided, and without the cache `flex-shrink: 1` alone forces
@@ -38,6 +42,7 @@ const Allocator = std.mem.Allocator;
 
 const geometry = @import("geometry.zig");
 const style_mod = @import("style.zig");
+const paint_mod = @import("paint.zig");
 
 pub const Rect = geometry.Rect;
 pub const Size = geometry.Size;
@@ -47,6 +52,8 @@ pub const Style = style_mod.Style;
 pub const Sizing = style_mod.Sizing;
 pub const Justify = style_mod.Justify;
 pub const AlignItems = style_mod.AlignItems;
+pub const Paint = paint_mod.Paint;
+pub const Color = paint_mod.Color;
 
 pub const Index = u32;
 pub const none: Index = std.math.maxInt(Index);
@@ -92,6 +99,11 @@ pub const Element = struct {
     // --- the caller's style, kept verbatim so `setStyle` can compare inputs ---
     style: Style = .{},
 
+    /// What this element looks like. Deliberately a separate value from
+    /// `style`, reached by a separate setter that does not dirty layout; see
+    /// `paint.zig`.
+    paint: Paint = .{},
+
     // --- denormalised style, read by the hot loops ---
     axis: Axis = .col,
     w_mode: Mode = .content,
@@ -116,11 +128,6 @@ pub const Element = struct {
     /// Children's hypothetical outer main sizes plus gaps. Maintained as
     /// intrinsics are recomputed; see the file header.
     sum_main: f32 = 0,
-    /// The largest child size ACROSS this element's axis, cached for the same
-    /// reason as `sum_main`: a line's cross extent is a maximum over siblings,
-    /// so computing it in the fast path would mean the sibling scan the fast
-    /// path exists to avoid.
-    max_cross: f32 = 0,
     /// Any child with a grow factor on this element's main axis.
     any_grow_main: bool = false,
     /// Any child that will shrink when the line overflows. Almost always true
@@ -198,6 +205,16 @@ pub const Tree = struct {
 
     viewport: Size = .{},
     stats: Stats = .{},
+
+    /// Bumped whenever anything that could change the rendered scene has
+    /// actually changed: a repaint, or a layout that did work.
+    ///
+    /// This is how the measured claim survives the paint layer. `Scene.build`
+    /// records the revision it built from and returns immediately when it still
+    /// matches, so a frame where nothing changed costs one integer comparison
+    /// at the scene layer too, rather than a walk over the tree emitting the
+    /// same primitives again. A `u64` so it cannot wrap in any real session.
+    revision: u64 = 1,
 
     pub fn init(gpa: Allocator) Error!Tree {
         var t: Tree = .{ .gpa = gpa };
@@ -310,6 +327,45 @@ pub const Tree = struct {
         return .{ .w = e.intrinsic_w, .h = e.intrinsic_h };
     }
 
+    /// Every element, in index order. The scene builder and the layout engine
+    /// both walk this directly rather than through accessors, because a tree
+    /// walk that re-indexes the list per field read pays a bounds check per
+    /// field; callers outside the package should use the accessors below.
+    pub fn elements(self: *const Tree) []const Element {
+        return self.els.items;
+    }
+
+    /// Named `parentOf` rather than `parent` because the layout engine already
+    /// uses `parent` as a local name throughout.
+    pub fn parentOf(self: *const Tree, el: Index) Index {
+        return self.els.items[el].parent;
+    }
+
+    pub fn firstChild(self: *const Tree, el: Index) Index {
+        return self.els.items[el].first_child;
+    }
+
+    pub fn nextSibling(self: *const Tree, el: Index) Index {
+        return self.els.items[el].next_sibling;
+    }
+
+    pub fn childCount(self: *const Tree, el: Index) u32 {
+        return self.els.items[el].child_count;
+    }
+
+    pub fn paint(self: *const Tree, el: Index) Paint {
+        return self.els.items[el].paint;
+    }
+
+    /// Sets appearance. Never dirties layout, by construction: the whole reason
+    /// `Paint` is not part of `Style` is so that this function cannot.
+    pub fn setPaint(self: *Tree, el: Index, p: Paint) void {
+        const e = &self.els.items[el];
+        if (Paint.eql(e.paint, p)) return;
+        e.paint = p;
+        self.revision += 1;
+    }
+
     fn applyStyle(self: *Tree, el: Index, s: Style) void {
         const e = &self.els.items[el];
         e.style = s;
@@ -372,16 +428,33 @@ pub const Tree = struct {
 
     /// Deepest element containing the point, or the root. Front-to-back within
     /// a parent: later children are painted later and so hit first.
+    ///
+    /// `Paint.clip_children` needs no test here, which is worth stating because
+    /// the opposite is the obvious assumption. The descent only enters a child
+    /// whose bounds contain the point, so every element on the path contains
+    /// it; a clip is the intersection of the clipping elements on that path,
+    /// and a point inside all of them is inside their intersection. A clip can
+    /// therefore never exclude a hit this function would otherwise report.
+    /// Clip-aware testing starts to matter only for a hit test that does not
+    /// descend by containment -- which is the scene-order one described below.
+    ///
+    /// What this does NOT respect is `Paint.layer`. A layered subtree paints
+    /// over whatever is beneath it but is not hit first here, so a tooltip
+    /// drawn over a button does not yet intercept the click. Getting that right
+    /// means testing in the order things were actually painted, which is the
+    /// order `Scene` already holds, against the clip each primitive already
+    /// carries. So it belongs to a scene-driven hit test and is left undone
+    /// rather than approximated here.
     pub fn hitTest(self: *const Tree, p: Point) Index {
         var hit: Index = self.root();
         if (!self.els.items[hit].bounds.contains(p)) return hit;
-        outer: while (true) {
+        while (true) {
             var c = self.els.items[hit].first_child;
             var found: Index = none;
             while (c != none) : (c = self.els.items[c].next_sibling) {
                 if (self.els.items[c].bounds.contains(p)) found = c;
             }
-            if (found == none) break :outer;
+            if (found == none) break;
             hit = found;
         }
         return hit;
@@ -400,6 +473,7 @@ pub const Tree = struct {
         self.dirty.clearRetainingCapacity();
         self.needs_full = false;
         self.stats.full_layouts += 1;
+        self.revision += 1;
     }
 
     /// Applies everything marked dirty since the last call, and returns what it
@@ -415,6 +489,10 @@ pub const Tree = struct {
         }
         for (self.dirty.items) |el| self.flushElement(el);
         self.dirty.clearRetainingCapacity();
+        // A dirty element that turned out not to move still counted work, and
+        // `Stats.total()` being zero here means every entry was a no-op, so the
+        // scene genuinely cannot have changed.
+        if (self.stats.total() > 0) self.revision += 1;
         return self.stats;
     }
 
@@ -466,10 +544,11 @@ pub const Tree = struct {
             }
             e.any_grow_main = grow;
             e.any_shrink_main = shrink;
-            // Baseline alignment needs the maximum baseline AND the maximum
-            // descent across the line, two more running maxima than this engine
-            // caches, so it takes the slow path. Everything else is expressible
-            // from `max_cross`.
+            // Baseline alignment needs the maximum baseline and the maximum
+            // descent across the line, both of which are maxima over siblings
+            // and so cost exactly the scan the fast path exists to avoid. It
+            // takes the slow path. Every other alignment is expressible from
+            // the container's own bounds.
             e.simple_main = !grow and !e.style.wrap and
                 e.style.justify == .start and
                 e.style.align_items != .baseline;
@@ -556,7 +635,6 @@ pub const Tree = struct {
         }
         if (kids > 1) main_sz += e.style.gap * @as(f32, @floatFromInt(kids - 1));
         e.sum_main = main_sz;
-        e.max_cross = cross;
         main_sz += pad * 2;
         cross += pad * 2;
 
@@ -790,10 +868,22 @@ pub const Tree = struct {
             if (e.style.align_items == .baseline) line_cross = @max(line_cross, max_bl + max_below);
             self.line_main[li] = used;
             self.line_bl[li] = max_bl;
-            // A single non-wrapping line fills the container across its axis so
-            // that `stretch` and `center` have something to work against.
+            // A single non-wrapping line's cross extent IS the container's
+            // inner cross size, not the larger of that and the tallest child.
+            // CSS 9.4 step 8 says so, and the difference is visible: taking the
+            // maximum lets one overflowing child enlarge the line, which then
+            // moves every centred sibling. An invisible 116-pixel popover
+            // anchor inside a 28-pixel toolbar row pushed the row's icon and
+            // label 51 pixels down its own container -- found by looking at
+            // `tools/demo.zig`, not by any test.
+            //
+            // Where the container's cross size came from its content, this is
+            // the same number by construction: the intrinsic pass set it to the
+            // largest child. Where it was imposed -- fixed, stretched, or
+            // clamped by min/max -- the imposed value is the correct one and
+            // the maximum was wrong.
             self.line_cross[li] = if (n_lines == 1 and !e.style.wrap)
-                @max(line_cross, avail_cross)
+                avail_cross
             else
                 line_cross;
         }
@@ -924,14 +1014,14 @@ pub const Tree = struct {
 
         const inner_x = e.bounds.x + pad;
         const inner_y = e.bounds.y + pad;
-        // A single non-wrapping line's cross extent is the larger of the
-        // container's inner size and the biggest child. `max_cross` supplies
-        // the second term without scanning siblings.
-        const avail_cross = switch (e.axis) {
+        // The fast path only ever runs on a single non-wrapping line, so the
+        // line's cross extent is the container's inner cross size; see the
+        // same decision in `positionChildren`. This used to read
+        // `@max(e.max_cross, avail_cross)` and had to match whatever that did.
+        const lc = switch (e.axis) {
             .row => @max(0, e.bounds.h - pad * 2),
             .col => @max(0, e.bounds.w - pad * 2),
         };
-        const lc = @max(e.max_cross, avail_cross);
         const gap = e.style.gap;
 
         var sp: usize = 0;
@@ -1058,9 +1148,9 @@ pub const Tree = struct {
         if (node == none) {
             self.repositionSubtree(self.root());
         } else {
-            // `recomputeIntrinsic(node)` already refreshed both `sum_main` and
-            // `max_cross` on the way past, even though it reported no change of
-            // its own, so the overflow test and the cross extent are current.
+            // `recomputeIntrinsic(node)` already refreshed `sum_main` on the
+            // way past, even though it reported no change of its own, so the
+            // overflow test is current.
             self.repositionFrom(node, child_on_path);
         }
     }
