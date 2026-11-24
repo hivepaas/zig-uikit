@@ -37,6 +37,16 @@ const row_alt = Color.hex(0x33363B);
 const width = 900;
 const height = 560;
 
+/// The field holding a composition in progress, so `main` can write a
+/// magnified crop of it. A module-level variable because this is a demo tool
+/// and threading a return value through three callers to carry one index would
+/// be worse than saying so here.
+pub var composition_field: Index = std.math.maxInt(Index);
+/// The width of that field's text, so the crop can show its end rather than a
+/// guessed offset that moves whenever the string does.
+pub var composition_text_w: f32 = 0;
+
+
 /// More rows than the panel can show, so the clip and the culling both have
 /// something to do.
 const row_total = 20;
@@ -102,6 +112,62 @@ fn label(t: *Tree, parent: Index, f: ?*text.Font, atlas: ?*text.Atlas, s: []cons
     t.setPaint(e, .{ .text_color = c });
     try text.setText(t, e, f.?, atlas.?, s);
     return e;
+}
+
+/// A bordered box that holds one line of text and whatever is drawn over it.
+fn textField(t: *Tree, parent: Index) !Index {
+    const field = try t.appendChild(parent, .{
+        .axis = .row,
+        .height = .{ .fixed = 34 },
+        .flex_shrink = 0,
+        .padding = 8,
+        .align_items = .center,
+    });
+    t.setPaint(field, .{
+        .background = card,
+        .border_color = line,
+        .border_width = 1,
+        .corner_radius = 8,
+    });
+    return field;
+}
+
+/// A box at `(x, y)` in the coordinates of the run that the label after it
+/// will hold, taking no space on the row.
+///
+/// The anchor is given the run's full height rather than zero. Under
+/// `align_items: .center` a zero-height element is centred as a *point*, so
+/// its children hang down from the middle of the row instead of lining up with
+/// the text -- which is what the first version of this did, and what the
+/// rendered image showed.
+fn overlay(t: *Tree, field: Index, x: f32, y: f32, w: f32, h: f32, run_h: f32, c: Color) !void {
+    const anchor = try t.appendChild(field, .{
+        .axis = .row,
+        .width = .{ .fixed = 0 },
+        .height = .{ .fixed = run_h },
+        .flex_shrink = 0,
+    });
+    _ = try t.appendChild(anchor, .{
+        .width = .{ .fixed = x },
+        .height = .{ .fixed = 1 },
+        .flex_shrink = 0,
+    });
+    const column = try t.appendChild(anchor, .{
+        .axis = .col,
+        .width = .{ .fixed = w },
+        .flex_shrink = 0,
+    });
+    _ = try t.appendChild(column, .{
+        .width = .{ .fixed = 1 },
+        .height = .{ .fixed = y },
+        .flex_shrink = 0,
+    });
+    const box = try t.appendChild(column, .{
+        .width = .{ .fixed = w },
+        .height = .{ .fixed = h },
+        .flex_shrink = 0,
+    });
+    t.setPaint(box, .{ .background = c, .corner_radius = if (h > 4) 2 else 0 });
 }
 
 fn spacer(t: *Tree, parent: Index) !Index {
@@ -274,100 +340,73 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
         _ = try label(t, c, ui_font, atlas, cell[2], dim);
     }
 
-    // --- a caret and a selection, drawn from the run's own answers ---
+    // --- what a text field looks like, drawn from the run and the document ---
     //
-    // The structure here is a workaround and says something true about the
+    // Two rows. The first is run-level: a selection and a caret, positioned by
+    // `TextRun.rangeRect` and `caretX`. The second is document-level: a
+    // `Document` holding a composition in progress, which is what
+    // `docs/text-and-accessibility.md` §2 is about -- and the first picture
+    // this project has produced of it.
+    //
+    // The positioning here is a workaround and says something true about the
     // toolkit. The scene builder paints an element's box, then its glyphs,
-    // then its children -- so there is no way to put a rectangle BEHIND an
-    // element's own text. A selection highlight therefore has to be a
-    // preceding sibling, positioned by a zero-width anchor and a spacer, the
-    // same trick the popover above uses for the same missing feature:
-    // absolute positioning.
-    //
-    // The numbers come from `TextRun.caretX`, which is the function
-    // `docs/text-and-accessibility.md` §7 is about. All four spikes answer
-    // "where is the caret" with a fixed rectangle, which is why their
-    // candidate windows appear in the wrong place on screen.
+    // then its children, so there is no way to put a rectangle behind an
+    // element's OWN text. Every overlay below is therefore a preceding
+    // sibling, positioned by a zero-width anchor and a spacer -- the same
+    // trick the popover uses, for the same missing feature: absolute
+    // positioning. The spacer is also why an overlay cannot start left of the
+    // label: a negative fixed width clamps to zero.
     {
         const field_text = "Nháy chuột vào đây: tiếng Việt";
         const sel = "tiếng Việt";
         const sel_start = std.mem.indexOf(u8, field_text, sel).?;
         const sel_end = sel_start + sel.len;
 
-        const field = try t.appendChild(content, .{
-            .axis = .row,
-            .height = .{ .fixed = 34 },
-            .flex_shrink = 0,
-            .padding = 8,
-            .align_items = .center,
-        });
-        t.setPaint(field, .{
-            .background = card,
-            .border_color = line,
-            .border_width = 1,
-            .corner_radius = 8,
-        });
-
+        const field = try textField(t, content);
         if (ui_font) |f| {
-            // Shaped once up here because the highlight has to be created
-            // before the label that it sits behind, and its position comes
-            // from the shaped run. `setText` below shapes again -- 2 us, with
-            // every glyph already in the atlas -- rather than the demo
-            // reaching into the element's run after the fact.
+            // Shaped once up here because the overlays have to be created
+            // before the label they sit behind, and their positions come from
+            // the shaped run. `setText` below shapes again -- 2 us, with every
+            // glyph already in the atlas -- rather than the demo reaching into
+            // the element's run after the fact.
             const run = try f.shape(atlas.?, field_text);
             const r = run.rangeRect(sel_start, sel_end);
-
-            const anchor = try t.appendChild(field, .{
-                .axis = .row,
-                // Zero width so it takes no room on the row, but the run's
-                // full height so that `align_items: .center` centres it the
-                // same way it centres the label. A zero-height anchor is
-                // centred as a point, and its children then hang DOWN from
-                // the middle of the row instead of sitting behind the text --
-                // which is what the first version of this did, and what the
-                // rendered image showed.
-                .width = .{ .fixed = 0 },
-                .height = .{ .fixed = r.h },
-                .flex_shrink = 0,
-            });
-            _ = try t.appendChild(anchor, .{
-                .width = .{ .fixed = r.x },
-                .height = .{ .fixed = 1 },
-                .flex_shrink = 0,
-            });
-            const highlight = try t.appendChild(anchor, .{
-                .width = .{ .fixed = r.w },
-                .height = .{ .fixed = r.h },
-                .flex_shrink = 0,
-            });
-            t.setPaint(highlight, .{ .background = Color.hex(0x2F4B8F), .corner_radius = 2 });
+            try overlay(t, field, r.x, 0, r.w, r.h, run.height(), Color.hex(0x2F4B8F));
+            try overlay(t, field, r.x + r.w, 0, 1, r.h, run.height(), Color.white);
         }
+        _ = try label(t, field, ui_font, atlas, field_text, bright);
+    }
+    {
+        // A Telex composition caught mid-word: the document ends in "Vi" and
+        // the input method is offering "ệt". On Wayland that offer is a
+        // preedit string that never enters the document; on Windows the
+        // processor would have written it in and marked the range provisional.
+        // `displayText` returns the same two values either way -- the string
+        // to lay out, and the byte range that is provisional -- so what
+        // follows never learns which protocol it is talking to.
+        var doc = ui.Document.init(t.gpa);
+        defer doc.deinit();
+        var scratch: std.ArrayList(u8) = .empty;
+        defer scratch.deinit(t.gpa);
 
-        const field_label = try label(t, field, ui_font, atlas, field_text, bright);
+        _ = try doc.insert(.application, "Bộ gõ đang soạn dở chữ: tiếng Vi");
+        try doc.setPreedit("ệt");
+        const shown = try doc.displayText(&scratch);
 
-        if (ui_font != null) {
-            // The caret, after the selection, at the far end of it.
-            const run = t.text(field_label);
-            const anchor = try t.appendChild(field, .{
-                .axis = .row,
-                .width = .{ .fixed = 0 },
-                .height = .{ .fixed = run.height() },
-                .flex_shrink = 0,
-            });
-            _ = try t.appendChild(anchor, .{
-                // Back up by the label's full width, because this anchor sits
-                // after it rather than at the field's content origin.
-                .width = .{ .fixed = run.caretX(sel_end) - run.width },
-                .height = .{ .fixed = 1 },
-                .flex_shrink = 0,
-            });
-            const caret = try t.appendChild(anchor, .{
-                .width = .{ .fixed = 1 },
-                .height = .{ .fixed = run.height() },
-                .flex_shrink = 0,
-            });
-            t.setPaint(caret, .{ .background = Color.white });
+        const field = try textField(t, content);
+        composition_field = field;
+        if (ui_font) |f| {
+            const run = try f.shape(atlas.?, shown.text);
+            composition_text_w = run.width;
+            const c = shown.composing.?;
+            const r = run.rangeRect(c.start, c.end);
+            // Underlined, not highlighted: §2 says provisional text is drawn
+            // differently and is part of the laid-out text, which is exactly
+            // what a byte range over one run buys.
+            try overlay(t, field, r.x, run.ascent + 2, r.w, 1, run.height(), accent);
+            try overlay(t, field, r.x + r.w, 0, 1, r.h, run.height(), Color.white);
         }
+        _ = try label(t, field, ui_font, atlas, shown.text, bright);
     }
 
     // --- the scrolling list: more rows than fit, clipped and culled ---
@@ -448,6 +487,23 @@ pub fn main() !void {
     const path = "docs/demo.png";
     try fb.writePng(io, path);
 
+    // The underline under provisional text is one pixel tall in a 900x560
+    // image, which is to say invisible in the screenshot. The README makes a
+    // claim about it, so the README gets a picture it can be checked against.
+    if (composition_field != std.math.maxInt(Index)) {
+        const b = t.bounds(composition_field);
+        // Just the end of the line: enough to show the committed text, the
+        // provisional text under it, and the caret, without the popover that
+        // overlaps the start of this field.
+        const tail = 100;
+        try writeCrop(gpa, io, &fb, .{
+            .x = b.x + 8 + @max(0, composition_text_w - tail),
+            .y = b.y,
+            .w = tail + 14,
+            .h = b.h,
+        }, 3, "docs/demo-composition.png");
+    }
+
     std.debug.print(
         \\{d} elements, {d} visited, {d} quads emitted ({d} of them glyphs)
         \\{d} culled as entirely outside their clip, of {d} list rows and their contents
@@ -462,4 +518,36 @@ pub fn main() !void {
         fonts.atlas.w,     fonts.atlas.h,      fonts.atlas.fillRatio() * 100,
         path,              width,              height,
     });
+}
+
+/// Writes a magnified crop of a framebuffer.
+///
+/// Nearest-neighbour, because the point of magnifying a UI screenshot is to
+/// see the pixels as they are. Smoothing them would hide exactly the thing
+/// being looked at.
+fn writeCrop(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    src: *const ui.Framebuffer,
+    r: ui.Rect,
+    scale: u32,
+    path: []const u8,
+) !void {
+    const x0: u32 = @intFromFloat(@max(0, r.x));
+    const y0: u32 = @intFromFloat(@max(0, r.y));
+    const w = @min(@as(u32, @intFromFloat(r.w)), src.w - x0);
+    const h = @min(@as(u32, @intFromFloat(r.h)), src.h - y0);
+
+    var out = try ui.Framebuffer.init(gpa, w * scale, h * scale);
+    defer out.deinit();
+    for (0..h * scale) |dy| {
+        for (0..w * scale) |dx| {
+            const sx = x0 + @as(u32, @intCast(dx)) / scale;
+            const sy = y0 + @as(u32, @intCast(dy)) / scale;
+            const from = (@as(usize, sy) * src.w + sx) * 4;
+            const to = (dy * w * scale + dx) * 4;
+            @memcpy(out.px[to..][0..4], src.px[from..][0..4]);
+        }
+    }
+    try out.writePng(io, path);
 }

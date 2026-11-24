@@ -8,7 +8,7 @@ A declarative GPU UI toolkit for Zig.
 > There are no widgets. Expect the API to change without notice.
 
 ```sh
-zig build test                           # 66 tests, no platform dependencies
+zig build test                           # 79 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
 zig build test-text                      # 14 tests, needs a font installed
@@ -315,6 +315,72 @@ children hung down from the middle of the row instead of sitting behind the
 text. Giving the anchor the run's height fixed it. That the demo is a picture
 is the only reason it was noticed.
 
+### The document, and the trap in designing it Wayland-first
+
+`src/document.zig` is §2 and §6 of the spec made executable: a byte buffer, a
+selection, a provisional composition range, and a `canEditNow()` guard. It
+links nothing and needs no window.
+
+The shape is **Windows-first on purpose**, and the spec is blunt about why.
+The same three keystrokes, `a` `w` `s` producing `ă`, arrive two ways:
+
+```
+Wayland:  preedit is a SEPARATE STRING. It never enters the document.
+Windows:  the processor WRITES INTO THE DOCUMENT and marks it provisional.
+```
+
+The Windows shape can represent Wayland — leave the range unused — and the
+Wayland shape cannot represent Windows at all. Spike B designed Wayland-first
+and produced a model spike E could not use. So the document carries the
+provisional range, the preedit sits beside it, and one function returns what
+both paths need:
+
+```zig
+const shown = try doc.displayText(&scratch);
+// shown.text      the string to lay out
+// shown.composing the byte range that is provisional, or null
+```
+
+On Windows that is the document unchanged with the range it was given; on
+Wayland the preedit is spliced in at the caret and the range says where it
+landed. Nothing downstream learns which protocol it is talking to. Both spikes'
+logged event sequences are transcribed into tests, and they are the test this
+file exists to pass.
+
+An edit reports its extent in **all three units at once**, computed where both
+the old text and the new one exist:
+
+```zig
+pub const Edit = struct { bytes: Extent, chars: Extent, utf16: Extent };
+```
+
+That is not belt and braces. `old_end` can only be converted against the text
+as it was, so a caller that kept bytes and converted later would convert it
+against the wrong string — a bug that does not crash and surfaces as a screen
+reader reading the wrong span. TSF's `(acpStart, acpOldEnd, acpNewEnd)` is
+`utf16`; AT-SPI's `(start, length)` is `chars`.
+
+The edits refuse what §6 says they must: the application cannot edit while a
+processor holds a lock or a composition is active, and a processor cannot write
+under a read-only lock. The lock *queue* — a request arriving while a lock is
+held has to be deferred, and the drain has to be a loop because a request can
+be queued from inside a deferred grant — belongs to the TSF adapter, which is
+the only thing with a `RequestLock` to answer.
+
+Two things are in bytes and aligned anyway rather than trusted:
+`delete_surrounding_text`'s counts, because a compositor is another process and
+a count that splits a character leaves the buffer holding invalid UTF-8; and
+backspace, which deletes a character rather than a byte for the same reason.
+
+![a Telex composition in progress: tiếng Vi committed, ệt provisional and underlined](docs/demo-composition.png)
+
+The second field in the demo is that document, with a Telex composition caught
+mid-word: `tiếng Vi` committed, `ệt` provisional and underlined, the caret after
+it. All four spikes could compose text and none could draw it; this is the
+first picture of it. The image is a 3× nearest-neighbour crop written by
+`zig build demo` from the same framebuffer as the screenshot above, because a
+one-pixel underline in a 900×560 image is a claim nobody can check.
+
 ### Text is Vulkan-only so far
 
 The Metal backend has no glyph atlas yet, and until it does the macOS demo is
@@ -344,13 +410,14 @@ Line breaking, bidirectional text, and font fallback for a glyph the matched
 family lacks. One shaped line is the unit here, and each of those is a separate
 piece of work on top of it rather than something to half-do inside it.
 
-Of the document model that
-[docs/text-and-accessibility.md](docs/text-and-accessibility.md) specifies, the
-unit conversions (§1) and caret geometry in run coordinates (§7) now exist.
-What does not: the document itself — a byte buffer with a selection, a
-provisional composition range (§2) and the `canEditNow()` guard the TSF lock
-protocol needs (§6) — and converting a caret rectangle from run coordinates to
-screen coordinates, which needs the window to say where it is.
+Of the eight requirements in
+[docs/text-and-accessibility.md](docs/text-and-accessibility.md), §1 (unit
+conversion), §2 (the provisional range) and §6 (the edit guard) now exist, and
+§7 exists in run coordinates. What does not: converting a caret rectangle from
+run coordinates to *screen* coordinates, which needs the window to say where it
+is; the adapters themselves, which is where §3, §4, §5 and §8 live; and any
+keyboard input at all, so nothing yet drives the document except its tests and
+the demo.
 
 ## The Vulkan backend
 

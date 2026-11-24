@@ -25,6 +25,7 @@ pub const tree = @import("tree.zig");
 pub const paint = @import("paint.zig");
 pub const glyph = @import("glyph.zig");
 pub const offsets = @import("offsets.zig");
+pub const document = @import("document.zig");
 pub const scene = @import("scene.zig");
 pub const raster = @import("raster.zig");
 
@@ -42,6 +43,9 @@ pub const Color = paint.Color;
 pub const Paint = paint.Paint;
 pub const Layer = paint.Layer;
 pub const layers = paint.layers;
+
+pub const Document = document.Document;
+pub const Range = document.Range;
 
 pub const Glyph = glyph.Glyph;
 pub const TextRun = glyph.TextRun;
@@ -68,6 +72,7 @@ test {
     _ = paint;
     _ = glyph;
     _ = offsets;
+    _ = document;
     _ = scene;
     _ = raster;
     _ = @import("layout_test.zig");
