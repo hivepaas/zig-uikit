@@ -224,12 +224,18 @@ on Windows.
 
 ## What this does not settle
 
-- **macOS.** `NSTextInputClient` and `NSAccessibility` are unexamined. Zig has no
-  Objective-C support, so both require runtime class registration through
-  `objc_msgSend` — a different order of effort from the C APIs above. That
-  mechanism now exists in `src/platform/objc.zig` and runs: the macOS window's
-  delegate is a class defined at run time. The protocols themselves are the
-  next spikes.
+- **macOS accessibility.** `NSAccessibility` is unexamined. `NSTextInputClient`
+  is no longer: it is implemented in the toolkit rather than as a spike
+  (`src/input_client.zig`, `src/platform/macos.zig`), and Apple's Vietnamese
+  Simple Telex composes through it. It confirmed §2's choice — macOS has the
+  TSF shape, provisional text in the document — and then showed a third
+  shape none of B-E met: Simple Telex **never marks text at all**. Each key is
+  an `insertText:` with an explicit UTF-16 replacement range that rewrites the
+  syllable in place, after reading it back about five times
+  (`attributedSubstringForProposedRange:`). So the replacement range is the
+  whole mechanism, not an edge case, and §1's unit rule decides whether
+  Vietnamese can be typed on a Mac at all. The README's macOS section has the
+  measurements.
 - **X11.** XIM or ibus over DBus, a separate problem of similar size to spike B.
 - **Provider lifetimes** (§5), the largest gap.
 - **Text layout** (§7), which everything in §1 and §7 ultimately depends on.

@@ -9,7 +9,7 @@ A declarative GPU UI toolkit for Zig.
 > There are no widgets. Expect the API to change without notice.
 
 ```sh
-zig build test                           # 101 tests, no platform dependencies
+zig build test                           # 113 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
 zig build test-text                      # 15 tests, needs a font installed
@@ -635,11 +635,9 @@ it. Nothing here sends a `set_cursor_rectangle` either, which needs the caret
 rectangle converted from run coordinates to screen coordinates, which needs the
 window to say where it is.
 
-The keyboard is Wayland-only. macOS delivers key events through `NSResponder`
-and does its own keymap translation in AppKit, so the platform half has to be
-written again there — but only the platform half: `keys.zig` and `editing.zig`
-are in core and the second backend reuses both, which is the whole reason they
-are shaped as plain data rather than as something that owns an xkb state.
+On macOS the platform half is written again, as this section predicted, and
+`keys.zig` and `editing.zig` were reused — with one change to `editing.zig`
+that the Mac forced; see "The keyboard and an input method on macOS".
 
 ## The Vulkan backend
 
@@ -796,8 +794,9 @@ Metal and AppKit, both reached through the Objective-C runtime: Zig cannot read
 Objective-C headers, so every call is `objc_msgSend` cast to the method's C
 signature, in [src/platform/objc.zig](src/platform/objc.zig). The window
 delegate is a class **defined at run time** with Zig functions as its methods,
-which is the mechanism `NSTextInputClient` and `NSAccessibility` will need; it
-is done first where it is two methods long.
+which is the mechanism `NSTextInputClient` and `NSAccessibility` need; it was
+done first where it was two methods long, and the text view now uses it for
+fourteen.
 
 Metal rather than MoltenVK: MoltenVK would have reused the Vulkan backend
 unchanged, at the price of a dependency not on a stock Mac and a translation
@@ -878,6 +877,104 @@ service itself starts); once the system's shader cache has it, **0.6 ms**.
 Shipping a precompiled `.metallib` is the fix when it matters, and is not done
 yet.
 
+### The keyboard and an input method on macOS
+
+A Mac text view never decodes a key. `keyDown:` hands the event straight back
+to AppKit with `interpretKeyEvents:`, and AppKit runs the input method and the
+user's key bindings and calls one of three methods: `insertText:` for text,
+`setMarkedText:` for an input method's provisional text, or
+`doCommandBySelector:` with what the key *means* — `moveWordLeft:` for
+Option+Left, `moveToLeftEndOfLine:` for Cmd+Left, and whatever the user put in
+`DefaultKeyBinding.dict`. So the window does not produce `KeyEvent`s for
+editing at all. Its view, `ZigUIKitView`, is a class defined at run time that
+conforms to `NSTextInputClient`, and the window edits the `Document` the
+application attaches with `setTextTarget`.
+
+That is why `editing.zig` changed. It took key events and decided that Ctrl
+meant "by word", which is right on Linux and Windows and meaningless on a Mac,
+where the meaning arrives already decided. Inventing a Ctrl so that
+`moveWordLeft:` would come out right would have written Linux's chord into
+the Mac path. So `editing` now has a `Command` — `word_left`, `select_all`,
+`delete_to_doc_start` and the rest — and two ways in: `apply` maps a key event
+with Linux chords onto one, and `input_client.commandForSelector` maps a
+Cocoa selector onto one. Everything both platforms share is in `applyCommand`.
+
+`src/input_client.zig` is the protocol itself, in core with no AppKit in it:
+`setMarkedText`, `insertText`, `markedRange`, `selectedRange` and `substring`
+over a `Document`, in UTF-16 `NSRange`s. `zig build test` covers it, including
+the one rule every implementation has to get right: with no explicit
+replacement range, new text replaces **the marked text, or else the
+selection**, not the caret. The AppKit view only converts `NSString`s.
+
+**macOS has the Windows shape**, and the document model took it without a
+change. `setMarkedText:` puts provisional text into the client's storage and
+asks for its range back, as TSF's `SetText` does; Wayland's preedit never
+enters the document. `docs/text-and-accessibility.md` chose the model that can
+hold both, and this is the first time a second platform tested that choice.
+
+Two scripted runs drive the whole path with real `NSEvent`s:
+
+```
+./zig-out/bin/window_demo --type     # Mac chords, with the ABC layout selected
+28 scripted keystrokes through AppKit: mean 117839 ns, worst 264375 ns
+  insertText            19
+  editing commands      9, refused 0
+document: "Gõ "
+the same edits with Linux chords through editing.apply: "Gõ " -- identical, selection included
+
+./zig-out/bin/window_demo --telex    # Apple's Vietnamese Simple Telex
+17 scripted keystrokes through AppKit: mean 5392274 ns, worst 24351917 ns
+  insertText            16 (11 of them replacing text already there)
+  setMarkedText         0 (and 0 cancelling)
+  substring queries     77, rectangle queries 0
+document: "Gõ vào đây: tiếng Việt tiếng Việt "
+expected "Gõ vào đây: tiếng Việt tiếng Việt " -- composed
+```
+
+`--type` is the Wayland demo's script in Mac chords — Cmd+Left, Option+Right
+twice, Shift+Cmd+Right, `X`, Option+Backspace — and the document it leaves,
+selection included, is the one the same edits with Linux chords leave through
+`editing.apply` with no window at all. `--telex` selects the input source, types
+`tieengs Vieetj` as key codes, and puts the user's input source back.
+
+![Simple Telex mid-word: the input method has already rewritten Vieet to Viêt in the document](docs/demo-typing-macos.png)
+
+What the Mac measured that nobody had written down:
+
+**Apple's Simple Telex never marks text.** Every spike so far composed Telex
+as provisional text — a Wayland preedit, a TSF composing range — and this
+input method has neither. Each key is an `insertText:` with an explicit
+replacement range that rewrites the syllable in place: with `tiêng` in the
+document, `s` is `insertText("tiếng", replacementRange: 23..28)`. No underline is ever shown
+because nothing is ever provisional, and the replacement range is not an edge
+case to be clamped but the entire mechanism — in UTF-16 units. The field already
+holds `Gõ vào đây: tiếng Việt `, which is 23 units and 31 bytes, so a client
+that read the range as bytes would rewrite the middle of `Việt` instead. This is a third shape, beside "outside
+the document" and "inside it, marked": inside it and final, rewritten.
+
+**The input method reads the document about five times per key** — 77
+`attributedSubstringForProposedRange:` calls for 17 keys — to see the syllable
+it is about to rewrite. A keystroke through it costs **5.4 ms on average,
+24 ms at worst**, against 0.12 ms for one that goes only through the key
+bindings. Almost all of that is the round trip to the input method's process;
+it is why `substring` returns a borrowed slice and allocates nothing.
+
+**A synthesised key event does not reach an input method unless Core
+Graphics made it.** An `NSEvent` from `keyEventWithType:...characters:` goes
+through the key bindings normally, and Apple's Vietnamese input method ignores
+it: every key arrives as a plain `insertText:` of its own character, with 5
+context queries in the whole run instead of 77. Made with
+`CGEventCreateKeyboardEvent` and wrapped by `eventWithCGEvent:`, the same key
+codes compose. Hence two calls on the window: `sendKey` for text a layout
+cannot type and for the key bindings, `sendKeyCode` for input methods. Neither
+needs accessibility permission, because both are delivered to this window
+rather than posted to the system.
+
+Cmd+A is not a key binding on a Mac but the Select All menu item's key
+equivalent, so the application menu gained an Edit menu with that one item.
+Cut, Copy and Paste need the pasteboard and are left out rather than added
+inert.
+
 ### Not done on macOS
 
 - A window moved to a display with a different scale reopens its fonts and
@@ -886,7 +983,16 @@ yet.
 - Live resize. While the user drags a window edge AppKit runs its own event
   loop inside `sendEvent:`, and this loop does not draw until it returns.
   Untested; rendering from the resize callback or a display link is the fix.
-- `NSTextInputClient` and `NSAccessibility` — the spikes Linux and Windows have.
+- `NSAccessibility` — the spike Linux and Windows have.
+- An input method that uses marked text. Apple's Simple Telex does not, and
+  the other Vietnamese input methods are not enabled on this Mac; the marked
+  path is covered by `zig build test` and not by a live input method. Japanese
+  or Chinese input would exercise it, and the candidate window would then be
+  the first real test of `firstRectForCharacterRange:`.
+- Clicking in the field. `characterIndexForPoint:` answers `NSNotFound`.
+- The process is not an application bundle, and the input method logs
+  `getApplicationProperty: called with invalid property` once per key because
+  of it. Harmless, and gone once there is an `Info.plist`.
 - Intel Macs. The `objc_msgSend_stret` path for large struct returns compiles
   and has never run.
 - `tools/window_demo_macos.zig` duplicates the loop in `window_demo.zig`. They

@@ -64,6 +64,76 @@ pub const Result = struct {
     edit: ?document.Edit = null,
 };
 
+/// What a keystroke means to a text field, apart from typing: the vocabulary
+/// `apply` translates keys into, and the one a platform that already did that
+/// translation hands over directly.
+///
+/// It exists because macOS does the translation itself. AppKit never tells a
+/// text view "Option and Left were pressed"; it runs the key through the
+/// user's key bindings and calls `moveWordLeft:`. Reconstructing a keystroke
+/// from that -- inventing a Ctrl so that `apply` would move by word -- would
+/// write Linux's chord into the Mac path, and would break the day someone
+/// rebinds a key in `DefaultKeyBinding.dict`, which is a thing Mac users do.
+/// So the meaning is the interface, and the chord is one way of arriving at it.
+pub const Command = struct {
+    op: Op,
+    /// Moves the focus and leaves the anchor: Shift with an arrow. Ignored by
+    /// the operations that are not movements.
+    extend: bool = false,
+
+    pub const Op = enum {
+        char_left,
+        char_right,
+        word_left,
+        word_right,
+        /// The ends of the document, not of a line: there is no line breaker.
+        /// See the note at the top of the file.
+        doc_start,
+        doc_end,
+        delete_char_backward,
+        delete_char_forward,
+        delete_word_backward,
+        delete_word_forward,
+        /// Cmd+Backspace on a Mac, which deletes to the start of the *line*;
+        /// here, of the document, for the same reason as `doc_start`.
+        delete_to_doc_start,
+        delete_to_doc_end,
+        select_all,
+        newline,
+    };
+};
+
+/// The command a keystroke stands for on a keyboard that names its chords the
+/// Linux and Windows way: Ctrl for words, Shift to extend. Null for a key that
+/// types text or that a text field does not act on.
+pub fn commandFor(ev: KeyEvent) ?Command {
+    const m = ev.mods;
+
+    // Ctrl+A. Here rather than left to the application because it is purely a
+    // selection change, and because it is the one accelerator a field that
+    // cannot do it looks broken without.
+    //
+    // Matched on `base`, not on the typed text: with Ctrl held the keymap
+    // produces `\x01`, so matching the text would match nothing. See the note
+    // in `keys.zig`.
+    if (m.ctrl and !m.alt and !m.logo and ev.base == 'a') return .{ .op = .select_all };
+
+    return switch (ev.key) {
+        .left => .{ .op = if (m.ctrl) .word_left else .char_left, .extend = m.shift },
+        .right => .{ .op = if (m.ctrl) .word_right else .char_right, .extend = m.shift },
+        .home => .{ .op = .doc_start, .extend = m.shift },
+        .end => .{ .op = .doc_end, .extend = m.shift },
+        .backspace => .{ .op = if (m.ctrl) .delete_word_backward else .delete_char_backward },
+        .delete => .{ .op = if (m.ctrl) .delete_word_forward else .delete_char_forward },
+        .enter => .{ .op = .newline },
+        // No line breaker, so there is no second line to move to. Reported as
+        // unhandled rather than silently swallowed, so that a scroll view
+        // above can still act on it. Focus traversal and dismissal belong to
+        // whatever owns the field.
+        .up, .down, .page_up, .page_down, .tab, .escape, .insert, .none => null,
+    };
+}
+
 /// Applies one keystroke.
 ///
 /// Returns `Error.Locked` when the document cannot be edited right now --
@@ -78,73 +148,8 @@ pub const Result = struct {
 /// the caret out from under it leaves the input method describing text that is
 /// no longer where it thinks it is.
 pub fn apply(doc: *Document, ev: KeyEvent, opt: Options) Error!Result {
-    const m = ev.mods;
-
-    // Ctrl+A. Here rather than left to the application because it is purely a
-    // selection change, and because it is the one accelerator a field that
-    // cannot do it looks broken without.
-    //
-    // Matched on `base`, not on the typed text: with Ctrl held the keymap
-    // produces `\x01`, so matching the text would match nothing. See the note
-    // in `keys.zig`.
-    if (m.ctrl and !m.alt and !m.logo and ev.base == 'a') {
-        if (!doc.canEditNow()) return Error.Locked;
-        try doc.setSelection(0, doc.len());
-        return .{ .handled = true, .moved = true };
-    }
-
-    switch (ev.key) {
-        .left, .right, .home, .end => return try move(doc, ev),
-
-        // No line breaker, so there is no second line to move to. Reported as
-        // unhandled rather than silently swallowed, so that a scroll view
-        // above can still act on it.
-        .up, .down, .page_up, .page_down => return .{},
-
-        .backspace => {
-            if (!doc.canEditNow()) return Error.Locked;
-            const sel = doc.selection();
-            if (!sel.isEmpty()) {
-                const e = try doc.replaceRange(.application, sel, "");
-                return .{ .handled = true, .edited = true, .moved = true, .edit = e };
-            }
-            if (sel.start == 0) return .{ .handled = true };
-            const to: usize = if (m.ctrl)
-                prevWord(doc.text(), sel.start)
-            else
-                offsets.prevChar(doc.text(), sel.start);
-            const e = try doc.replaceRange(.application, .{ .start = to, .end = sel.start }, "");
-            return .{ .handled = true, .edited = true, .moved = true, .edit = e };
-        },
-
-        .delete => {
-            if (!doc.canEditNow()) return Error.Locked;
-            const sel = doc.selection();
-            if (!sel.isEmpty()) {
-                const e = try doc.replaceRange(.application, sel, "");
-                return .{ .handled = true, .edited = true, .moved = true, .edit = e };
-            }
-            if (sel.end == doc.len()) return .{ .handled = true };
-            const to: usize = if (m.ctrl)
-                nextWord(doc.text(), sel.end)
-            else
-                offsets.nextChar(doc.text(), sel.end);
-            const e = try doc.replaceRange(.application, .{ .start = sel.end, .end = to }, "");
-            return .{ .handled = true, .edited = true, .moved = true, .edit = e };
-        },
-
-        .enter => {
-            if (!opt.multiline) return .{};
-            if (!doc.canEditNow()) return Error.Locked;
-            const e = try doc.insert(.application, "\n");
-            return .{ .handled = true, .edited = true, .moved = true, .edit = e };
-        },
-
-        // Focus traversal and dismissal belong to whatever owns the field.
-        .tab, .escape, .insert => return .{},
-
-        .none => {},
-    }
+    if (commandFor(ev)) |cmd| return applyCommand(doc, cmd, opt);
+    if (ev.key != .none) return .{};
 
     // A plain typed character.
     //
@@ -155,10 +160,62 @@ pub fn apply(doc: *Document, ev: KeyEvent, opt: Options) Error!Result {
     // Windows WM_CHAR path can look like -- and this is the layer with tests,
     // so this is where the rule should be enforceable without a keyboard.
     const s = ev.text();
-    if (s.len == 0 or m.anyAccel()) return .{};
+    if (s.len == 0 or ev.mods.anyAccel()) return .{};
     if (!isInsertable(s)) return .{};
     if (!doc.canEditNow()) return Error.Locked;
     const e = try doc.insert(.application, s);
+    return .{ .handled = true, .edited = true, .moved = true, .edit = e };
+}
+
+/// Applies one command. Refused with `Error.Locked` under the same conditions
+/// as `apply`, for the same reasons.
+pub fn applyCommand(doc: *Document, cmd: Command, opt: Options) Error!Result {
+    switch (cmd.op) {
+        .char_left, .char_right, .word_left, .word_right, .doc_start, .doc_end => return move(doc, cmd),
+
+        .select_all => {
+            if (!doc.canEditNow()) return Error.Locked;
+            try doc.setSelection(0, doc.len());
+            return .{ .handled = true, .moved = true };
+        },
+
+        .delete_char_backward, .delete_word_backward, .delete_to_doc_start => {
+            if (!doc.canEditNow()) return Error.Locked;
+            const sel = doc.selection();
+            if (!sel.isEmpty()) return deleteRange(doc, sel);
+            if (sel.start == 0) return .{ .handled = true };
+            const to: usize = switch (cmd.op) {
+                .delete_word_backward => prevWord(doc.text(), sel.start),
+                .delete_to_doc_start => 0,
+                else => offsets.prevChar(doc.text(), sel.start),
+            };
+            return deleteRange(doc, .{ .start = to, .end = sel.start });
+        },
+
+        .delete_char_forward, .delete_word_forward, .delete_to_doc_end => {
+            if (!doc.canEditNow()) return Error.Locked;
+            const sel = doc.selection();
+            if (!sel.isEmpty()) return deleteRange(doc, sel);
+            if (sel.end == doc.len()) return .{ .handled = true };
+            const to: usize = switch (cmd.op) {
+                .delete_word_forward => nextWord(doc.text(), sel.end),
+                .delete_to_doc_end => doc.len(),
+                else => offsets.nextChar(doc.text(), sel.end),
+            };
+            return deleteRange(doc, .{ .start = sel.end, .end = to });
+        },
+
+        .newline => {
+            if (!opt.multiline) return .{};
+            if (!doc.canEditNow()) return Error.Locked;
+            const e = try doc.insert(.application, "\n");
+            return .{ .handled = true, .edited = true, .moved = true, .edit = e };
+        },
+    }
+}
+
+fn deleteRange(doc: *Document, r: Range) Error!Result {
+    const e = try doc.replaceRange(.application, r, "");
     return .{ .handled = true, .edited = true, .moved = true, .edit = e };
 }
 
@@ -183,38 +240,37 @@ pub fn isInsertable(s: []const u8) bool {
 
 // ------------------------------------------------------------------- movement
 
-fn move(doc: *Document, ev: KeyEvent) Error!Result {
+fn move(doc: *Document, cmd: Command) Error!Result {
     if (!doc.canEditNow()) return Error.Locked;
 
     const s = doc.text();
-    const m = ev.mods;
     const sel = doc.selection();
 
-    const target: usize = switch (ev.key) {
+    const target: usize = switch (cmd.op) {
         // To the ends of the DOCUMENT, not of the line. There is no line
         // breaker, so there are no line ends to go to; when there is one, this
         // is the function that changes.
-        .home => 0,
-        .end => s.len,
-        .left => blk: {
+        .doc_start => 0,
+        .doc_end => s.len,
+        .char_left, .word_left => blk: {
             // An unshifted arrow with a selection collapses it to the near
             // edge rather than moving from the focus. Which edge is "near"
             // depends on the direction, not on which end the focus is at,
             // which is why the selection is kept as anchor-and-focus and not
             // as an ordered pair.
-            if (!m.shift and !sel.isEmpty()) break :blk sel.start;
-            break :blk if (m.ctrl) prevWord(s, doc.focus) else offsets.prevChar(s, doc.focus);
+            if (!cmd.extend and !sel.isEmpty()) break :blk sel.start;
+            break :blk if (cmd.op == .word_left) prevWord(s, doc.focus) else offsets.prevChar(s, doc.focus);
         },
-        .right => blk: {
-            if (!m.shift and !sel.isEmpty()) break :blk sel.end;
-            break :blk if (m.ctrl) nextWord(s, doc.focus) else offsets.nextChar(s, doc.focus);
+        .char_right, .word_right => blk: {
+            if (!cmd.extend and !sel.isEmpty()) break :blk sel.end;
+            break :blk if (cmd.op == .word_right) nextWord(s, doc.focus) else offsets.nextChar(s, doc.focus);
         },
         else => unreachable,
     };
 
     const anchor_was = doc.anchor;
     const focus_was = doc.focus;
-    if (m.shift) {
+    if (cmd.extend) {
         try doc.setSelection(doc.anchor, target);
     } else {
         try doc.setCaret(target);

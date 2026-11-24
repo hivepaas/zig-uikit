@@ -52,6 +52,7 @@ pub const CGRect = extern struct { origin: CGPoint, size: CGSize };
 
 extern "objc" fn objc_getClass(name: [*:0]const u8) ?Class;
 extern "objc" fn sel_registerName(name: [*:0]const u8) SEL;
+extern "objc" fn sel_getName(s: SEL) [*:0]const u8;
 extern "objc" fn objc_msgSend() void;
 extern "objc" fn objc_msgSend_stret() void;
 extern "objc" fn objc_allocateClassPair(superclass: Class, name: [*:0]const u8, extra: usize) ?Class;
@@ -65,7 +66,7 @@ extern "objc" fn objc_getProtocol(name: [*:0]const u8) ?*anyopaque;
 extern "objc" fn objc_autoreleasePoolPush() *anyopaque;
 extern "objc" fn objc_autoreleasePoolPop(pool: *anyopaque) void;
 
-pub const Error = error{ ClassNotFound, ClassExists, MethodRejected, IvarRejected };
+pub const Error = error{ ClassNotFound, ClassExists, MethodRejected, IvarRejected, ProtocolNotFound };
 
 /// Looks a class up by name. Classes come from linked frameworks, so a missing
 /// one means a framework was not linked, which is a build mistake rather than a
@@ -91,6 +92,11 @@ pub fn sel(comptime name: [:0]const u8) SEL {
     const s = sel_registerName(name);
     S.cached = s;
     return s;
+}
+
+/// A selector's name: what `doCommandBySelector:` was asked to do.
+pub fn selName(s: SEL) []const u8 {
+    return std.mem.span(sel_getName(s));
 }
 
 /// Sends a message: `[target selector:args...]`.
@@ -145,6 +151,16 @@ pub fn release(obj: id) void {
 pub fn string(s: [*:0]const u8) id {
     const cls = class("NSString") catch unreachable;
     return send(id, cls, "stringWithUTF8String:", .{s});
+}
+
+/// An autoreleased `NSString` from UTF-8 bytes that need not be terminated.
+pub fn stringFromSlice(s: []const u8) id {
+    const NSUTF8StringEncoding: NSUInteger = 4;
+    const cls = class("NSString") catch unreachable;
+    const str = send(id, send(id, cls, "alloc", .{}), "initWithBytes:length:encoding:", .{
+        s.ptr, s.len, NSUTF8StringEncoding,
+    });
+    return send(id, str, "autorelease", .{});
 }
 
 /// The UTF-8 bytes of an `NSString`, borrowed for as long as the string lives.
@@ -203,6 +219,16 @@ pub const ClassBuilder = struct {
     /// skipped: conformance is advisory for the delegate protocols used here.
     pub fn protocol(self: ClassBuilder, comptime name: [:0]const u8) void {
         if (objc_getProtocol(name)) |p| _ = class_addProtocol(self.cls, p);
+    }
+
+    /// Declares conformance, and fails when the protocol is not known to the
+    /// runtime. For a protocol that AppKit *checks* rather than merely
+    /// documents: `-[NSView inputContext]` returns nil for a view that does not
+    /// conform to `NSTextInputClient`, and the symptom of that is an input
+    /// method that silently never starts.
+    pub fn requireProtocol(self: ClassBuilder, comptime name: [:0]const u8) Error!void {
+        const p = objc_getProtocol(name) orelse return Error.ProtocolNotFound;
+        _ = class_addProtocol(self.cls, p);
     }
 
     pub fn finish(self: ClassBuilder) Class {

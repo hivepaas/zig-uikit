@@ -28,6 +28,7 @@ pub const offsets = @import("offsets.zig");
 pub const document = @import("document.zig");
 pub const keys = @import("keys.zig");
 pub const editing = @import("editing.zig");
+pub const input_client = @import("input_client.zig");
 pub const scene = @import("scene.zig");
 pub const raster = @import("raster.zig");
 
@@ -82,6 +83,7 @@ test {
     _ = document;
     _ = keys;
     _ = editing;
+    _ = input_client;
     _ = scene;
     _ = raster;
     _ = @import("layout_test.zig");

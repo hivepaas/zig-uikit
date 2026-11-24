@@ -57,6 +57,9 @@ pub const Editable = struct {
     /// Behind the text, so it is created before the label.
     selection: Overlay,
     caret: Overlay,
+    /// Under the provisional text while an input method is composing, and
+    /// zero-width otherwise.
+    underline: Overlay,
     run_h: f32,
 };
 pub var editable: ?Editable = null;
@@ -75,6 +78,11 @@ pub const selection_color = Color.hex(0x2F4B8F);
 /// line, three style changes, and a copy of the run into the element. It is
 /// here rather than in `window_demo.zig` so that the software demo and the GPU
 /// demo can call it too, and so that the cost is measured in one place.
+///
+/// Provisional text is underlined from `doc.composing`: the shape a Mac or
+/// Windows input method produces, where the marked text is in the document.
+/// A Wayland preedit is not shown here yet, because nothing feeds one to this
+/// field; when something does, this shapes `displayText` instead.
 pub fn refreshEditable(t: *Tree, fonts: *Fonts, doc: *const ui.Document) !void {
     const e = editable orelse return;
     const run = try fonts.ui.shape(&fonts.atlas, doc.text());
@@ -82,9 +90,28 @@ pub fn refreshEditable(t: *Tree, fonts: *Fonts, doc: *const ui.Document) !void {
     const r = run.rangeRect(sel.start, sel.end);
     try moveOverlay(t, e.selection, r.x, r.w);
     try moveOverlay(t, e.caret, run.caretX(doc.focus), 1);
+    if (doc.composing) |c| {
+        const u = run.rangeRect(c.start, c.end);
+        try moveOverlay(t, e.underline, u.x, u.w);
+    } else {
+        try moveOverlay(t, e.underline, 0, 0);
+    }
     // Last, because it copies the run out of the font's scratch buffer and the
     // two calls above read it.
     try t.setText(e.label, run);
+}
+
+/// Where a byte range of the editable field's text is drawn, in layout units
+/// from the top-left of the window: what an input method asks so that its
+/// candidate window opens beside the text. Read from the tree after layout,
+/// so it is wherever the field actually is, not where it was built.
+pub fn editableRangeRect(t: *const Tree, r: ui.Range) ui.Rect {
+    const e = editable orelse return .{};
+    const b = t.bounds(e.label);
+    const run = t.text(e.label);
+    const pad = t.style(e.label).padding;
+    const rr = run.rangeRect(r.start, r.end);
+    return .{ .x = b.x + pad + rr.x, .y = b.y + pad + rr.y, .w = rr.w, .h = rr.h };
 }
 
 /// More rows than the panel can show, so the clip and the culling both have
@@ -516,12 +543,11 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
         // `refreshEditable` when something changed. Nothing about the
         // keyboard reaches this file.
         //
-        // No input method is attached to it yet, so what arrives is raw
-        // keystrokes and `displayText` would have nothing to splice in; the
-        // row above still stands in for composition. Wiring
-        // `zwp_text_input_v3` to this document is the next slice, and when it
-        // is done this field gains an underline and the row above becomes
-        // redundant.
+        // On a Mac an input method is attached to it, through
+        // `NSTextInputClient`, and provisional text in it is underlined by
+        // `refreshEditable`. On Wayland what arrives is still raw keystrokes:
+        // `zwp_text_input_v3` is the next slice there, and the row above
+        // stands in for composition until it lands.
         _ = try label(t, content, ui_font, atlas, "Gõ được thật — bàn phím, xkb, và Document:", dim);
 
         const field = try textField(t, content);
@@ -530,12 +556,15 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
             const h = run.height();
             const sel = try overlayParts(t, field, 0, 0, 0, h, h, selection_color);
             const caret = try overlayParts(t, field, run.width, 0, 1, h, h, caret_color);
+            // The same place and thickness as the composition row above.
+            const under = try overlayParts(t, field, 0, run.ascent + 2, 0, 1, h, accent);
             const lbl = try label(t, field, ui_font, atlas, editable_initial, Color.white);
             editable = .{
                 .field = field,
                 .label = lbl,
                 .selection = sel,
                 .caret = caret,
+                .underline = under,
                 .run_h = h,
             };
         } else {

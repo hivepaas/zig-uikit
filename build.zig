@@ -274,10 +274,16 @@ fn addMacos(
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{.{ .name = "objc", .module = objc_mod }},
+        .imports = &.{
+            .{ .name = "objc", .module = objc_mod },
+            // For the key events, the document and the input-method model in
+            // core, as the Wayland window imports it for `keys.zig`.
+            .{ .name = "zig-uikit", .module = mod },
+        },
     });
     appkit_mod.linkFramework("AppKit", .{});
     appkit_mod.linkFramework("QuartzCore", .{});
+    appkit_mod.linkFramework("CoreGraphics", .{});
 
     const window_demo = b.addExecutable(.{
         .name = "window_demo",

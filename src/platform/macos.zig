@@ -17,15 +17,31 @@
 //! Heap-allocated for the same reason as the Wayland window: the delegate keeps
 //! a pointer to it for the life of the window.
 //!
-//! The delegate is a class defined at run time (see `objc.ClassBuilder`), which
-//! is the mechanism `NSTextInputClient` and `NSAccessibility` will need, done
-//! first where it is small: two methods, one instance variable.
+//! The delegate is a class defined at run time (see `objc.ClassBuilder`), and
+//! so is the view: `ZigUIKitView` is an `NSView` that conforms to
+//! `NSTextInputClient`, which is how a Mac input method talks to a text field.
+//!
+//! **Keyboard input is not keystrokes on a Mac.** AppKit hands `keyDown:` to
+//! the view, the view hands it straight back with `interpretKeyEvents:`, and
+//! what comes out is one of three calls: `insertText:` for text,
+//! `setMarkedText:` for an input method's provisional text, or
+//! `doCommandBySelector:` with whatever the user's key bindings say the key
+//! means. The view never decodes a key itself, and so never disagrees with
+//! the rest of the Mac about what Option+Left does. The three calls are
+//! implemented in core (`input_client.zig`, `editing.zig`) against the
+//! `Document` the application attaches with `setTextTarget`; this file only
+//! converts `NSString`s and `NSRange`s.
+//!
+//! What the editing layer does not handle -- Escape, Tab, the vertical arrows
+//! -- arrives in `keys` as a `KeyEvent`, as it does on Wayland.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const objc = @import("objc");
+const ui = @import("zig-uikit");
 const id = objc.id;
 const send = objc.send;
+const ic = ui.input_client;
 
 pub const Error = error{ WindowFailed, NotMainThread } || objc.Error || Allocator.Error;
 
@@ -40,6 +56,9 @@ const NSEventMaskAny: u64 = std.math.maxInt(u64);
 
 extern "Foundation" const NSDefaultRunLoopMode: id;
 extern "c" fn pthread_main_np() c_int;
+extern "CoreGraphics" fn CGEventCreateKeyboardEvent(source: ?*anyopaque, key: u16, down: bool) ?*anyopaque;
+extern "CoreGraphics" fn CGEventSetFlags(ev: *anyopaque, flags: u64) void;
+extern "CoreFoundation" fn CFRelease(obj: *anyopaque) void;
 
 pub const Window = struct {
     gpa: Allocator,
@@ -68,6 +87,57 @@ pub const Window = struct {
     pointer_x: f32 = -1,
     pointer_y: f32 = -1,
     pointer_inside: bool = false,
+
+    /// Whether this window has keyboard focus: it is the key window.
+    focused: bool = false,
+
+    /// Keys the editing layer did not act on, for the application: Escape,
+    /// Tab, the vertical arrows. Text and editing commands do not come through
+    /// here when a text target is attached; they go straight to its document.
+    keys: ui.KeyQueue = .{},
+
+    /// The document keyboard input edits, if any. See `setTextTarget`.
+    text: ?TextTarget = null,
+    /// Set whenever the text target's document or selection changed, by
+    /// typing, by an input method or by a command, and cleared by the caller
+    /// once it has reshaped the line.
+    text_changed: bool = false,
+    /// What the input method did, counted. The evidence a spike reports.
+    ime: ImeStats = .{},
+
+    pub const TextTarget = struct {
+        doc: *ui.Document,
+        options: ui.editing.Options = .{},
+        /// Where a byte range of the document is drawn, in points from the
+        /// view's top-left corner. An input method asks, through
+        /// `firstRectForCharacterRange:`, so that its candidate window opens
+        /// beside the text instead of in a corner of the screen; that is
+        /// `docs/text-and-accessibility.md` §7, and every spike answered it
+        /// with a fixed rectangle. Null answers with the view's corner.
+        rect: ?*const fn (ctx: ?*anyopaque, r: ui.Range) ui.Rect = null,
+        ctx: ?*anyopaque = null,
+    };
+
+    pub const ImeStats = struct {
+        /// `setMarkedText:` calls with text, and with none (a cancel).
+        marked: u32 = 0,
+        cancelled: u32 = 0,
+        /// `insertText:` calls: commits and plain typing alike.
+        inserted: u32 = 0,
+        /// Of those, the ones with an explicit replacement range: an input
+        /// method rewriting text already in the document. Apple's Simple
+        /// Telex composes entirely this way and never marks anything.
+        replaced: u32 = 0,
+        unmarked: u32 = 0,
+        /// `doCommandBySelector:` calls that became editing commands, and the
+        /// ones that were passed on as keys or ignored.
+        commands: u32 = 0,
+        passed_on: u32 = 0,
+        /// Edits the document refused (`error.Locked`, `error.BadRange`).
+        refused: u32 = 0,
+        rect_queries: u32 = 0,
+        substring_queries: u32 = 0,
+    };
 
     pub fn open(gpa: Allocator, title: [*:0]const u8, w: u32, h: u32) Error!*Window {
         // AppKit is main-thread-only and says so by crashing somewhere else
@@ -99,11 +169,14 @@ pub const Window = struct {
         // A layer-hosting view: the layer is set *before* `wantsLayer`, so the
         // view hosts this layer instead of creating a backing layer of its own
         // that AppKit would draw into. Core Animation composites it directly.
-        const view = send(id, send(id, try objc.class("NSView"), "alloc", .{}), "initWithFrame:", .{rect});
+        const view = send(id, send(id, try viewClass(), "alloc", .{}), "initWithFrame:", .{rect});
+        objc.setState(view, try viewClass(), self);
         const layer = objc.retain(send(id, try objc.class("CAMetalLayer"), "layer", .{}));
         send(void, view, "setLayer:", .{layer});
         send(void, view, "setWantsLayer:", .{objc.YES});
         send(void, window, "setContentView:", .{view});
+        // Keys go to the first responder, which would otherwise be the window.
+        _ = send(objc.BOOL, window, "makeFirstResponder:", .{view});
 
         const delegate = objc.new(try delegateClass());
         objc.setState(delegate, try delegateClass(), self);
@@ -140,6 +213,7 @@ pub const Window = struct {
         if (app_delegate_target == self) app_delegate_target = null;
         send(void, self.window, "setDelegate:", .{@as(?id, null)});
         objc.setState(self.delegate, delegateClass() catch unreachable, null);
+        objc.setState(self.view, viewClass() catch unreachable, null);
         if (!self.closed) send(void, self.window, "close", .{});
         objc.release(self.delegate);
         objc.release(self.layer);
@@ -157,6 +231,130 @@ pub const Window = struct {
     pub fn pixelHeight(self: *const Window) u32 {
         return @intFromFloat(@round(@as(f32, @floatFromInt(self.height)) * self.scale));
     }
+
+    /// Attaches the document keyboard input edits, or detaches it with null.
+    ///
+    /// While one is attached, typing, input-method composition and editing
+    /// commands change it directly, during `pump`, and set `text_changed`. It
+    /// has to be direct rather than queued: an input method asks the client
+    /// for its marked range and selection in the middle of a keystroke and
+    /// expects answers that already include the edit it just made.
+    pub fn setTextTarget(self: *Window, target: ?TextTarget) void {
+        if (self.text) |t| {
+            if (ic.hasMarkedText(t.doc)) ic.unmarkText(t.doc);
+        }
+        const pool = objc.AutoreleasePool.push();
+        defer pool.pop();
+        if (send(?id, self.view, "inputContext", .{})) |ctx| send(void, ctx, "discardMarkedText", .{});
+        self.text = target;
+    }
+
+    /// Tells the input method that the text moved on screen, so that it asks
+    /// for `firstRectForCharacterRange:` again.
+    pub fn textGeometryChanged(self: *Window) void {
+        const pool = objc.AutoreleasePool.push();
+        defer pool.pop();
+        if (send(?id, self.view, "inputContext", .{})) |ctx| send(void, ctx, "invalidateCharacterCoordinates", .{});
+    }
+
+    /// The input source this window's text input uses, by identifier --
+    /// `com.apple.inputmethod.VietnameseIM.VietnameseSimpleTelex`, say -- and
+    /// the one it replaced, which the caller should put back. Changing it is
+    /// not private to this window: it is the input source in the menu bar.
+    /// Returns null when the view has no input context, or the source is not
+    /// enabled in System Settings.
+    pub fn selectInputSource(self: *Window, source: [*:0]const u8, previous: []u8) ?[]const u8 {
+        const pool = objc.AutoreleasePool.push();
+        defer pool.pop();
+        const ctx = send(?id, self.view, "inputContext", .{}) orelse return null;
+        const was = objc.utf8(send(?id, ctx, "selectedKeyboardInputSource", .{}) orelse objc.string(""));
+        const n = @min(was.len, previous.len);
+        @memcpy(previous[0..n], was[0..n]);
+        const want = objc.string(source);
+        const enabled = send(?id, ctx, "keyboardInputSources", .{}) orelse return null;
+        if (!objc.truthy(send(objc.BOOL, enabled, "containsObject:", .{want}))) return null;
+        send(void, ctx, "setSelectedKeyboardInputSource:", .{want});
+        return previous[0..n];
+    }
+
+    /// Delivers a keystroke with stated characters: to the window, the first
+    /// responder and the key bindings -- but **not** to an input method.
+    ///
+    /// Measured, not documented anywhere: an event made by
+    /// `keyEventWithType:...characters:` reaches `interpretKeyEvents:` and the
+    /// key bindings normally, and Apple's Vietnamese input method ignores it
+    /// -- every key arrives as a plain `insertText:` of its own character.
+    /// That makes this the way to type text a keyboard layout cannot produce
+    /// (`—`, `ử`) and to test the key bindings, and `sendKeyCode` the way to
+    /// test an input method.
+    ///
+    /// `chars` is what the key types with the modifiers applied and `bare`
+    /// without them; `code` is the virtual key code.
+    pub fn sendKey(self: *Window, code: u16, chars: []const u8, bare: []const u8, mods: KeyMods) void {
+        const pool = objc.AutoreleasePool.push();
+        defer pool.pop();
+        const NSEventTypeKeyDown: objc.NSUInteger = 10;
+        const NSEventTypeKeyUp: objc.NSUInteger = 11;
+        var flags: objc.NSUInteger = 0;
+        if (mods.shift) flags |= 1 << 17;
+        if (mods.control) flags |= 1 << 18;
+        if (mods.option) flags |= 1 << 19;
+        if (mods.command) flags |= 1 << 20;
+        // Arrow keys carry these two on real hardware, and the standard key
+        // bindings are keyed on them.
+        if (mods.function) flags |= (1 << 21) | (1 << 23);
+        const number = send(objc.NSInteger, self.window, "windowNumber", .{});
+        const now = send(f64, send(id, objc.class("NSProcessInfo") catch return, "processInfo", .{}), "systemUptime", .{});
+        const cls = objc.class("NSEvent") catch return;
+        for ([_]objc.NSUInteger{ NSEventTypeKeyDown, NSEventTypeKeyUp }) |kind| {
+            const ev = send(?id, cls, "keyEventWithType:location:modifierFlags:timestamp:windowNumber:context:characters:charactersIgnoringModifiers:isARepeat:keyCode:", .{
+                kind,
+                objc.CGPoint{ .x = 0, .y = 0 },
+                flags,
+                now,
+                number,
+                @as(?id, null),
+                objc.stringFromSlice(chars),
+                objc.stringFromSlice(bare),
+                objc.NO,
+                code,
+            }) orelse return;
+            send(void, self.window, "sendEvent:", .{ev});
+        }
+    }
+
+    /// A keystroke by key code alone, as the hardware would send it: the
+    /// event is made by Core Graphics, its characters come from the current
+    /// keyboard layout, and an input method sees it. See `sendKey` for why
+    /// there are two. Delivered to this window directly rather than posted to
+    /// the system, so it needs no accessibility permission and cannot type
+    /// into anything else.
+    pub fn sendKeyCode(self: *Window, code: u16, mods: KeyMods) void {
+        const pool = objc.AutoreleasePool.push();
+        defer pool.pop();
+        var flags: u64 = 0;
+        if (mods.shift) flags |= 1 << 17;
+        if (mods.control) flags |= 1 << 18;
+        if (mods.option) flags |= 1 << 19;
+        if (mods.command) flags |= 1 << 20;
+        if (mods.function) flags |= (1 << 21) | (1 << 23);
+        const cls = objc.class("NSEvent") catch return;
+        for ([_]bool{ true, false }) |down| {
+            const cg = CGEventCreateKeyboardEvent(null, code, down) orelse return;
+            defer CFRelease(cg);
+            CGEventSetFlags(cg, flags);
+            const ev = send(?id, cls, "eventWithCGEvent:", .{cg}) orelse return;
+            send(void, self.window, "sendEvent:", .{ev});
+        }
+    }
+
+    pub const KeyMods = packed struct {
+        shift: bool = false,
+        control: bool = false,
+        option: bool = false,
+        command: bool = false,
+        function: bool = false,
+    };
 
     /// Processes every queued event without blocking, then samples the size
     /// and the pointer.
@@ -194,6 +392,7 @@ pub const Window = struct {
         self.pointer_x = @floatCast(p.x);
         self.pointer_y = @floatCast(bounds.size.height - p.y);
         self.pointer_inside = p.x >= 0 and p.y >= 0 and p.x < bounds.size.width and p.y < bounds.size.height;
+        self.focused = objc.truthy(send(objc.BOOL, self.window, "isKeyWindow", .{}));
     }
 };
 
@@ -224,7 +423,25 @@ fn sharedApplication() Error!id {
     });
     send(void, app_menu, "addItem:", .{quit});
     send(void, app_item, "setSubmenu:", .{app_menu});
+
+    // Cmd-A is not a key binding on a Mac; it is the Select All menu item's
+    // key equivalent, sent to the first responder as `selectAll:`. Without an
+    // Edit menu the shortcut does nothing at all, so there is one, with the
+    // single item this toolkit implements. Cut, Copy and Paste need the
+    // pasteboard and are not here rather than here and inert.
+    const edit_item = objc.new(try objc.class("NSMenuItem"));
+    send(void, menubar, "addItem:", .{edit_item});
+    const edit_menu = send(id, send(id, try objc.class("NSMenu"), "alloc", .{}), "initWithTitle:", .{objc.string("Edit")});
+    const select_all = send(id, send(id, try objc.class("NSMenuItem"), "alloc", .{}), "initWithTitle:action:keyEquivalent:", .{
+        objc.string("Select All"), objc.sel("selectAll:"), objc.string("a"),
+    });
+    send(void, edit_menu, "addItem:", .{select_all});
+    send(void, edit_item, "setSubmenu:", .{edit_menu});
+
     send(void, app, "setMainMenu:", .{menubar});
+    objc.release(select_all);
+    objc.release(edit_menu);
+    objc.release(edit_item);
     objc.release(quit);
     objc.release(app_menu);
     objc.release(app_item);
@@ -243,6 +460,7 @@ fn sharedApplication() Error!id {
 
 var delegate_class: ?objc.Class = null;
 var app_delegate_class: ?objc.Class = null;
+var view_class: ?objc.Class = null;
 
 fn delegateClass() Error!objc.Class {
     if (delegate_class) |c| return c;
@@ -250,6 +468,7 @@ fn delegateClass() Error!objc.Class {
         b.protocol("NSWindowDelegate");
         try b.method("windowWillClose:", &windowWillClose, "v@:@");
         try b.method("windowDidChangeBackingProperties:", &windowDidChangeBacking, "v@:@");
+        try b.method("windowDidResignKey:", &windowDidResignKey, "v@:@");
         delegate_class = b.finish();
     } else {
         delegate_class = try objc.class("ZigUIKitWindowDelegate");
@@ -282,7 +501,223 @@ fn windowDidChangeBacking(self: id, _: objc.SEL, _: id) callconv(.c) void {
     w.resized = true;
 }
 
+fn windowDidResignKey(self: id, _: objc.SEL, _: id) callconv(.c) void {
+    // The input method's composition belongs to the key window. Committing
+    // what is marked when focus leaves is what every Mac text view does, and
+    // it stops a composition outliving the keyboard that was making it.
+    const w = objc.getState(Window, self, delegate_class.?) orelse return;
+    w.focused = false;
+    const t = w.text orelse return;
+    if (ic.hasMarkedText(t.doc)) {
+        ic.unmarkText(t.doc);
+        w.ime.unmarked += 1;
+        w.text_changed = true;
+    }
+}
+
 fn applicationShouldTerminate(_: id, _: objc.SEL, _: id) callconv(.c) objc.NSUInteger {
     if (app_delegate_target) |w| w.closed = true;
     return NSTerminateCancel;
+}
+
+// ------------------------------------------------------------------ the view
+//
+// `ZigUIKitView`: an `NSView` that hosts the layer, accepts first responder,
+// and conforms to `NSTextInputClient`. Every method below converts its
+// arguments and calls into `input_client.zig` or `editing.zig`; none of them
+// decides anything about text.
+//
+// Type encodings: `B` is `BOOL` on Apple silicon (a C `bool`) and `c` on
+// Intel (a `signed char`); `{_NSRange=QQ}` is an `NSRange` by value; and a
+// method returning a `CGRect` is written as one, the Zig function returning
+// the struct -- the C calling convention then does whatever the architecture
+// requires, which on arm64 is a hidden pointer the runtime supplies.
+
+const B = if (objc.BOOL == bool) "B" else "c";
+const R = "{_NSRange=QQ}";
+const RECT = "{CGRect={CGPoint=dd}{CGSize=dd}}";
+
+fn viewClass() Error!objc.Class {
+    if (view_class) |c| return c;
+    if (try objc.ClassBuilder.begin("NSView", "ZigUIKitView")) |b| {
+        try b.requireProtocol("NSTextInputClient");
+        try b.method("acceptsFirstResponder", &acceptsFirstResponder, B ++ "@:");
+        try b.method("keyDown:", &keyDown, "v@:@");
+        try b.method("selectAll:", &selectAll, "v@:@");
+
+        try b.method("insertText:replacementRange:", &insertText, "v@:@" ++ R);
+        try b.method("setMarkedText:selectedRange:replacementRange:", &setMarkedText, "v@:@" ++ R ++ R);
+        try b.method("unmarkText", &unmarkText, "v@:");
+        try b.method("doCommandBySelector:", &doCommandBySelector, "v@::");
+        try b.method("selectedRange", &selectedRange, R ++ "@:");
+        try b.method("markedRange", &markedRange, R ++ "@:");
+        try b.method("hasMarkedText", &hasMarkedText, B ++ "@:");
+        try b.method("attributedSubstringForProposedRange:actualRange:", &attributedSubstring, "@@:" ++ R ++ "^" ++ R);
+        try b.method("validAttributesForMarkedText", &validAttributes, "@@:");
+        try b.method("firstRectForCharacterRange:actualRange:", &firstRect, RECT ++ "@:" ++ R ++ "^" ++ R);
+        try b.method("characterIndexForPoint:", &characterIndex, "Q@:{CGPoint=dd}");
+        view_class = b.finish();
+    } else {
+        view_class = try objc.class("ZigUIKitView");
+    }
+    return view_class.?;
+}
+
+fn stateOf(self: id) ?*Window {
+    return objc.getState(Window, self, view_class.?);
+}
+
+/// The text of an argument AppKit documents as "an `NSString` or an
+/// `NSAttributedString`": both arrive, depending on the input method.
+fn plainText(obj: id) []const u8 {
+    const attributed = objc.class("NSAttributedString") catch return objc.utf8(obj);
+    if (objc.truthy(send(objc.BOOL, obj, "isKindOfClass:", .{attributed}))) {
+        return objc.utf8(send(id, obj, "string", .{}));
+    }
+    return objc.utf8(obj);
+}
+
+fn acceptsFirstResponder(_: id, _: objc.SEL) callconv(.c) objc.BOOL {
+    return objc.YES;
+}
+
+fn keyDown(self: id, _: objc.SEL, event: id) callconv(.c) void {
+    // Straight back to AppKit, which runs the input method and the key
+    // bindings and calls one of the methods below. See the module comment.
+    const arr = send(id, objc.class("NSArray") catch return, "arrayWithObject:", .{event});
+    send(void, self, "interpretKeyEvents:", .{arr});
+}
+
+fn selectAll(self: id, _: objc.SEL, _: ?id) callconv(.c) void {
+    const w = stateOf(self) orelse return;
+    runCommand(w, .{ .op = .select_all });
+}
+
+fn runCommand(w: *Window, cmd: ui.editing.Command) void {
+    const t = w.text orelse return;
+    const res = ui.editing.applyCommand(t.doc, cmd, t.options) catch {
+        w.ime.refused += 1;
+        return;
+    };
+    w.ime.commands += 1;
+    if (res.edited or res.moved) w.text_changed = true;
+    // A command the field does not act on -- Enter in a single-line field --
+    // is the application's, as it is from `editing.apply`.
+    if (!res.handled and cmd.op == .newline) w.keys.push(ui.KeyEvent.named(.enter));
+}
+
+fn insertText(self: id, _: objc.SEL, string: id, replacement: ic.Utf16Range) callconv(.c) void {
+    const w = stateOf(self) orelse return;
+    const s = plainText(string);
+    // Control characters reach here from some input methods; they are not
+    // text, for the reason `editing.isInsertable` gives.
+    if (!ui.editing.isInsertable(s)) return;
+    w.ime.inserted += 1;
+    if (!replacement.isNone()) w.ime.replaced += 1;
+    const t = w.text orelse {
+        var ev: ui.KeyEvent = .{};
+        if (ev.setText(s)) w.keys.push(ev);
+        return;
+    };
+    _ = ic.insertText(t.doc, s, replacement) catch {
+        w.ime.refused += 1;
+        return;
+    };
+    w.text_changed = true;
+}
+
+fn setMarkedText(self: id, _: objc.SEL, string: id, sel: ic.Utf16Range, replacement: ic.Utf16Range) callconv(.c) void {
+    const w = stateOf(self) orelse return;
+    const t = w.text orelse return;
+    const s = plainText(string);
+    if (s.len == 0) w.ime.cancelled += 1 else w.ime.marked += 1;
+    ic.setMarkedText(t.doc, s, sel, replacement) catch {
+        w.ime.refused += 1;
+        return;
+    };
+    w.text_changed = true;
+}
+
+fn unmarkText(self: id, _: objc.SEL) callconv(.c) void {
+    const w = stateOf(self) orelse return;
+    const t = w.text orelse return;
+    w.ime.unmarked += 1;
+    ic.unmarkText(t.doc);
+    w.text_changed = true;
+}
+
+fn doCommandBySelector(self: id, _: objc.SEL, which: objc.SEL) callconv(.c) void {
+    const w = stateOf(self) orelse return;
+    const name = objc.selName(which);
+    if (ic.commandForSelector(name)) |cmd| {
+        if (w.text != null) return runCommand(w, cmd);
+    }
+    w.ime.passed_on += 1;
+    if (ic.keyForSelector(name)) |ev| w.keys.push(ev);
+    // Anything else -- `noop:` for a Cmd chord with no binding, `complete:`
+    // for Escape in some layouts -- is dropped. NSTextView beeps; a toolkit
+    // that wants to beep can do it from the counters.
+}
+
+fn selectedRange(self: id, _: objc.SEL) callconv(.c) ic.Utf16Range {
+    const w = stateOf(self) orelse return .none;
+    const t = w.text orelse return .none;
+    return ic.selectedRange(t.doc);
+}
+
+fn markedRange(self: id, _: objc.SEL) callconv(.c) ic.Utf16Range {
+    const w = stateOf(self) orelse return .none;
+    const t = w.text orelse return .none;
+    return ic.markedRange(t.doc);
+}
+
+fn hasMarkedText(self: id, _: objc.SEL) callconv(.c) objc.BOOL {
+    const w = stateOf(self) orelse return objc.NO;
+    const t = w.text orelse return objc.NO;
+    return if (ic.hasMarkedText(t.doc)) objc.YES else objc.NO;
+}
+
+fn attributedSubstring(self: id, _: objc.SEL, range: ic.Utf16Range, actual: ?*ic.Utf16Range) callconv(.c) ?id {
+    const w = stateOf(self) orelse return null;
+    const t = w.text orelse return null;
+    w.ime.substring_queries += 1;
+    const got = ic.substring(t.doc, range) orelse return null;
+    if (actual) |a| a.* = got.actual;
+    const cls = objc.class("NSAttributedString") catch return null;
+    const str = send(id, send(id, cls, "alloc", .{}), "initWithString:", .{objc.stringFromSlice(got.text)});
+    return send(id, str, "autorelease", .{});
+}
+
+fn validAttributes(_: id, _: objc.SEL) callconv(.c) ?id {
+    // No attributes: marked text is drawn underlined by the application, the
+    // way the document model says provisional text is drawn, whatever the
+    // input method would like. An empty array is a valid answer; nil is not.
+    return send(id, objc.class("NSArray") catch return null, "array", .{});
+}
+
+fn firstRect(self: id, _: objc.SEL, range: ic.Utf16Range, actual: ?*ic.Utf16Range) callconv(.c) objc.CGRect {
+    const zero: objc.CGRect = .{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 0, .height = 0 } };
+    const w = stateOf(self) orelse return zero;
+    w.ime.rect_queries += 1;
+    var local: ui.Rect = .{};
+    if (w.text) |t| {
+        const b = ic.toBytes(t.doc.text(), range);
+        if (actual) |a| a.* = ic.fromBytes(t.doc.text(), b);
+        if (t.rect) |f| local = f(t.ctx, b);
+    }
+    // Points from the top-left, as the layout has them, to the view's own
+    // coordinates (bottom-left: it is not flipped), then to the screen.
+    const bounds = send(objc.CGRect, self, "bounds", .{});
+    const in_view: objc.CGRect = .{
+        .origin = .{ .x = local.x, .y = bounds.size.height - (local.y + local.h) },
+        .size = .{ .width = local.w, .height = local.h },
+    };
+    const in_window = send(objc.CGRect, self, "convertRect:toView:", .{ in_view, @as(?id, null) });
+    return send(objc.CGRect, w.window, "convertRectToScreen:", .{in_window});
+}
+
+fn characterIndex(_: id, _: objc.SEL, _: objc.CGPoint) callconv(.c) objc.NSUInteger {
+    // Asked when the user clicks inside marked text. There is no click
+    // handling yet, so there is no answer but this one.
+    return ic.not_found;
 }
