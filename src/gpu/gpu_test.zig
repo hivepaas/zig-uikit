@@ -126,7 +126,7 @@ test "the GPU renders what the software reference renders" {
     var fb = try ui.Framebuffer.init(testing.allocator, w, h);
     defer fb.deinit();
     fb.clear(clear);
-    ui.raster.drawScene(&fb, &scene);
+    ui.raster.drawScene(&fb, &scene, null);
 
     var target = try vk.Target.init(&gpu, w, h);
     defer target.deinit();
@@ -155,4 +155,116 @@ test "the GPU renders what the software reference renders" {
         );
         return error.RendererDivergedFromReference;
     }
+}
+
+test "an opaque glyph is bit-exact, not merely close" {
+    var gpu = try openGpu();
+    defer gpu.deinit();
+
+    // Everything else in this file allows a difference of one or two, because
+    // the GPU folds a fill and a border into one premultiplied source while the
+    // reference blends them as two eight-bit steps. A glyph has neither: its
+    // coverage is a byte read from the atlas, and where that byte is 255 and
+    // the colour is opaque, both sides write the source colour and nothing
+    // else. So this one asserts equality, and any inequality means the two are
+    // reading different texels.
+    //
+    // A 4x4 atlas with a diagonal of full coverage and zero elsewhere. The
+    // diagonal is what makes misaddressing visible: an atlas of uniform
+    // coverage would pass with the texel coordinates transposed, off by one, or
+    // ignored entirely.
+    var pixels: [16]u8 = @splat(0);
+    for (0..4) |i| pixels[i * 4 + i] = 255;
+    const atlas: ui.AtlasView = .{ .pixels = &pixels, .w = 4, .h = 4 };
+
+    const w = 12;
+    const h = 12;
+    const clear = ui.Color.hex(0x101010);
+    const fg = ui.Color.hex(0xE0C040);
+
+    var scene = ui.Scene.init(testing.allocator);
+    defer scene.deinit();
+    // Built by hand rather than from a tree: the point is the renderer, and a
+    // tree would need a font to put a glyph in it.
+    try scene.quads.append(testing.allocator, .{
+        .x = 3,
+        .y = 2,
+        .w = 4,
+        .h = 4,
+        .background = fg.pack(),
+        .border_color = 0,
+        .border_width = 0,
+        .corner_radius = 0,
+        .cx = 0,
+        .cy = 0,
+        .cw = w,
+        .ch = h,
+        .u0 = 0,
+        .v0 = 0,
+        .u1 = 4,
+        .v1 = 4,
+        .flags = .{ .textured = true },
+    });
+
+    var fb = try ui.Framebuffer.init(testing.allocator, w, h);
+    defer fb.deinit();
+    fb.clear(clear);
+    ui.raster.drawScene(&fb, &scene, atlas);
+
+    var target = try vk.Target.init(&gpu, w, h);
+    defer target.deinit();
+    var renderer = try vk.Renderer.initDefault(&gpu);
+    defer renderer.deinit();
+    try renderer.setAtlas(atlas);
+    try renderer.render(&target, &scene, clear);
+
+    const got = target.pixels();
+    for (0..@as(usize, w) * h) |i| {
+        const x = i % w;
+        const y = i / w;
+        for (0..3) |ch| {
+            if (got[i * 4 + ch] != fb.px[i * 4 + ch]) {
+                std.debug.print(
+                    "  glyph pixel ({d},{d}) channel {d}: gpu {d}, reference {d}\n",
+                    .{ x, y, ch, got[i * 4 + ch], fb.px[i * 4 + ch] },
+                );
+                return error.GlyphDivergedFromReference;
+            }
+        }
+    }
+
+    // And the diagonal is actually where it should be, so that a pass does not
+    // just mean "both sides drew nothing".
+    for (0..4) |i| {
+        const on = (2 + i) * w + (3 + i);
+        try testing.expectEqual(fg.r, got[on * 4 + 0]);
+        // A texel beside the diagonal is zero coverage, so the clear shows.
+        if (i + 1 < 4) {
+            const off = (2 + i) * w + (3 + i + 1);
+            try testing.expectEqual(clear.r, got[off * 4 + 0]);
+        }
+    }
+}
+
+test "the atlas can be replaced at a different size" {
+    var gpu = try openGpu();
+    defer gpu.deinit();
+    var renderer = try vk.Renderer.initDefault(&gpu);
+    defer renderer.deinit();
+
+    // The renderer starts with a one-texel atlas so its descriptor is valid
+    // before any text exists; growing past it recreates the image, the view and
+    // the descriptor write, and shrinking again has to work too.
+    var big: [64 * 32]u8 = @splat(200);
+    try renderer.setAtlas(.{ .pixels = &big, .w = 64, .h = 32 });
+    try testing.expectEqual(@as(u32, 64), renderer.atlas_w);
+
+    var small: [8 * 8]u8 = @splat(7);
+    try renderer.setAtlas(.{ .pixels = &small, .w = 8, .h = 8 });
+    try testing.expectEqual(@as(u32, 8), renderer.atlas_w);
+
+    // The same size again must reuse the image and only re-upload.
+    const before = renderer.atlas_image;
+    try renderer.setAtlas(.{ .pixels = &small, .w = 8, .h = 8 });
+    try testing.expectEqual(before, renderer.atlas_image);
 }

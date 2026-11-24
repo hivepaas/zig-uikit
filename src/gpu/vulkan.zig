@@ -401,12 +401,16 @@ fn transition(
 }
 
 /// The per-instance attribute layout, read straight off `Quad`.
-fn attributeDescriptions() [4]c.VkVertexInputAttributeDescription {
+fn attributeDescriptions() [6]c.VkVertexInputAttributeDescription {
     return .{
         .{ .location = 0, .binding = 0, .format = c.VK_FORMAT_R32G32B32A32_SFLOAT, .offset = @offsetOf(Quad, "x") },
         .{ .location = 1, .binding = 0, .format = c.VK_FORMAT_R32G32_UINT, .offset = @offsetOf(Quad, "background") },
         .{ .location = 2, .binding = 0, .format = c.VK_FORMAT_R32G32_SFLOAT, .offset = @offsetOf(Quad, "border_width") },
         .{ .location = 3, .binding = 0, .format = c.VK_FORMAT_R32G32B32A32_SFLOAT, .offset = @offsetOf(Quad, "cx") },
+        // The four atlas texels as one 16-bit uvec4. `R16G16B16A16_UINT` is a
+        // mandatory vertex format, so no capability check is needed.
+        .{ .location = 4, .binding = 0, .format = c.VK_FORMAT_R16G16B16A16_UINT, .offset = @offsetOf(Quad, "u0") },
+        .{ .location = 5, .binding = 0, .format = c.VK_FORMAT_R32_UINT, .offset = @offsetOf(Quad, "flags") },
     };
 }
 
@@ -424,7 +428,12 @@ comptime {
     std.debug.assert(@offsetOf(Quad, "border_width") == 24);
     std.debug.assert(@offsetOf(Quad, "corner_radius") == 28);
     std.debug.assert(@offsetOf(Quad, "cx") == 32);
-    std.debug.assert(@sizeOf(Quad) == 48);
+    std.debug.assert(@offsetOf(Quad, "u0") == 48);
+    std.debug.assert(@offsetOf(Quad, "v0") == 50);
+    std.debug.assert(@offsetOf(Quad, "u1") == 52);
+    std.debug.assert(@offsetOf(Quad, "v1") == 54);
+    std.debug.assert(@offsetOf(Quad, "flags") == 56);
+    std.debug.assert(@sizeOf(Quad) == 60);
 }
 
 const Push = extern struct { vw: f32, vh: f32, flags: u32 };
@@ -460,6 +469,25 @@ pub const Renderer = struct {
     instance_mapped: [*]u8 = undefined,
     instance_capacity: usize = 0,
 
+    /// The glyph atlas, as a single-channel sampled image.
+    ///
+    /// Always present, even with no text in the scene: a descriptor the
+    /// fragment shader declares has to be bound whether or not any invocation
+    /// reaches the branch that reads it, so `init` makes a one-texel atlas and
+    /// `setAtlas` replaces it. The alternative -- two pipelines, one with the
+    /// sampler and one without -- would be a pipeline switch mid-frame to save
+    /// a descriptor write per atlas change.
+    atlas_image: c.VkImage = null,
+    atlas_memory: c.VkDeviceMemory = null,
+    atlas_view: c.VkImageView = null,
+    atlas_sampler: c.VkSampler = null,
+    atlas_w: u32 = 0,
+    atlas_h: u32 = 0,
+
+    set_layout: c.VkDescriptorSetLayout = null,
+    desc_pool: c.VkDescriptorPool = null,
+    desc_set: c.VkDescriptorSet = null,
+
     /// The ordinary case: the quad pipeline with the shaders this module ships.
     pub fn initDefault(gpu: *Gpu) Error!Renderer {
         return init(gpu, &shaders.vert, &shaders.frag);
@@ -475,6 +503,8 @@ pub const Renderer = struct {
         self.vert = try shaderModule(gpu, vert_spv);
         self.frag = try shaderModule(gpu, frag_spv);
 
+        try self.initAtlasResources();
+
         const pcr: c.VkPushConstantRange = .{
             .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT,
             .offset = 0,
@@ -482,6 +512,8 @@ pub const Renderer = struct {
         };
         const plci: c.VkPipelineLayoutCreateInfo = .{
             .sType = c.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+            .setLayoutCount = 1,
+            .pSetLayouts = &self.set_layout,
             .pushConstantRangeCount = 1,
             .pPushConstantRanges = &pcr,
         };
@@ -597,6 +629,14 @@ pub const Renderer = struct {
             c.vkFreeMemory(d, self.instance_memory, null);
         }
         if (self.instances != null) c.vkDestroyBuffer(d, self.instances, null);
+        self.destroyAtlasImage();
+        if (self.atlas_sampler != null) c.vkDestroySampler(d, self.atlas_sampler, null);
+        if (self.desc_pool != null) c.vkDestroyDescriptorPool(d, self.desc_pool, null);
+        if (self.set_layout != null) c.vkDestroyDescriptorSetLayout(d, self.set_layout, null);
+        self.atlas_sampler = null;
+        self.desc_pool = null;
+        self.desc_set = null;
+        self.set_layout = null;
         if (self.pipeline != null) c.vkDestroyPipeline(d, self.pipeline, null);
         if (self.layout != null) c.vkDestroyPipelineLayout(d, self.layout, null);
         if (self.frag != null) c.vkDestroyShaderModule(d, self.frag, null);
@@ -607,6 +647,262 @@ pub const Renderer = struct {
         self.vert = null;
         self.instances = null;
         self.instance_memory = null;
+    }
+
+    // ------------------------------------------------------------- the atlas
+
+    fn initAtlasResources(self: *Renderer) Error!void {
+        const d = self.gpu.device;
+
+        const binding: c.VkDescriptorSetLayoutBinding = .{
+            .binding = 0,
+            .descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+            .stageFlags = c.VK_SHADER_STAGE_FRAGMENT_BIT,
+        };
+        const slci: c.VkDescriptorSetLayoutCreateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+            .bindingCount = 1,
+            .pBindings = &binding,
+        };
+        try check(
+            "vkCreateDescriptorSetLayout",
+            c.vkCreateDescriptorSetLayout(d, &slci, null, &self.set_layout),
+        );
+
+        const pool_size: c.VkDescriptorPoolSize = .{
+            .type = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .descriptorCount = 1,
+        };
+        const dpci: c.VkDescriptorPoolCreateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .maxSets = 1,
+            .poolSizeCount = 1,
+            .pPoolSizes = &pool_size,
+        };
+        try check("vkCreateDescriptorPool", c.vkCreateDescriptorPool(d, &dpci, null, &self.desc_pool));
+
+        const dsai: c.VkDescriptorSetAllocateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+            .descriptorPool = self.desc_pool,
+            .descriptorSetCount = 1,
+            .pSetLayouts = &self.set_layout,
+        };
+        try check("vkAllocateDescriptorSets", c.vkAllocateDescriptorSets(d, &dsai, &self.desc_set));
+
+        // `NEAREST` everywhere, and it does not actually matter: the fragment
+        // shader reads the atlas with `texelFetch`, which bypasses the sampler
+        // entirely. A sampler object still has to exist because the descriptor
+        // type is a combined image sampler, so this one is the least
+        // surprising thing to look at in a debugger -- and if someone ever
+        // switches that fetch to a `texture()` call, nearest sampling is what
+        // keeps the result matching the software reference.
+        const sci: c.VkSamplerCreateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+            .magFilter = c.VK_FILTER_NEAREST,
+            .minFilter = c.VK_FILTER_NEAREST,
+            .mipmapMode = c.VK_SAMPLER_MIPMAP_MODE_NEAREST,
+            .addressModeU = c.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeV = c.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .addressModeW = c.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+            .maxLod = 0,
+            .borderColor = c.VK_BORDER_COLOR_FLOAT_TRANSPARENT_BLACK,
+        };
+        try check("vkCreateSampler", c.vkCreateSampler(d, &sci, null, &self.atlas_sampler));
+
+        // One transparent texel, so the descriptor is valid before any text
+        // exists. A scene with no glyphs never samples it.
+        try self.setAtlas(.{ .pixels = &[_]u8{0}, .w = 1, .h = 1 });
+    }
+
+    fn destroyAtlasImage(self: *Renderer) void {
+        const d = self.gpu.device;
+        if (self.atlas_view != null) c.vkDestroyImageView(d, self.atlas_view, null);
+        if (self.atlas_image != null) c.vkDestroyImage(d, self.atlas_image, null);
+        if (self.atlas_memory != null) c.vkFreeMemory(d, self.atlas_memory, null);
+        self.atlas_view = null;
+        self.atlas_image = null;
+        self.atlas_memory = null;
+        self.atlas_w = 0;
+        self.atlas_h = 0;
+    }
+
+    /// Uploads a glyph atlas, replacing whatever was there.
+    ///
+    /// The whole atlas every time, not the part that changed. A 512-square
+    /// atlas is 256 KB and this happens when glyphs are added -- the first
+    /// frame, a new font size, a character nobody has typed before -- not per
+    /// frame. Tracking a dirty rectangle would be a second incremental system
+    /// guarding a cost that is not on the frame path.
+    pub fn setAtlas(self: *Renderer, atlas: ui.AtlasView) Error!void {
+        const d = self.gpu.device;
+        if (atlas.w == 0 or atlas.h == 0) return Error.NoSuitableMemoryType;
+        if (atlas.pixels.len < @as(usize, atlas.w) * atlas.h) return Error.NoSuitableMemoryType;
+
+        if (atlas.w != self.atlas_w or atlas.h != self.atlas_h) {
+            _ = c.vkDeviceWaitIdle(d);
+            self.destroyAtlasImage();
+
+            const ici: c.VkImageCreateInfo = .{
+                .sType = c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                .imageType = c.VK_IMAGE_TYPE_2D,
+                // One channel of coverage. `R8_UNORM` is mandatory for sampled
+                // images with linear filtering on every Vulkan implementation,
+                // so there is nothing to fall back to.
+                .format = c.VK_FORMAT_R8_UNORM,
+                .extent = .{ .width = atlas.w, .height = atlas.h, .depth = 1 },
+                .mipLevels = 1,
+                .arrayLayers = 1,
+                .samples = c.VK_SAMPLE_COUNT_1_BIT,
+                .tiling = c.VK_IMAGE_TILING_OPTIMAL,
+                .usage = c.VK_IMAGE_USAGE_TRANSFER_DST_BIT | c.VK_IMAGE_USAGE_SAMPLED_BIT,
+                .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
+                .initialLayout = c.VK_IMAGE_LAYOUT_UNDEFINED,
+            };
+            try check("vkCreateImage", c.vkCreateImage(d, &ici, null, &self.atlas_image));
+
+            var req: c.VkMemoryRequirements = undefined;
+            c.vkGetImageMemoryRequirements(d, self.atlas_image, &req);
+            const mai: c.VkMemoryAllocateInfo = .{
+                .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                .allocationSize = req.size,
+                .memoryTypeIndex = try self.gpu.memoryType(
+                    req.memoryTypeBits,
+                    c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT,
+                ),
+            };
+            try check("vkAllocateMemory", c.vkAllocateMemory(d, &mai, null, &self.atlas_memory));
+            try check("vkBindImageMemory", c.vkBindImageMemory(d, self.atlas_image, self.atlas_memory, 0));
+
+            const vci: c.VkImageViewCreateInfo = .{
+                .sType = c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                .image = self.atlas_image,
+                .viewType = c.VK_IMAGE_VIEW_TYPE_2D,
+                .format = c.VK_FORMAT_R8_UNORM,
+                .subresourceRange = .{
+                    .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
+                    .levelCount = 1,
+                    .layerCount = 1,
+                },
+            };
+            try check("vkCreateImageView", c.vkCreateImageView(d, &vci, null, &self.atlas_view));
+
+            self.atlas_w = atlas.w;
+            self.atlas_h = atlas.h;
+
+            const info: c.VkDescriptorImageInfo = .{
+                .sampler = self.atlas_sampler,
+                .imageView = self.atlas_view,
+                .imageLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            };
+            const write: c.VkWriteDescriptorSet = .{
+                .sType = c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                .dstSet = self.desc_set,
+                .dstBinding = 0,
+                .descriptorCount = 1,
+                .descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                .pImageInfo = &info,
+            };
+            c.vkUpdateDescriptorSets(d, 1, &write, 0, null);
+        }
+
+        try self.uploadAtlas(atlas);
+    }
+
+    const AtlasUpload = struct {
+        image: c.VkImage,
+        staging: c.VkBuffer,
+        w: u32,
+        h: u32,
+    };
+
+    fn uploadAtlas(self: *Renderer, atlas: ui.AtlasView) Error!void {
+        const d = self.gpu.device;
+        const size: c.VkDeviceSize = @as(u64, atlas.w) * atlas.h;
+
+        var staging: c.VkBuffer = null;
+        var memory: c.VkDeviceMemory = null;
+        const bci: c.VkBufferCreateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+            .size = size,
+            .usage = c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+            .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
+        };
+        try check("vkCreateBuffer", c.vkCreateBuffer(d, &bci, null, &staging));
+        defer c.vkDestroyBuffer(d, staging, null);
+
+        var req: c.VkMemoryRequirements = undefined;
+        c.vkGetBufferMemoryRequirements(d, staging, &req);
+        const mai: c.VkMemoryAllocateInfo = .{
+            .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+            .allocationSize = req.size,
+            .memoryTypeIndex = try self.gpu.memoryType(
+                req.memoryTypeBits,
+                c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+            ),
+        };
+        try check("vkAllocateMemory", c.vkAllocateMemory(d, &mai, null, &memory));
+        defer c.vkFreeMemory(d, memory, null);
+        try check("vkBindBufferMemory", c.vkBindBufferMemory(d, staging, memory, 0));
+
+        var ptr: ?*anyopaque = null;
+        try check("vkMapMemory", c.vkMapMemory(d, memory, 0, size, 0, &ptr));
+        const dst: [*]u8 = @ptrCast(ptr.?);
+        @memcpy(dst[0..@intCast(size)], atlas.pixels[0..@intCast(size)]);
+        c.vkUnmapMemory(d, memory);
+
+        try self.gpu.oneShot(AtlasUpload, .{
+            .image = self.atlas_image,
+            .staging = staging,
+            .w = atlas.w,
+            .h = atlas.h,
+        }, recordAtlasUpload);
+    }
+
+    fn recordAtlasUpload(u: AtlasUpload, cb: c.VkCommandBuffer) void {
+        // `UNDEFINED` as the source layout discards whatever was in the image,
+        // which is correct precisely because the whole atlas is being written.
+        transition(
+            cb,
+            u.image,
+            c.VK_IMAGE_LAYOUT_UNDEFINED,
+            c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            c.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0,
+            c.VK_ACCESS_TRANSFER_WRITE_BIT,
+        );
+        const copy: c.VkBufferImageCopy = .{
+            .bufferOffset = 0,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource = .{
+                .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .imageOffset = .{ .x = 0, .y = 0, .z = 0 },
+            .imageExtent = .{ .width = u.w, .height = u.h, .depth = 1 },
+        };
+        c.vkCmdCopyBufferToImage(
+            cb,
+            u.staging,
+            u.image,
+            c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            1,
+            &copy,
+        );
+        transition(
+            cb,
+            u.image,
+            c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+            c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+            c.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            c.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+            c.VK_ACCESS_TRANSFER_WRITE_BIT,
+            c.VK_ACCESS_SHADER_READ_BIT,
+        );
     }
 
     fn ensureInstances(self: *Renderer, count: usize) Error!void {
@@ -739,6 +1035,18 @@ pub const Renderer = struct {
             c.vkCmdSetViewport(cb, 0, 1, &viewport);
             c.vkCmdSetScissor(cb, 0, 1, &scissor);
             c.vkCmdBindPipeline(cb, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline);
+            if (self.desc_set != null) {
+                c.vkCmdBindDescriptorSets(
+                    cb,
+                    c.VK_PIPELINE_BIND_POINT_GRAPHICS,
+                    self.layout,
+                    0,
+                    1,
+                    &self.desc_set,
+                    0,
+                    null,
+                );
+            }
             const offset: c.VkDeviceSize = 0;
             c.vkCmdBindVertexBuffers(cb, 0, 1, &self.instances, &offset);
             const push: Push = .{

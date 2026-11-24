@@ -31,7 +31,12 @@ const hover_tint = ui.Color.hex(0x3D4450);
 /// channel order. Those are exactly the things that go wrong once a window is
 /// involved, and they go wrong in ways that look like a palette mistake rather
 /// than a crash.
-fn checkPresentedFrame(gpa: std.mem.Allocator, swapchain: *vk.Swapchain, scene: *const ui.Scene) !void {
+fn checkPresentedFrame(
+    gpa: std.mem.Allocator,
+    swapchain: *vk.Swapchain,
+    scene: *const ui.Scene,
+    atlas: ui.AtlasView,
+) !void {
     const w = swapchain.extent.width;
     const h = swapchain.extent.height;
 
@@ -41,7 +46,7 @@ fn checkPresentedFrame(gpa: std.mem.Allocator, swapchain: *vk.Swapchain, scene: 
     var reference = try ui.Framebuffer.init(gpa, w, h);
     defer reference.deinit();
     reference.clear(bg);
-    ui.raster.drawScene(&reference, scene);
+    ui.raster.drawScene(&reference, scene, atlas);
 
     var worst: u32 = 0;
     for (0..@as(usize, w) * h) |i| {
@@ -102,9 +107,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var renderer = try vk.Renderer.initDefault(&gpu);
     defer renderer.deinit();
 
+    var fonts = try demo.Fonts.init(gpa);
+    defer fonts.deinit();
+
     var t = try ui.Tree.init(gpa);
     defer t.deinit();
-    try demo.buildUi(&t);
+    try demo.buildUi(&t, &fonts);
+    // Uploaded once, after the interface is built, because that is when every
+    // glyph it uses is in the atlas. Nothing in the loop adds text, so nothing
+    // in the loop touches the atlas; an application that did would call this
+    // again when the shaper reported new glyphs.
+    try renderer.setAtlas(fonts.atlas.view());
     t.layout(.{
         .w = @floatFromInt(swapchain.extent.width),
         .h = @floatFromInt(swapchain.extent.height),
@@ -229,7 +242,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
 
         if (capture and frames == 9) {
-            try checkPresentedFrame(gpa, &swapchain, &scene);
+            try checkPresentedFrame(gpa, &swapchain, &scene, fonts.atlas.view());
             capture = false;
             if (sweep == 0) break;
         }

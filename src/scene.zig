@@ -27,11 +27,15 @@
 //! changes on the GPU, and would not let a subtree outside its clip be skipped
 //! in a single test.
 //!
-//! What is deliberately absent: text, images, shadows and transforms. Text
-//! needs a shaping and layout stack that does not exist yet, and the other
-//! three are each a primitive whose shape should be decided when there is
-//! something to measure. Guessing at them now would mean a `Quad` with unused
-//! fields and a renderer with unreachable branches.
+//! **Text is the same primitive.** A glyph is a clipped rectangle whose
+//! coverage comes from an atlas instead of from a distance field, so it goes in
+//! the same list, in tree order, right after the box of the element it belongs
+//! to. See `Quad` for why that is worth eight bytes on every box in the scene.
+//!
+//! What is deliberately absent: images, shadows and transforms. Each is a
+//! primitive whose shape should be decided when there is something to measure.
+//! Guessing at them now would mean a `Quad` with unused fields and a renderer
+//! with unreachable branches.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -49,13 +53,29 @@ pub const Tree = tree_mod.Tree;
 pub const Index = tree_mod.Index;
 const none = tree_mod.none;
 
-/// One rounded, bordered, clipped rectangle: 48 bytes, and the only primitive
-/// there is.
+/// One clipped rectangle -- either a rounded bordered box or a glyph sampled
+/// from the atlas -- in 60 bytes, and the only primitive there is.
 ///
 /// `extern` and flat so the list can be uploaded as an instance buffer with no
 /// repacking. The fields are in the order a shader reads them, and the clip
 /// rectangle is part of the instance rather than pipeline state for the reason
 /// given in the module comment.
+///
+/// **Why text is this primitive and not a second one.** A separate text
+/// pipeline would need its own primitive list, and then the two lists would
+/// have to be interleaved by draw call to keep a label painting over its own
+/// background -- which is to say, the ordering that falls out of one sorted
+/// list for free would have to be reconstructed, and a window of alternating
+/// boxes and labels would become a draw call per element. One primitive, one
+/// list, one pipeline, one draw call: paint order stays a property of the list.
+///
+/// The cost is twelve bytes on every box quad that has no text in it: 48 bytes
+/// became 60, a quarter more upload volume for a scene with no text in it at
+/// all, and `zig build bench` reports what that did to the rebuild. The struct
+/// is deliberately NOT padded out to a 64-byte cache line. 60 is a legal vertex
+/// stride, the four bytes would buy an aligned instance fetch, and no
+/// measurement here says that is worth 6% more bandwidth -- so the spare field
+/// stays unwritten until something asks for it.
 pub const Quad = extern struct {
     x: f32,
     y: f32,
@@ -78,6 +98,31 @@ pub const Quad = extern struct {
     cw: f32,
     ch: f32,
 
+    /// Atlas texels, when `flags.textured` is set: the top-left texel and one
+    /// past the bottom-right. Addressed as integers rather than normalised
+    /// coordinates, and sampled with `texelFetch`, so that destination pixel
+    /// and source texel correspond exactly with no filtering in between. That
+    /// is what lets the GPU and the software reference produce the same bytes
+    /// for text rather than nearly the same.
+    u0: u16 = 0,
+    v0: u16 = 0,
+    u1: u16 = 0,
+    v1: u16 = 0,
+
+    flags: Flags = .{},
+
+    pub const Flags = packed struct(u32) {
+        /// Coverage comes from the atlas instead of from the distance field.
+        /// A textured quad ignores `border_*` and `corner_radius`, and takes
+        /// its colour from `background`.
+        textured: bool = false,
+        _rest: u31 = 0,
+
+        pub fn bits(self: Flags) u32 {
+            return @bitCast(self);
+        }
+    };
+
     pub fn rect(self: Quad) Rect {
         return .{ .x = self.x, .y = self.y, .w = self.w, .h = self.h };
     }
@@ -90,7 +135,18 @@ pub const Quad = extern struct {
     /// a display with `s` pixels per layout unit. Renderers do this on the GPU;
     /// this is for the software reference, so a Retina frame can be checked
     /// against the same scene the window laid out.
+    ///
+    /// **A textured quad cannot be scaled**, and this asserts rather than
+    /// pretending otherwise. Its atlas rectangle is a fixed number of texels,
+    /// and the whole basis of how a glyph is sampled is that one destination
+    /// pixel reads one texel; doubling the destination and not the source
+    /// would leave half the glyph outside its own texel range and discarded.
+    /// The answer on a scaled display is to shape at the device pixel size --
+    /// a 13-point label on a 2x display is a 26-pixel font, not a 13-pixel one
+    /// drawn twice as large -- so a scene built for such a display has no
+    /// textured quad in layout units for this to be asked about.
     pub fn scaled(self: Quad, s: f32) Quad {
+        std.debug.assert(!self.flags.textured);
         var q = self;
         q.x *= s;
         q.y *= s;
@@ -109,14 +165,16 @@ pub const Quad = extern struct {
 comptime {
     // Not a requirement, an assertion that the layout has not drifted: the
     // renderer's vertex attribute offsets are derived from this.
-    std.debug.assert(@sizeOf(Quad) == 48);
+    std.debug.assert(@sizeOf(Quad) == 60);
 }
 
 pub const Stats = struct {
     /// Elements examined.
     visited: u32 = 0,
-    /// Quads written.
+    /// Quads written, boxes and glyphs together.
     emitted: u32 = 0,
+    /// How many of `emitted` were glyphs.
+    glyphs: u32 = 0,
     /// Elements with nothing inside their clip.
     culled: u32 = 0,
     /// Subtrees skipped without being visited at all, which is only possible
@@ -213,13 +271,16 @@ pub const Scene = struct {
         const els = t.elements();
         const view: Rect = .{ .w = t.viewport.w, .h = t.viewport.h };
 
-        // One element can emit at most one quad, so the exact upper bound is
-        // known before the walk. Reserving it turns every append into a store,
-        // and means a rebuild performs no allocation at all once the tree has
-        // reached its largest size.
-        try self.quads.ensureTotalCapacity(self.gpa, els.len);
-        try self.owners.ensureTotalCapacity(self.gpa, els.len);
-        try self.layer_of.ensureTotalCapacity(self.gpa, els.len);
+        // One element emits at most one box quad plus one quad per glyph, so
+        // the exact upper bound is known before the walk -- the tree keeps the
+        // glyph total so that finding it is not itself a pass over the
+        // elements. Reserving it turns every append into a store, and means a
+        // rebuild performs no allocation at all once the tree has reached its
+        // largest size.
+        const cap = els.len + t.glyph_total;
+        try self.quads.ensureTotalCapacity(self.gpa, cap);
+        try self.owners.ensureTotalCapacity(self.gpa, cap);
+        try self.layer_of.ensureTotalCapacity(self.gpa, cap);
 
         var multi_layer = false;
         var first_layer: Layer = 0;
@@ -263,29 +324,87 @@ pub const Scene = struct {
                     self.stats.skipped_subtrees += 1;
                     continue;
                 }
-            } else if (e.paint.isVisible()) {
-                self.quads.appendAssumeCapacity(.{
-                    .x = e.bounds.x,
-                    .y = e.bounds.y,
-                    .w = e.bounds.w,
-                    .h = e.bounds.h,
-                    .background = e.paint.background.pack(),
-                    .border_color = e.paint.border_color.pack(),
-                    .border_width = e.paint.border_width,
-                    .corner_radius = e.paint.corner_radius,
-                    .cx = clip.x,
-                    .cy = clip.y,
-                    .cw = clip.w,
-                    .ch = clip.h,
-                });
-                self.owners.appendAssumeCapacity(idx);
-                self.layer_of.appendAssumeCapacity(layer);
-                if (self.stats.emitted == 0) {
-                    first_layer = layer;
-                } else if (layer != first_layer) {
-                    multi_layer = true;
+            } else {
+                if (e.paint.isVisible()) {
+                    self.quads.appendAssumeCapacity(.{
+                        .x = e.bounds.x,
+                        .y = e.bounds.y,
+                        .w = e.bounds.w,
+                        .h = e.bounds.h,
+                        .background = e.paint.background.pack(),
+                        .border_color = e.paint.border_color.pack(),
+                        .border_width = e.paint.border_width,
+                        .corner_radius = e.paint.corner_radius,
+                        .cx = clip.x,
+                        .cy = clip.y,
+                        .cw = clip.w,
+                        .ch = clip.h,
+                    });
+                    self.owners.appendAssumeCapacity(idx);
+                    self.layer_of.appendAssumeCapacity(layer);
+                    if (self.stats.emitted == 0) {
+                        first_layer = layer;
+                    } else if (layer != first_layer) {
+                        multi_layer = true;
+                    }
+                    self.stats.emitted += 1;
                 }
-                self.stats.emitted += 1;
+
+                // Glyphs come after the box, so a label paints over its own
+                // background without anything having to sort them. They are
+                // emitted whether or not the box was: a label normally has no
+                // fill at all, and `isVisible` is a question about the box.
+                //
+                // Positions are relative to the content origin -- the padding
+                // box corner -- and are not clipped to the element's own
+                // bounds. Text that overflows its element behaves like any
+                // other overflow: it shows unless an ancestor clips it.
+                if (e.text.glyphs.len > 0) {
+                    const fg = e.paint.text_color.pack();
+                    const ox = e.bounds.x + e.style.padding;
+                    const oy = e.bounds.y + e.style.padding;
+                    for (e.text.glyphs) |g| {
+                        self.quads.appendAssumeCapacity(.{
+                            // Snapped to the pixel grid. Element bounds are
+                            // fractional in general -- flex division produces
+                            // thirds -- and a glyph quad at a fractional
+                            // position would no longer map one destination
+                            // pixel to one atlas texel, which is the whole
+                            // basis of how text is sampled here. Rounding
+                            // moves a line of text by at most half a pixel and
+                            // keeps it crisp; not rounding keeps it where the
+                            // layout put it and makes it blurry. Every toolkit
+                            // that does not do subpixel positioning makes the
+                            // same trade.
+                            .x = @round(ox + g.dx),
+                            .y = @round(oy + g.dy),
+                            .w = g.w,
+                            .h = g.h,
+                            .background = fg,
+                            .border_color = 0,
+                            .border_width = 0,
+                            .corner_radius = 0,
+                            .cx = clip.x,
+                            .cy = clip.y,
+                            .cw = clip.w,
+                            .ch = clip.h,
+                            .u0 = g.u0,
+                            .v0 = g.v0,
+                            .u1 = g.u1,
+                            .v1 = g.v1,
+                            .flags = .{ .textured = true },
+                        });
+                        self.owners.appendAssumeCapacity(idx);
+                        self.layer_of.appendAssumeCapacity(layer);
+                        if (self.stats.emitted == 0) {
+                            first_layer = layer;
+                        } else if (layer != first_layer) {
+                            multi_layer = true;
+                        }
+                        self.stats.emitted += 1;
+                        self.stats.glyphs += 1;
+                    }
+                }
             }
 
             if (e.first_child != none) {

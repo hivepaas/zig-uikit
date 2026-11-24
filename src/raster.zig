@@ -30,11 +30,13 @@ const Allocator = std.mem.Allocator;
 const geometry = @import("geometry.zig");
 const paint_mod = @import("paint.zig");
 const scene_mod = @import("scene.zig");
+const glyph_mod = @import("glyph.zig");
 
 pub const Rect = geometry.Rect;
 pub const Color = paint_mod.Color;
 pub const Quad = scene_mod.Quad;
 pub const Scene = scene_mod.Scene;
+pub const AtlasView = glyph_mod.AtlasView;
 
 /// Signed distance from a point to a rounded rectangle: negative inside,
 /// positive outside, in pixels. Inigo Quilez's formulation.
@@ -233,7 +235,11 @@ pub const Framebuffer = struct {
 /// Draws one quad. The bounding box is the quad expanded by one pixel for the
 /// antialiased edge, intersected with the clip and with the framebuffer, so the
 /// cost of a clipped-away quad is the intersection and nothing else.
-pub fn drawQuad(fb: *Framebuffer, q: Quad) void {
+///
+/// `atlas` is only read by textured quads. Passing `null` with a textured quad
+/// in the list draws nothing for it rather than trapping, so that a caller
+/// which has no text can ignore the parameter entirely.
+pub fn drawQuad(fb: *Framebuffer, q: Quad, atlas: ?AtlasView) void {
     const bounds = q.rect();
     const clip = q.clipRect();
     if (clip.w <= 0 or clip.h <= 0) return;
@@ -247,6 +253,12 @@ pub fn drawQuad(fb: *Framebuffer, q: Quad) void {
     const bg = unpack(q.background);
     const bc = unpack(q.border_color);
     const bw = q.border_width;
+
+    if (q.flags.textured) {
+        const a = atlas orelse return;
+        drawGlyph(fb, q, bg, a, x0, y0, x1, y1);
+        return;
+    }
 
     var y: u32 = @intFromFloat(y0);
     const y_end: u32 = @intFromFloat(y1);
@@ -275,8 +287,55 @@ pub fn drawQuad(fb: *Framebuffer, q: Quad) void {
     }
 }
 
-pub fn drawScene(fb: *Framebuffer, s: *const Scene) void {
-    for (s.items()) |q| drawQuad(fb, q);
+/// A textured quad: coverage comes from the atlas, not from a distance field.
+///
+/// There is no antialiasing arithmetic here at all, which is the point. The
+/// coverage FreeType produced is already antialiased, and the quad's position
+/// was snapped to the pixel grid by the scene builder, so the mapping from
+/// destination pixel to source texel is an integer offset. Resampling it --
+/// with a ramp, a filter, or anything else -- would only blur work that is
+/// already correct, and would be a second implementation for the GPU to
+/// disagree with.
+fn drawGlyph(
+    fb: *Framebuffer,
+    q: Quad,
+    color: Color,
+    atlas: AtlasView,
+    x0: f32,
+    y0: f32,
+    x1: f32,
+    y1: f32,
+) void {
+    const clip = q.clipRect();
+    const tw = @as(i32, q.u1) - @as(i32, q.u0);
+    const th = @as(i32, q.v1) - @as(i32, q.v0);
+
+    var y: u32 = @intFromFloat(y0);
+    const y_end: u32 = @intFromFloat(y1);
+    const x_start: u32 = @intFromFloat(x0);
+    const x_end: u32 = @intFromFloat(x1);
+    while (y < y_end) : (y += 1) {
+        const py = @as(f32, @floatFromInt(y)) + 0.5;
+        const ty: i32 = @intFromFloat(@floor(py - q.y));
+        if (ty < 0 or ty >= th) continue;
+        var x: u32 = x_start;
+        while (x < x_end) : (x += 1) {
+            const px = @as(f32, @floatFromInt(x)) + 0.5;
+            const tx: i32 = @intFromFloat(@floor(px - q.x));
+            if (tx < 0 or tx >= tw) continue;
+
+            const in_clip = boxCoverage(px, py, clip);
+            if (in_clip <= 0) continue;
+
+            const cov = atlas.at(@as(i32, q.u0) + tx, @as(i32, q.v0) + ty);
+            if (cov == 0) continue;
+            fb.blend(x, y, color, (@as(f32, @floatFromInt(cov)) / 255.0) * in_clip);
+        }
+    }
+}
+
+pub fn drawScene(fb: *Framebuffer, s: *const Scene, atlas: ?AtlasView) void {
+    for (s.items()) |q| drawQuad(fb, q, atlas);
 }
 
 fn unpack(v: u32) Color {

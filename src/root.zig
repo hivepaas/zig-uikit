@@ -1,12 +1,17 @@
 //! zig-uikit — a declarative GPU UI toolkit for Zig.
 //!
-//! Pre-alpha. What exists today is the layout core -- a retained element tree
-//! with element-level dirty tracking and a flexbox engine over it -- and the
-//! scene layer above it, which turns laid-out elements into a flat list of
-//! GPU-ready primitives. There is no GPU renderer, no text and no platform
-//! layer in this module yet; the software rasteriser in `raster.zig` exists to
-//! verify the scene, not to draw a window. The input-method and accessibility
-//! work lives in `spikes/` and has not been folded in.
+//! Pre-alpha. What exists in THIS module is the layout core -- a retained
+//! element tree with element-level dirty tracking and a flexbox engine over it
+//! -- and the scene layer above it, which turns laid-out elements into a flat
+//! list of GPU-ready primitives. The software rasteriser in `raster.zig`
+//! exists to verify the scene, not to draw a window.
+//!
+//! This module links nothing and its tests run on a machine with no fonts, no
+//! GPU and no compositor. The Vulkan renderer, the Wayland window and the text
+//! stack are separate modules for that reason; `glyph.zig` holds the plain
+//! numbers that let the core lay out and paint text it cannot itself produce.
+//! The input-method and accessibility work lives in `spikes/` and has not been
+//! folded in.
 //!
 //! The design is documented in two notes, both written from measurements rather
 //! than from preference:
@@ -18,6 +23,7 @@ pub const geometry = @import("geometry.zig");
 pub const style = @import("style.zig");
 pub const tree = @import("tree.zig");
 pub const paint = @import("paint.zig");
+pub const glyph = @import("glyph.zig");
 pub const scene = @import("scene.zig");
 pub const raster = @import("raster.zig");
 
@@ -35,6 +41,10 @@ pub const Color = paint.Color;
 pub const Paint = paint.Paint;
 pub const Layer = paint.Layer;
 pub const layers = paint.layers;
+
+pub const Glyph = glyph.Glyph;
+pub const TextRun = glyph.TextRun;
+pub const AtlasView = glyph.AtlasView;
 
 pub const Scene = scene.Scene;
 pub const Quad = scene.Quad;
@@ -55,6 +65,7 @@ test {
     _ = style;
     _ = tree;
     _ = paint;
+    _ = glyph;
     _ = scene;
     _ = raster;
     _ = @import("layout_test.zig");

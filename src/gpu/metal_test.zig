@@ -103,7 +103,7 @@ fn worstAgainstReference(got: []const u8, scene: *const ui.Scene, w: u32, h: u32
     var fb = try ui.Framebuffer.init(testing.allocator, w, h);
     defer fb.deinit();
     fb.clear(clear);
-    for (scene.items()) |q| ui.raster.drawQuad(&fb, q.scaled(scale));
+    for (scene.items()) |q| ui.raster.drawQuad(&fb, q.scaled(scale), null);
 
     var worst: u32 = 0;
     var worst_at: usize = 0;

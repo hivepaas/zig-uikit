@@ -17,6 +17,15 @@
 //! so a pixel on the seam rounds differently; and float-to-unorm conversion is
 //! the driver's, not ours.
 //!
+//! Text is compared separately, because it has a tighter bound available. A
+//! glyph's coverage is a byte fetched from the same atlas on both sides with
+//! the same integer arithmetic -- no distance field, no ramp, no filtering --
+//! so the two sides agree on *coverage* exactly. What they still round
+//! independently is the blend of that coverage into the framebuffer, which is
+//! worth one unit. So a glyph pixel differing by more than one would mean the
+//! two are addressing different texels, and the breakdown below says so rather
+//! than letting it hide in an average over the whole window.
+//!
 //! Measured on an AMD RADV device, the largest channel difference over the
 //! whole demo is 1 of 255 and no pixel differs by more than that. The written
 //! difference image is amplified 64x, so a difference of one shows as a visible
@@ -34,14 +43,25 @@ const demo = @import("demo.zig");
 const width = 900;
 const height = 560;
 
+/// Whether this backend can draw a textured quad. Only the Vulkan one has a
+/// glyph atlas so far, so on Metal the demo is built with no text in it --
+/// drawing a glyph through a shader with no atlas branch would produce a
+/// rounded rectangle per letter, which is a picture of a bug rather than a
+/// picture of missing text.
+const has_text = @hasDecl(vk.Renderer, "setAtlas");
+
 pub fn main() !void {
     const gpa = std.heap.smp_allocator;
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
 
+    var fonts: ?demo.Fonts = if (has_text) try demo.Fonts.init(gpa) else null;
+    defer if (fonts) |*f| f.deinit();
+    const atlas: ?ui.AtlasView = if (fonts) |*f| f.atlas.view() else null;
+
     var t = try ui.Tree.init(gpa);
     defer t.deinit();
-    try demo.buildUi(&t);
+    try demo.buildUi(&t, if (fonts) |*f| f else null);
     t.layout(.{ .w = width, .h = height });
 
     var scene = ui.Scene.init(gpa);
@@ -54,7 +74,7 @@ pub fn main() !void {
     var fb = try ui.Framebuffer.init(gpa, width, height);
     defer fb.deinit();
     fb.clear(bg);
-    ui.raster.drawScene(&fb, &scene);
+    ui.raster.drawScene(&fb, &scene, atlas);
 
     // --- the GPU ---
     var gpu = vk.Gpu.init(gpa, .{}) catch |e| {
@@ -69,6 +89,13 @@ pub fn main() !void {
         stats.emitted,
         scene.items().len * @sizeOf(ui.Quad),
     });
+    if (fonts) |*f| {
+        std.debug.print("{d} of those quads are glyphs, from a {d}x{d} atlas\n\n", .{
+            stats.glyphs, f.atlas.w, f.atlas.h,
+        });
+    } else {
+        std.debug.print("no text: this backend has no glyph atlas yet\n\n", .{});
+    }
 
     var target = try vk.Target.init(&gpu, width, height);
     defer target.deinit();
@@ -86,10 +113,32 @@ pub fn main() !void {
             @as(f64, @floatFromInt(renderer.compile_ns)) / 1e6,
         });
     }
+    if (atlas) |a| try renderer.setAtlas(a);
     try renderer.render(&target, &scene, bg);
 
     // --- compare ---
     const gpu_px = target.pixels();
+
+    // Which pixels any glyph quad touched. Built from the scene rather than
+    // guessed at from the image, so the breakdown is about the primitive and
+    // not about "the parts that look like text".
+    const is_text = try gpa.alloc(bool, @as(usize, width) * height);
+    defer gpa.free(is_text);
+    @memset(is_text, false);
+    for (scene.items()) |q| {
+        if (!q.flags.textured) continue;
+        const x0: usize = @intFromFloat(@max(0, q.x));
+        const y0: usize = @intFromFloat(@max(0, q.y));
+        const x1: usize = @intFromFloat(@min(@as(f32, width), q.x + q.w));
+        const y1: usize = @intFromFloat(@min(@as(f32, height), q.y + q.h));
+        for (y0..y1) |y| for (x0..x1) |x| {
+            is_text[y * width + x] = true;
+        };
+    }
+
+    var text_pixels: usize = 0;
+    var text_max: u32 = 0;
+    var text_over1: usize = 0;
     var max_delta: u32 = 0;
     var over1: usize = 0;
     var over8: usize = 0;
@@ -106,6 +155,11 @@ pub fn main() !void {
         }
         sum += worst;
         max_delta = @max(max_delta, worst);
+        if (is_text[i]) {
+            text_pixels += 1;
+            text_max = @max(text_max, worst);
+            if (worst > 1) text_over1 += 1;
+        }
         if (worst > 1) over1 += 1;
         if (worst > 8) over8 += 1;
         // Amplified, because a difference of 3 in 255 is invisible and is
@@ -131,6 +185,12 @@ pub fn main() !void {
         over1, 100 * @as(f64, @floatFromInt(over1)) / @as(f64, @floatFromInt(total)),
         over8, 100 * @as(f64, @floatFromInt(over8)) / @as(f64, @floatFromInt(total)),
     });
+    std.debug.print(
+        \\of which {d} pixels are covered by a glyph:
+        \\  largest channel difference   {d}
+        \\  glyph pixels differing by > 1 {d}
+        \\
+    , .{ text_pixels, text_max, text_over1 });
 
     try writePng(gpa, io, gpu_px, "docs/demo-gpu" ++ suffix ++ ".png");
     try writePng(gpa, io, diff, "docs/demo-diff" ++ suffix ++ ".png");

@@ -20,11 +20,15 @@ layout(location = 0) in vec4 in_rect;    // offset  0: x, y, w, h
 layout(location = 1) in uvec2 in_color;  // offset 16: background, border_color
 layout(location = 2) in vec2 in_params;  // offset 24: border_width, corner_radius
 layout(location = 3) in vec4 in_clip;    // offset 32: cx, cy, cw, ch
+layout(location = 4) in uvec4 in_uv;     // offset 48: u0, v0, u1, v1 (16-bit)
+layout(location = 5) in uint in_flags;   // offset 56
 
 layout(location = 0) flat out vec4 v_rect;
 layout(location = 1) flat out uvec2 v_color;
 layout(location = 2) flat out vec2 v_params;
 layout(location = 3) flat out vec4 v_clip;
+layout(location = 4) flat out ivec4 v_uv;
+layout(location = 5) flat out uint v_flags;
 
 uint swapRB(uint v) {
     return (v & 0xFF00FF00u) | ((v & 0xFFu) << 16) | ((v >> 16) & 0xFFu);
@@ -40,6 +44,12 @@ void main() {
     // Expanded by one pixel on every side, because the fragment shader's
     // coverage ramp extends half a pixel past the geometric edge and a quad
     // that stopped exactly at its bounds would clip its own antialiasing.
+    //
+    // A textured quad has no ramp -- its edge is a texel boundary -- so the
+    // expansion is wasted fragments for glyphs. It is kept uniform anyway: the
+    // fragment shader has to bounds-check the texel fetch regardless, the
+    // waste is a one-pixel border on glyphs that are typically 6 by 10, and one
+    // code path here is worth more than that.
     vec2 p = in_rect.xy - 1.0 + uv * (in_rect.zw + 2.0);
 
     // Vulkan's clip space has +Y down, which is the same direction as the
@@ -52,4 +62,6 @@ void main() {
         : in_color;
     v_params = in_params;
     v_clip = in_clip;
+    v_uv = ivec4(in_uv);
+    v_flags = in_flags;
 }

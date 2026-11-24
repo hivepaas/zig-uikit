@@ -12,6 +12,44 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // --- the text stack ---
+    //
+    // A separate module, for the same reason the renderers are: shaping and
+    // rasterisation need fontconfig, FreeType and HarfBuzz, and the layout core
+    // is tested on machines with none of them. `src/glyph.zig` carries the
+    // plain-data types that let the core lay out and paint text it cannot
+    // itself produce.
+    //
+    // Not behind the platform switch, because nothing in it is
+    // platform-specific -- but see `test-text` in the README: the three
+    // libraries have to be installed, which on macOS means Homebrew.
+    const text_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/text.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    for (pkgIncludes(b, &.{ "freetype2", "harfbuzz", "fontconfig" })) |dir| {
+        text_c.addIncludePath(.{ .cwd_relative = dir });
+    }
+
+    const text_mod = b.addModule("zig-uikit-text", .{
+        .root_source_file = b.path("src/text/text.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "c", .module = text_c.createModule() },
+            .{ .name = "zig-uikit", .module = mod },
+        },
+    });
+    text_mod.linkSystemLibrary("freetype", .{});
+    text_mod.linkSystemLibrary("harfbuzz", .{});
+    text_mod.linkSystemLibrary("fontconfig", .{});
+
+    const text_tests = b.addTest(.{ .root_module = text_mod });
+    const run_text_tests = b.addRunArtifact(text_tests);
+    b.step("test-text", "Run the tests that need a font installed").dependOn(&run_text_tests.step);
+
     // A window's worth of interface, rasterised in software and written as a
     // PPM. There is no renderer yet, so this is how the scene layer is looked
     // at rather than only asserted about.
@@ -21,7 +59,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tools/demo.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "zig-uikit", .module = mod }},
+            .imports = &.{
+                .{ .name = "zig-uikit", .module = mod },
+                .{ .name = "zig-uikit-text", .module = text_mod },
+            },
         }),
     });
     const run_demo = b.addRunArtifact(demo);
@@ -35,7 +76,10 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tools/scene_bench.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "zig-uikit", .module = mod }},
+            .imports = &.{
+                .{ .name = "zig-uikit", .module = mod },
+                .{ .name = "zig-uikit-text", .module = text_mod },
+            },
         }),
     });
     // Deliberately inherits -Doptimize rather than forcing ReleaseFast: the
@@ -50,8 +94,8 @@ pub fn build(b: *std.Build) void {
     // follows the target: Vulkan and Wayland on Linux, Metal and AppKit on
     // macOS. `zig build window` means the same thing on both.
     switch (target.result.os.tag) {
-        .macos => addMacos(b, target, optimize, mod),
-        else => addLinux(b, target, optimize, mod),
+        .macos => addMacos(b, target, optimize, mod, text_mod),
+        else => addLinux(b, target, optimize, mod, text_mod),
     }
 
     const tests = b.addTest(.{ .root_module = mod });
@@ -65,6 +109,7 @@ fn addLinux(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     mod: *std.Build.Module,
+    text_mod: *std.Build.Module,
 ) void {
     // --- the Vulkan backend ---
     //
@@ -125,6 +170,7 @@ fn addLinux(
                 .{ .name = "zig-uikit", .module = mod },
                 .{ .name = "zig-uikit-vulkan", .module = gpu_mod },
                 .{ .name = "zig-uikit-wayland", .module = wl_mod },
+                .{ .name = "zig-uikit-text", .module = text_mod },
             },
         }),
     });
@@ -160,6 +206,7 @@ fn addLinux(
             .imports = &.{
                 .{ .name = "zig-uikit", .module = mod },
                 .{ .name = "gpu", .module = gpu_mod },
+                .{ .name = "zig-uikit-text", .module = text_mod },
             },
         }),
     });
@@ -177,6 +224,7 @@ fn addMacos(
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
     mod: *std.Build.Module,
+    text_mod: *std.Build.Module,
 ) void {
     const objc_mod = b.addModule("zig-uikit-objc", .{
         .root_source_file = b.path("src/platform/objc.zig"),
@@ -224,6 +272,7 @@ fn addMacos(
                 .{ .name = "zig-uikit", .module = mod },
                 .{ .name = "zig-uikit-metal", .module = metal_mod },
                 .{ .name = "zig-uikit-macos", .module = appkit_mod },
+                .{ .name = "zig-uikit-text", .module = text_mod },
             },
         }),
     });
@@ -257,10 +306,44 @@ fn addMacos(
             .imports = &.{
                 .{ .name = "zig-uikit", .module = mod },
                 .{ .name = "gpu", .module = metal_mod },
+                .{ .name = "zig-uikit-text", .module = text_mod },
             },
         }),
     });
     const run_gpu_demo = b.addRunArtifact(gpu_demo);
     b.step("gpu-demo", "Render the demo on the GPU and diff it against the software reference")
         .dependOn(&run_gpu_demo.step);
+}
+
+/// The include directories `pkg-config` reports for a set of libraries.
+///
+/// `linkSystemLibrary` finds these for a compilation, but translate-c is a
+/// separate step that needs them spelled out, and FreeType and HarfBuzz both
+/// live in a subdirectory rather than on the default include path. Hardcoding
+/// `/usr/include/freetype2` works on this machine and not on a BSD, a Nix
+/// store or a Mac, so the question is asked rather than assumed -- and if
+/// `pkg-config` is absent the usual Linux paths are tried anyway, because
+/// failing the whole build over a missing helper would be worse than a clear
+/// compile error about a missing header.
+fn pkgIncludes(b: *std.Build, libs: []const []const u8) []const []const u8 {
+    var argv: std.ArrayList([]const u8) = .empty;
+    argv.appendSlice(b.allocator, &.{ "pkg-config", "--cflags-only-I" }) catch @panic("OOM");
+    argv.appendSlice(b.allocator, libs) catch @panic("OOM");
+
+    var out: std.ArrayList([]const u8) = .empty;
+    var code: u8 = 0;
+    if (b.runAllowFail(argv.items, &code, .ignore)) |stdout| {
+        var it = std.mem.tokenizeAny(u8, stdout, " \n\r\t");
+        while (it.next()) |tok| {
+            if (std.mem.startsWith(u8, tok, "-I")) {
+                out.append(b.allocator, tok[2..]) catch @panic("OOM");
+            }
+        }
+    } else |_| {
+        out.appendSlice(b.allocator, &.{
+            "/usr/include/freetype2",
+            "/usr/include/harfbuzz",
+        }) catch @panic("OOM");
+    }
+    return out.items;
 }

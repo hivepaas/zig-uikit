@@ -43,6 +43,7 @@ const Allocator = std.mem.Allocator;
 const geometry = @import("geometry.zig");
 const style_mod = @import("style.zig");
 const paint_mod = @import("paint.zig");
+const glyph_mod = @import("glyph.zig");
 
 pub const Rect = geometry.Rect;
 pub const Size = geometry.Size;
@@ -54,6 +55,8 @@ pub const Justify = style_mod.Justify;
 pub const AlignItems = style_mod.AlignItems;
 pub const Paint = paint_mod.Paint;
 pub const Color = paint_mod.Color;
+pub const Glyph = glyph_mod.Glyph;
+pub const TextRun = glyph_mod.TextRun;
 
 pub const Index = u32;
 pub const none: Index = std.math.maxInt(Index);
@@ -103,6 +106,15 @@ pub const Element = struct {
     /// `style`, reached by a separate setter that does not dirty layout; see
     /// `paint.zig`.
     paint: Paint = .{},
+
+    /// This element's shaped text, and a layout input: a leaf with text takes
+    /// its content size and its baseline from the run rather than from the
+    /// synthesised guess a childless element otherwise gets.
+    ///
+    /// The glyph slice is owned by the tree and freed in `deinit`. Shaped by
+    /// the `text` module, which the core does not import; see `glyph.zig` for
+    /// why the dependency runs that way.
+    text: TextRun = .{},
 
     // --- denormalised style, read by the hot loops ---
     axis: Axis = .col,
@@ -216,6 +228,11 @@ pub const Tree = struct {
     viewport: Size = .{},
     stats: Stats = .{},
 
+    /// Glyphs across every element. Maintained by `setText` so that
+    /// `Scene.build` can reserve its exact upper bound without a pass over the
+    /// elements first.
+    glyph_total: usize = 0,
+
     /// Bumped whenever anything that could change the rendered scene has
     /// actually changed: a repaint, or a layout that did work.
     ///
@@ -233,6 +250,9 @@ pub const Tree = struct {
     }
 
     pub fn deinit(self: *Tree) void {
+        for (self.els.items) |e| {
+            if (e.text.glyphs.len > 0) self.gpa.free(e.text.glyphs);
+        }
         self.els.deinit(self.gpa);
         self.pre.deinit(self.gpa);
         self.post.deinit(self.gpa);
@@ -376,6 +396,57 @@ pub const Tree = struct {
         if (Paint.eql(e.paint, p)) return;
         e.paint = p;
         self.revision += 1;
+    }
+
+    pub fn text(self: *const Tree, el: Index) TextRun {
+        return self.els.items[el].text;
+    }
+
+    /// Installs a shaped run on an element, taking a copy of the glyphs.
+    ///
+    /// A copy, not the caller's slice, because the tree outlives whatever
+    /// scratch buffer the shaper used and nothing else in this API asks a
+    /// caller to keep a buffer alive for as long as the element exists.
+    ///
+    /// Unlike `setPaint` this DOES dirty layout, and that asymmetry is the
+    /// whole content of the function: text is a size input. A label that
+    /// changes from "3" to "3000" is wider, and its container has to be laid
+    /// out again. Changing the colour of that label is not, which is why the
+    /// colour is in `Paint` and goes through the setter that cannot dirty
+    /// anything.
+    ///
+    /// Comparing the old run against the new one first would be the same
+    /// optimisation `setStyle` makes, and is deliberately not done: a glyph
+    /// slice comparison is O(glyphs), the shaping that produced it already cost
+    /// far more than the comparison would save, and a caller re-setting
+    /// identical text every frame is a caller that should not be re-shaping
+    /// every frame either. The right place to stop that is the shaper's cache,
+    /// not here.
+    pub fn setText(self: *Tree, el: Index, run: TextRun) Error!void {
+        const copy = if (run.glyphs.len == 0)
+            &.{}
+        else
+            try self.gpa.dupe(Glyph, run.glyphs);
+
+        const e = &self.els.items[el];
+        self.glyph_total -= e.text.glyphs.len;
+        if (e.text.glyphs.len > 0) self.gpa.free(e.text.glyphs);
+        e.text = .{
+            .glyphs = copy,
+            .width = run.width,
+            .ascent = run.ascent,
+            .descent = run.descent,
+        };
+        self.glyph_total += copy.len;
+
+        try self.dirty.append(self.gpa, el);
+        self.revision += 1;
+    }
+
+    pub fn clearText(self: *Tree, el: Index) Error!void {
+        if (self.els.items[el].text.glyphs.len == 0 and
+            self.els.items[el].text.width == 0) return;
+        try self.setText(el, .{});
     }
 
     fn applyStyle(self: *Tree, el: Index, s: Style) void {
@@ -746,12 +817,33 @@ pub const Tree = struct {
                 e.intrinsic_w = cross;
             },
         }
+        // Text is a content size, and it is the element's OWN content rather
+        // than a child's, so it is folded in as a lower bound on both axes
+        // instead of replacing the sum over children. A container that has both
+        // text and children is unusual and the result is at least defensible:
+        // it is as large as it needs to be for either.
+        //
+        // `@max` and not an assignment for the same reason: an element with
+        // text and a padding of 8 is text plus 16 wide, and an element with
+        // text whose children are wider than the text is as wide as the
+        // children.
+        if (!e.text.isEmpty()) {
+            e.intrinsic_w = @max(e.intrinsic_w, e.text.width + pad * 2);
+            e.intrinsic_h = @max(e.intrinsic_h, e.text.height() + pad * 2);
+        }
+
         if (e.w_mode == .fixed) e.intrinsic_w = e.fixed_w;
         if (e.h_mode == .fixed) e.intrinsic_h = e.fixed_h;
 
-        // A row takes the deepest child baseline, a column the first child's,
-        // and a leaf synthesises one where a single line of text would sit.
-        if (kids == 0) {
+        // A row takes the deepest child baseline and a column the first
+        // child's. A leaf with text has a real baseline -- the font's ascent
+        // below the content edge, which is exactly where its glyphs were
+        // positioned -- and a leaf without text keeps the synthesised guess,
+        // because `align_items: .baseline` on a row of plain boxes still has to
+        // mean something.
+        if (!e.text.isEmpty() and kids == 0) {
+            e.baseline = pad + e.text.ascent;
+        } else if (kids == 0) {
             e.baseline = e.intrinsic_h * 0.8;
         } else switch (e.axis) {
             .row => e.baseline = pad + deepest_bl,

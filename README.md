@@ -3,28 +3,35 @@
 A declarative GPU UI toolkit for Zig.
 
 > **Status: pre-alpha.** The layout core, the scene layer, a Vulkan renderer
-> with a Wayland window, and a Metal renderer with a macOS window exist and are
-> tested. There is no text and there are no widgets. Expect the API to change
-> without notice.
+> with a Wayland window, a Metal renderer with a macOS window, and a shaped-text
+> stack exist and are tested. Text is drawn by the Vulkan backend only so far.
+> There are no widgets. Expect the API to change without notice.
 
 ```sh
-zig build test                           # 46 tests, no platform dependencies
+zig build test                           # 54 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
-zig build test-gpu                       # Vulkan: 5 tests; Metal: 8 tests
+zig build test-text                      # 12 tests, needs a font installed
+zig build test-gpu                       # Vulkan: 7 tests; Metal: 8 tests
 zig build gpu-demo                       # renders on the GPU, diffs against the reference
 zig build window                         # opens a window and renders into it
 ```
 
-The last three follow the target: Vulkan and Wayland on Linux, Metal and
-AppKit on macOS.
+The last two follow the target: Vulkan and Wayland on Linux, Metal and AppKit
+on macOS. `zig build test` needs nothing. Everything else links fontconfig,
+FreeType and HarfBuzz, because the demos share one source file and that file
+can set text — on macOS that means Homebrew, even for the demo that currently
+draws none.
 
 ![a window's worth of interface, rendered by the software rasteriser](docs/demo.png)
 
 Everything above is drawn by this repository: layout, clipping, culling, the
-popover escaping the panel that owns it, and the pixels themselves. There is no
-window and no GPU involved, and no text — labels are the bars a design tool uses
-where text will go, which is honest about what exists.
+popover escaping the panel that owns it, the text, and the pixels themselves.
+There is no window and no GPU involved — that image is the software reference
+rasteriser. The text is shaped by HarfBuzz and rasterised by FreeType, and it is
+in Vietnamese because `tiếng Việt` stacks a tone mark over a vowel that already
+carries a diacritic, which is the shortest string that tells you whether a text
+stack actually shapes or merely maps codepoints to glyphs.
 
 ```zig
 var t = try ui.Tree.init(gpa);
@@ -43,8 +50,22 @@ try t.setStyle(label, .{ .width = .{ .grow = 2 } });
 const cost = t.flush();   // .intrinsic, .position, .fast_path, .slow_path
 
 var scene = ui.Scene.init(gpa);
-_ = try scene.build(&t);  // a flat list of 48-byte quads, ready to upload
+_ = try scene.build(&t);  // a flat list of 60-byte quads, ready to upload
 ```
+
+Text is installed on an element, not drawn by a call:
+
+```zig
+var lib = try text.Library.init();
+var font = try lib.open(gpa, "sans", 13);     // fontconfig matches the family
+var atlas = try text.Atlas.init(gpa, 512, 512);
+
+try text.setText(&t, label, &font, &atlas, "Xin chào");
+t.setPaint(label, .{ .text_color = ui.Color.white });
+```
+
+`setText` shapes and dirties layout, because text is a size input. `setPaint`
+does not, because colour is not. That split is the whole design in one line.
 
 The tree is **retained and mutated**, not rebuilt per frame. That is the whole
 point: a frame arena reset wholesale cannot reuse last frame's subtrees, which
@@ -67,7 +88,8 @@ Measured on this library, 1 641 elements:
 | `setStyle` a leaf's *size* + `flush()` | 142 ns | propagates; no GPUI equivalent |
 | full `layout()` | 24 us | GPUI full refresh: 3.50 ms |
 | `Scene.build`, nothing changed | 3.8 ns | one integer comparison |
-| `Scene.build`, full rebuild | 8.4 us | 0.35% of GPUI's unchanged frame |
+| `Scene.build`, full rebuild | 8.4 us | 0.36% of GPUI's unchanged frame |
+| `Scene.build`, full rebuild **with text** | 24 us | 8 985 quads, 7 344 of them glyphs |
 
 This is the first time the shipped library has been measured rather than the
 prototype in the benchmark repository, and the point of running it was that it
@@ -79,15 +101,25 @@ maintaining bugs in exchange for microseconds. What keeps the headline claim
 true end to end is instead a revision counter: `Scene.build` returns after one
 integer comparison when nothing has changed.
 
-There is one primitive, a 48-byte rounded bordered rectangle, and it carries its
-own absolute clip rectangle rather than relying on push/pop state — so the list
+There is one primitive, a 60-byte clipped rectangle, and it carries its own
+absolute clip rectangle rather than relying on push/pop state — so the list
 survives being bucketed by painting layer, the GPU gets one draw call, and a
 subtree outside its clip is skipped in a single test.
+
+**A glyph is that same primitive**, with its coverage read from an atlas instead
+of from a distance field. The alternative — a second list and a second pipeline
+for text — would mean interleaving draw calls to keep a label painting over its
+own background, which is to say reconstructing by hand the ordering that one
+sorted list gives for free. The cost of not doing that is twelve bytes on every
+box quad in the scene: 48 became 60, and a full rebuild of the 1 641-element
+grid went from 8.1 us to 8.4 us. The struct is deliberately *not* padded out to
+a 64-byte cache line, because 6% more bandwidth to buy an aligned instance fetch
+is not something any measurement here asks for.
 
 `src/raster.zig` is a software rasteriser. It is **not** the renderer: it exists
 because paint is the one part of a toolkit that cannot be checked by asserting
 on numbers, and `coverage` in it is the signed distance field the GPU shader
-will be written from, so the two cannot quietly disagree.
+was written from, so the two cannot quietly disagree.
 
 ### Two bugs the picture found that the tests did not
 
@@ -110,6 +142,139 @@ going to be found by writing more assertions.
 container that should fill its parent across its axis has to say so. Whether
 that is the right default is still open; it is written down rather than
 discovered later.
+
+## Text
+
+`zig build test-text` — 12 tests, and they need a font installed, which is why
+they are not in `zig build test`.
+
+**HarfBuzz is in the first slice of text, not a later one.** The tempting
+shortcut is one glyph per codepoint through `FT_Get_Char_Index`: about thirty
+lines, and it renders English correctly. It renders `tiếng Việt` wrongly.
+Vietnamese stacks a tone mark over a vowel that may already carry a diacritic,
+and whether that is one precomposed glyph or two glyphs positioned by the
+font's `GPOS` table is a property of the font, not of the text. Only the shaper
+knows. A toolkit written in Vietnam that cannot set Vietnamese is not a toolkit
+with a missing feature; it is one built on a model that has to be thrown away.
+
+A test asserts the consequence directly: `tiếng việt` written with precomposed
+characters and written with combining marks must shape to the same width and
+the same glyph count. A per-codepoint renderer fails that.
+
+### The core does not link a font engine
+
+`zig build test` still runs on a machine with no fonts, no GPU and no
+compositor, and that property was worth keeping. So the split is:
+
+- `src/text/` is a separate module. It links fontconfig, FreeType and
+  HarfBuzz, and it is the only thing that knows what a font is.
+- `src/glyph.zig` is in the core and is plain numbers: where each glyph sits,
+  which atlas texels it reads, the run's width and the font's ascent and
+  descent. The core lays out around that and emits primitives for it without
+  being able to produce any of it.
+
+The direction matters. Had `Tree.setText` taken a string and a font, the layout
+core would link three C libraries. Taking an already-shaped run instead also
+puts shaping where it belongs: it happens when the text changes, not once per
+frame — and the measurement says why.
+
+### Shaping costs 2.1 us, which is the argument for not doing it per frame
+
+| | cost |
+| --- | --- |
+| shape a 40-character Vietnamese line, warm glyph cache | **2.1 us** |
+| shape it *and* install it on an element | 2.1 us (+40 ns for the copy) |
+| rebuild a scene of 8 985 quads, 7 344 of them glyphs | 24 us |
+| recolour text and flush | **1.4 ns** |
+
+Shaping one line costs a quarter of what rebuilding the entire 1 641-element
+scene costs. A window with 1 224 labels in it, re-shaped every frame, would be
+**2.6 ms** — which is, to within rounding, the 2.32 ms that this project exists
+to argue against. Element-level reactivity is not an optimisation here; it is
+the only thing that makes a text-heavy window affordable at all.
+
+Which is also why the text colour lives in `Paint` and not in the run. A theme
+switch recolours every label in the window. If colour were part of the shaped
+run, recolouring would mean re-shaping, and the table above says what that
+costs.
+
+### One destination pixel, one atlas texel
+
+A glyph quad is snapped to the pixel grid by the scene builder, and its
+coverage is read with `texelFetch` — integer addressing, no filtering, on the
+GPU and in the software reference alike. Both sides compute the same integer
+offset from the quad's origin, so they agree on coverage *exactly*; what they
+still round independently is the eight-bit blend into the framebuffer, worth
+one unit. So `zig build gpu-demo` reports text separately from everything else:
+
+```
+of which 40760 pixels are covered by a glyph:
+  largest channel difference   1
+  glyph pixels differing by > 1 0
+```
+
+A glyph pixel differing by more than one would mean the two sides are
+addressing different texels, which is a bug and not a rounding difference. A
+test in `zig build test-gpu` makes the bound exact where it can be: an opaque
+glyph over a known background must come back **bit-identical**, and it is drawn
+from a 4×4 atlas with coverage only on the diagonal — because a uniform atlas
+would pass with the coordinates transposed, off by one, or ignored.
+
+The atlas itself is shelf-packed, single channel, and has **no gutter between
+glyphs**. A gutter exists to stop a filtered sampler reading a neighbour's
+texels; nothing here filters, so there is nothing for it to prevent. Exact
+texel addressing pays for itself twice: crisp text, and a denser atlas.
+
+Running out of atlas is `error.AtlasFull` and not a growth. Growing moves every
+glyph, so every texel coordinate cached on every element becomes wrong, which
+means growth needs a re-shape pass over the whole tree — a decision that
+belongs to whatever owns the tree, and failing loudly is what stops it being
+made by accident.
+
+### A font's line height is not its ascent plus its descent
+
+Noto Sans at 15 pixels reports ascent 17, descent 5, and a preferred line
+spacing of **20** — two pixels *less* than the extent it claims for its own
+glyphs. They answer different questions: ascent and descent are maxima over
+every glyph in the font, including accents almost no line contains, while line
+height is what the designer wants lines set at.
+
+So a single label's box is ascent plus descent, the bound that cannot clip ink,
+which matters most for exactly the text this project has to set correctly. A
+line breaker, when there is one, will stack lines at `line_height` instead.
+
+### Text is Vulkan-only so far
+
+The Metal backend has no glyph atlas yet, and until it does the macOS demo is
+built with **no text in it** — `demo.buildUi` takes an optional font set and
+draws the grey bars a design tool uses where text will go. That is deliberate
+rather than lazy: a textured quad reaching a shader with no atlas branch would
+be drawn by the rounded-rectangle branch instead, so every letter would come
+out as a small rounded box. A picture of a bug is worse than a picture of
+missing text.
+
+What the Metal side needs is a texture binding, a `setAtlas`, and the textured
+branch in `quad.metal` transcribed from the GLSL — the same ten lines, against
+`texture2d<float>::read` instead of `texelFetch`. It is not written here
+because none of it could be compiled or run on this machine, and three
+untested transcriptions of one formula is one too many.
+
+One thing the Retina path already settles, though. `Quad.scaled` now asserts
+that the quad is not textured, because **a glyph cannot be scaled**: its atlas
+rectangle is a fixed number of texels and one destination pixel reads one
+texel, so doubling the destination would leave half the glyph outside its own
+range. The answer on a 2× display is to shape at the device pixel size — a
+13-point label is a 26-pixel font, not a 13-pixel one drawn twice as large.
+
+### What text does not do yet
+
+Line breaking, bidirectional text, font fallback for a glyph the matched family
+lacks, and the document model that
+[docs/text-and-accessibility.md](docs/text-and-accessibility.md) specifies —
+UTF-8 storage with conversion at four protocol boundaries, a provisional
+composition range, and caret geometry in screen coordinates. One shaped line is
+the unit here. Each of those is a separate piece of work on top of it rather
+than something to half-do inside it.
 
 ## The Vulkan backend
 
@@ -134,7 +299,7 @@ pixel:
 ```
 GPU vs software reference, 504000 pixels:
   largest channel difference   1
-  mean channel difference      0.0008
+  mean channel difference      0.0034
   pixels differing by > 1      0 (0.000%)
 ```
 
@@ -152,6 +317,16 @@ sRGB values directly, which is what every shipping UI toolkit does, and an sRGB
 format would make the GPU blend in linear space so the two disagreed by
 construction. Gamma-correct compositing is one decision to make for both, not a
 difference to discover.
+
+The glyph atlas is a single-channel sampled image, and the renderer always has
+one: a one-texel transparent atlas exists from `Renderer.init` so the fragment
+shader's descriptor is valid before any text does. The alternative — two
+pipelines, one with a sampler and one without — would mean switching pipeline
+mid-frame to save a descriptor write that happens when glyphs are added, not
+per frame. `setAtlas` uploads the whole atlas rather than a dirty rectangle, for
+the same reason: 256 KB when the shaper finds a character nobody has typed
+before is not on the frame path, and a second incremental system guarding it
+would be maintaining bugs for nothing.
 
 The compiled SPIR-V is committed and embedded in the binary, so building the
 toolkit needs no shader compiler; only changing a shader does.
@@ -179,12 +354,26 @@ person moving a mouse:
 180 frames
   frames that did any layout work   0 (0.0%)
   frames that rebuilt the scene     25 (13.9%)
-  mean CPU per frame                 787 ns
-  mean CPU on the 155 frames that changed nothing   256 ns
+  mean CPU per frame                9.9 us
+  mean CPU on the 155 frames that changed nothing   920 ns
 ```
 
 The pointer moves on every one of those frames. Layout work happens on none of
 them, and the scene is rebuilt only when the highlighted row actually changes.
+
+Two notes on those numbers, because both are easy to misread. This binary is a
+**debug build** — `zig build window` does not force `ReleaseFast`, and the
+release figures are in `zig build bench`. And the mean per frame is dominated
+by the 14% of frames that rebuild a 726-quad scene with 685 glyphs in it, not
+by anything the other 86% do.
+
+> **A correction.** An earlier version of this file quoted 787 ns and 256 ns
+> here. Those do not reproduce. Re-running the same commit on the same machine
+> today gives 965–1 246 ns for the unchanged-frame figure, and the current code
+> gives 815–1 168 ns over seven runs — the same range, so adding text cost
+> nothing on an idle frame. The 256 ns was one lucky sample reported as if it
+> were the number. A single run of a sub-microsecond figure under a compositor
+> is not a measurement; the range above is.
 
 ### The bottleneck moved, and measuring it properly changed the answer
 
@@ -325,7 +514,9 @@ yet.
 
 A retained element tree with **element-level** reactivity, a real text stack
 (shaping, bidi, font fallback, IME), and accessibility treated as a first-class
-concern rather than an afterthought.
+concern rather than an afterthought. Shaping and glyph rendering exist; bidi,
+fallback, line breaking, IME and accessibility do not yet, though four spikes
+have established what they require.
 
 ## Why
 

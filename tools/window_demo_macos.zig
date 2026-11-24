@@ -33,7 +33,10 @@ fn checkPresentedFrame(gpa: std.mem.Allocator, swapchain: *mtl.Swapchain, scene:
     var reference = try ui.Framebuffer.init(gpa, w, h);
     defer reference.deinit();
     reference.clear(bg);
-    for (scene.items()) |q| ui.raster.drawQuad(&reference, q.scaled(swapchain.scale));
+    // No atlas: the Metal backend has none yet, so this demo builds its
+    // interface with no text in it (see `demo.buildUi`) and there are no
+    // textured quads in the scene for the reference to need one for.
+    for (scene.items()) |q| ui.raster.drawQuad(&reference, q.scaled(swapchain.scale), null);
 
     var worst: u32 = 0;
     var over1: usize = 0;
@@ -104,7 +107,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var t = try ui.Tree.init(gpa);
     defer t.deinit();
-    try demo.buildUi(&t);
+    try demo.buildUi(&t, null);
     t.layout(viewport(win));
 
     var scene = ui.Scene.init(gpa);

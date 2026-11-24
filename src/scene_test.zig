@@ -321,7 +321,7 @@ fn render(t: *const Tree, w: u32, h: u32) !Framebuffer {
     defer sc.deinit();
     _ = try sc.build(t);
     var fb = try Framebuffer.init(testing.allocator, w, h);
-    ui.raster.drawScene(&fb, &sc);
+    ui.raster.drawScene(&fb, &sc, null);
     return fb;
 }
 
@@ -547,4 +547,234 @@ test "the PNG encoder produces a file that decodes back to the pixels" {
             try testing.expectEqualSlices(u8, &.{ want.r, want.g, want.b }, row[1 + x * 3 ..][0..3]);
         }
     }
+}
+
+// ------------------------------------------------------------------- text
+//
+// No font is involved in any of these. The atlas is a handful of bytes written
+// by hand, which is the point: the core's half of text is "sample a coverage
+// byte at an exact texel and blend it", and that is checkable without
+// fontconfig, FreeType or HarfBuzz being installed. What those produce is
+// tested in `zig build test-text`.
+
+/// A run of `n` glyphs in a row, each `size` square, reading from a diagonal
+/// strip of the atlas so every glyph has a different coverage value.
+fn fakeRun(glyphs: []ui.Glyph, size: u16) ui.TextRun {
+    for (glyphs, 0..) |*g, i| {
+        const at: u16 = @intCast(i * size);
+        g.* = .{
+            .dx = @floatFromInt(at),
+            .dy = 0,
+            .w = @floatFromInt(size),
+            .h = @floatFromInt(size),
+            .u0 = at,
+            .v0 = 0,
+            .u1 = at + size,
+            .v1 = size,
+        };
+    }
+    return .{
+        .glyphs = glyphs,
+        .width = @floatFromInt(glyphs.len * size),
+        .ascent = @floatFromInt(size),
+        .descent = 0,
+    };
+}
+
+test "text sizes a leaf and gives it a real baseline" {
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    const label = try t.appendChild(t.root(), .{});
+
+    var glyphs: [4]ui.Glyph = undefined;
+    try t.setText(label, fakeRun(&glyphs, 6));
+    t.layout(.{ .w = 200, .h = 100 });
+
+    // 4 glyphs of 6 pixels wide, 6 of ascent and nothing below the baseline.
+    try testing.expectEqual(@as(f32, 24), t.bounds(label).w);
+    try testing.expectEqual(@as(f32, 6), t.bounds(label).h);
+    // The baseline is the ascent, not the 0.8 * height a childless element
+    // without text has to guess at.
+    try testing.expectEqual(@as(f32, 6), t.elements()[label].baseline);
+}
+
+test "padding surrounds text the same way it surrounds children" {
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    const label = try t.appendChild(t.root(), .{ .padding = 5 });
+
+    var glyphs: [2]ui.Glyph = undefined;
+    try t.setText(label, fakeRun(&glyphs, 10));
+    t.layout(.{ .w = 200, .h = 100 });
+
+    try testing.expectEqual(@as(f32, 30), t.bounds(label).w); // 20 + 2*5
+    try testing.expectEqual(@as(f32, 20), t.bounds(label).h); // 10 + 2*5
+    try testing.expectEqual(@as(f32, 15), t.elements()[label].baseline);
+}
+
+test "setting text dirties layout and recolouring it does not" {
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    const label = try t.appendChild(t.root(), .{});
+    var glyphs: [3]ui.Glyph = undefined;
+    try t.setText(label, fakeRun(&glyphs, 8));
+    t.layout(.{ .w = 200, .h = 100 });
+
+    // Longer text is wider, and that has to reach the parent.
+    var more: [5]ui.Glyph = undefined;
+    try t.setText(label, fakeRun(&more, 8));
+    const s = t.flush();
+    try testing.expect(s.total() > 0);
+    try testing.expectEqual(@as(f32, 40), t.bounds(label).w);
+
+    // Colour is not a size input.
+    const rev = t.revision;
+    t.setPaint(label, .{ .text_color = Color.hex(0xFF0000) });
+    try testing.expect(t.revision > rev);
+    try testing.expectEqual(@as(u32, 0), t.flush().total());
+}
+
+test "glyph quads follow their element's box, in its clip and its layer" {
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    const box = try t.appendChild(t.root(), .{
+        .width = .{ .fixed = 50 },
+        .height = .{ .fixed = 20 },
+        .padding = 2,
+    });
+    t.setPaint(box, .{ .background = Color.hex(0x112233), .clip_children = true });
+    var glyphs: [3]ui.Glyph = undefined;
+    try t.setText(box, fakeRun(&glyphs, 4));
+    t.layout(.{ .w = 200, .h = 100 });
+
+    var sc = Scene.init(testing.allocator);
+    defer sc.deinit();
+    const st = try sc.build(&t);
+    try testing.expectEqual(@as(u32, 3), st.glyphs);
+
+    const q = sc.items();
+    try testing.expectEqual(@as(usize, 4), q.len);
+    // The box first, then its glyphs -- which is what makes a label paint over
+    // its own background without anything having to sort.
+    try testing.expect(!q[0].flags.textured);
+    for (q[1..]) |g| {
+        try testing.expect(g.flags.textured);
+        // Positioned from the element's content origin, which is the padding
+        // box corner, not the element's edge.
+        try testing.expect(g.x >= t.bounds(box).x + 2);
+        // Carrying the clip of the element they belong to.
+        try testing.expectEqual(q[0].cx, g.cx);
+    }
+    try testing.expectEqual(t.bounds(box).x + 2, q[1].x);
+}
+
+test "a glyph samples exactly one texel per pixel" {
+    // A 4x1 atlas with four distinct coverages, drawn as one 4x1 glyph at an
+    // integral position. Each destination pixel must read its own texel: this
+    // is the property the GPU's `texelFetch` path is written to match, and the
+    // reason glyph positions are snapped to the pixel grid.
+    const pixels = [_]u8{ 0, 85, 170, 255 };
+    const atlas: ui.AtlasView = .{ .pixels = &pixels, .w = 4, .h = 1 };
+
+    var fb = try ui.Framebuffer.init(testing.allocator, 8, 3);
+    defer fb.deinit();
+    fb.clear(Color.black);
+
+    const q: ui.Quad = .{
+        .x = 2,
+        .y = 1,
+        .w = 4,
+        .h = 1,
+        .background = Color.white.pack(),
+        .border_color = 0,
+        .border_width = 0,
+        .corner_radius = 0,
+        .cx = 0,
+        .cy = 0,
+        .cw = 8,
+        .ch = 3,
+        .u0 = 0,
+        .v0 = 0,
+        .u1 = 4,
+        .v1 = 1,
+        .flags = .{ .textured = true },
+    };
+    ui.raster.drawQuad(&fb, q, atlas);
+
+    for (pixels, 0..) |cov, i| {
+        const got = fb.at(@intCast(2 + i), 1).r;
+        try testing.expectEqual(cov, got);
+    }
+    // The quad is expanded by a pixel for antialiasing it does not have, so
+    // the pixels either side must be untouched rather than reading a
+    // neighbouring texel or the edge one twice.
+    try testing.expectEqual(@as(u8, 0), fb.at(1, 1).r);
+    try testing.expectEqual(@as(u8, 0), fb.at(6, 1).r);
+    try testing.expectEqual(@as(u8, 0), fb.at(2, 0).r);
+    try testing.expectEqual(@as(u8, 0), fb.at(2, 2).r);
+}
+
+test "a clip cuts a glyph at the texel the clip falls on" {
+    const pixels = [_]u8{ 255, 255, 255, 255 };
+    const atlas: ui.AtlasView = .{ .pixels = &pixels, .w = 4, .h = 1 };
+
+    var fb = try ui.Framebuffer.init(testing.allocator, 8, 3);
+    defer fb.deinit();
+    fb.clear(Color.black);
+
+    const q: ui.Quad = .{
+        .x = 2,
+        .y = 1,
+        .w = 4,
+        .h = 1,
+        .background = Color.white.pack(),
+        .border_color = 0,
+        .border_width = 0,
+        .corner_radius = 0,
+        // Clip ends halfway through the glyph's third pixel.
+        .cx = 0,
+        .cy = 0,
+        .cw = 4.5,
+        .ch = 3,
+        .u0 = 0,
+        .v0 = 0,
+        .u1 = 4,
+        .v1 = 1,
+        .flags = .{ .textured = true },
+    };
+    ui.raster.drawQuad(&fb, q, atlas);
+
+    try testing.expectEqual(@as(u8, 255), fb.at(2, 1).r);
+    try testing.expectEqual(@as(u8, 255), fb.at(3, 1).r);
+    // Half covered by the clip: the clip is antialiased even though the glyph
+    // is not, because the clip edge is geometry and the glyph edge is a texel.
+    try testing.expectEqual(@as(u8, 128), fb.at(4, 1).r);
+    try testing.expectEqual(@as(u8, 0), fb.at(5, 1).r);
+}
+
+test "a textured quad with no atlas draws nothing" {
+    var fb = try ui.Framebuffer.init(testing.allocator, 4, 4);
+    defer fb.deinit();
+    fb.clear(Color.black);
+    const q: ui.Quad = .{
+        .x = 0,
+        .y = 0,
+        .w = 4,
+        .h = 4,
+        .background = Color.white.pack(),
+        .border_color = 0,
+        .border_width = 0,
+        .corner_radius = 0,
+        .cx = 0,
+        .cy = 0,
+        .cw = 4,
+        .ch = 4,
+        .u0 = 0,
+        .v0 = 0,
+        .u1 = 4,
+        .v1 = 4,
+        .flags = .{ .textured = true },
+    };
+    ui.raster.drawQuad(&fb, q, null);
+    try testing.expectEqual(@as(u8, 0), fb.at(2, 2).r);
 }

@@ -104,6 +104,15 @@ pub const Paint = struct {
     border_color: Color = Color.transparent,
     border_width: f32 = 0,
 
+    /// The colour the element's text is drawn in.
+    ///
+    /// In `Paint` and not in the text run, for the reason this whole struct
+    /// exists: a theme switch recolours every label in the window, and if the
+    /// colour lived in the run then recolouring would mean re-shaping. Here it
+    /// bumps the revision, rebuilds the scene, and runs no layout and no
+    /// HarfBuzz at all.
+    text_color: Color = Color.black,
+
     /// One radius for all four corners. Per-corner radii are a mechanical
     /// extension of the same distance field and are left out rather than
     /// half-done.
@@ -136,15 +145,18 @@ pub const Paint = struct {
     pub fn eql(a: Paint, b: Paint) bool {
         return Color.eql(a.background, b.background) and
             Color.eql(a.border_color, b.border_color) and
+            Color.eql(a.text_color, b.text_color) and
             a.border_width == b.border_width and
             a.corner_radius == b.corner_radius and
             a.clip_children == b.clip_children and
             a.layer == b.layer;
     }
 
-    /// Whether this element contributes a primitive of its own. An element with
-    /// no fill and no border still clips and still carries a layer, so being
-    /// invisible is not the same as being absent.
+    /// Whether this element contributes a *box* primitive of its own. An
+    /// element with no fill and no border still clips, still carries a layer,
+    /// and may still have text, so being invisible is not the same as being
+    /// absent -- and text is deliberately not consulted here, because this
+    /// question is about the box.
     pub fn isVisible(self: Paint) bool {
         if (!self.background.isInvisible()) return true;
         return self.border_width > 0 and !self.border_color.isInvisible();

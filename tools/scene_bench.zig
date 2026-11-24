@@ -6,8 +6,8 @@
 //! ~15 ns and zero allocations, against ~2.32 ms of CPU for a view-level
 //! toolkit) is a figure for that prototype, not for the code shipped here. The
 //! library was written from the prototype's lessons but is not the same code:
-//! it has a separate paint channel, a `max_cross` cache the prototype lacked,
-//! and a correctness fix the prototype still does not have.
+//! it has a separate paint channel, text as a layout input, and a correctness
+//! fix (CSS 9.4 step 8) the prototype still does not have.
 //!
 //! So the numbers below either reproduce the claim on the real implementation
 //! or do not. The comparison baselines, all from the benchmark repository at
@@ -19,6 +19,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const ui = @import("zig-uikit");
+const text = @import("zig-uikit-text");
 
 const Tree = ui.Tree;
 const Color = ui.Color;
@@ -283,13 +284,115 @@ pub fn main() !void {
         report("scene build, nothing changed", dt, iters, "one integer comparison");
     }
 
+    // --- text on the frame path ---
+    //
+    // Synthetic glyph runs, not shaped ones: no font is opened here. Shaping is
+    // not on the frame path -- it happens when the text changes -- and what is
+    // measured below is what a window full of text costs every time the scene
+    // is rebuilt. Six glyphs per cell is a short label, and 1224 cells is a
+    // dense table.
+    {
+        var text_tree = try build(gpa);
+        defer text_tree.t.deinit();
+        var glyphs: [6]ui.Glyph = undefined;
+        for (&glyphs, 0..) |*g, i| {
+            const at: u16 = @intCast(i * 6);
+            g.* = .{
+                .dx = @floatFromInt(at),
+                .dy = 0,
+                .w = 6,
+                .h = 10,
+                .u0 = at,
+                .v0 = 0,
+                .u1 = at + 6,
+                .v1 = 10,
+            };
+        }
+        const run: ui.TextRun = .{ .glyphs = &glyphs, .width = 36, .ascent = 8, .descent = 2 };
+
+        var labelled: u32 = 0;
+        var el: Index = 0;
+        while (el < text_tree.t.count()) : (el += 1) {
+            if (text_tree.t.childCount(el) != 0) continue;
+            try text_tree.t.setText(el, run);
+            labelled += 1;
+        }
+        text_tree.t.layout(viewport);
+        _ = text_tree.t.flush();
+
+        var text_scene = ui.Scene.init(gpa);
+        defer text_scene.deinit();
+        const ts = try text_scene.build(&text_tree.t);
+
+        std.debug.print("\ntext ({d} labels of {d} glyphs: {d} quads, {d} of them glyphs)\n", .{
+            labelled, glyphs.len, ts.emitted, ts.glyphs,
+        });
+
+        const iters = 2_000;
+        var flip = false;
+        const t0 = nowNs();
+        for (0..iters) |_| {
+            flip = !flip;
+            text_tree.t.setPaint(text_tree.tinted, .{
+                .background = if (flip) Color.hex(0x9AA0A6) else Color.hex(0x4C7EF3),
+                .corner_radius = 5,
+            });
+            _ = text_tree.t.flush();
+            _ = try text_scene.build(&text_tree.t);
+        }
+        report("full scene rebuild, with text", nowNs() - t0, iters, "the same grid without text: see above");
+
+        const rc_iters = 1_000_000;
+        const t1 = nowNs();
+        for (0..rc_iters) |_| {
+            _ = text_tree.t.flush();
+        }
+        report("recolour text, flush", nowNs() - t1, rc_iters, "text colour is paint, so no layout runs");
+    }
+
+    // --- shaping, which is NOT on the frame path ---
+    //
+    // Measured anyway, because the first question about any text stack is what
+    // a string costs, and because the answer is what justifies shaping on
+    // change rather than per frame. Both numbers are with a warm glyph cache,
+    // which is the realistic case: a label whose text changes is overwhelmingly
+    // made of letters the atlas already holds.
+    {
+        var lib = try text.Library.init();
+        defer lib.deinit();
+        var font = try lib.open(gpa, "sans", 13);
+        defer font.deinit();
+        var atlas = try text.Atlas.init(gpa, 512, 512);
+        defer atlas.deinit();
+
+        const line = "Hàng thứ 12 — tiếng Việt đã được tạo hình";
+        _ = try font.shape(&atlas, line);
+
+        std.debug.print("\nshaping (off the frame path: happens when the text changes)\n", .{});
+        {
+            const iters = 20_000;
+            const t0 = nowNs();
+            for (0..iters) |_| _ = try font.shape(&atlas, line);
+            report("shape a 40-character line", nowNs() - t0, iters, "HarfBuzz, warm glyph cache");
+        }
+        {
+            var t2 = try Tree.init(gpa);
+            defer t2.deinit();
+            const el = try t2.appendChild(t2.root(), .{});
+            const iters = 20_000;
+            const t0 = nowNs();
+            for (0..iters) |_| try text.setText(&t2, el, &font, &atlas, line);
+            report("shape it and install it", nowNs() - t0, iters, "plus the copy onto the element");
+        }
+    }
+
     // --- raster ---
     std.debug.print("\nsoftware raster (reference, not the renderer)\n", .{});
     {
         const iters = 200;
-        for (0..10) |_| ui.raster.drawScene(&fb, &sc);
+        for (0..10) |_| ui.raster.drawScene(&fb, &sc, null);
         const t0 = nowNs();
-        for (0..iters) |_| ui.raster.drawScene(&fb, &sc);
+        for (0..iters) |_| ui.raster.drawScene(&fb, &sc, null);
         report("drawScene, whole viewport", nowNs() - t0, iters, "a GPU does this in the compositor's budget");
     }
     std.debug.print("\n", .{});
