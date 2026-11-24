@@ -90,9 +90,35 @@ Telex, input mode 1 (Pre-edit). One interactive session, 43 `done` events,
 - No stale-serial `done` events.
 - No resync storm after the fix described below.
 
-**Not yet verified, and it is the more dangerous half:**
-`delete_surrounding_text` was never called, so the byte-length hazard is
-untested. See the correction above — this needs bamboo input mode 2.
+**`delete_surrounding_text` is now covered by a self test, not by typing.**
+`ime-wayland --selftest` drives the four event handlers directly, with no
+compositor, and asserts the document that comes out — **21 assertions, all
+passing** ([logs/session-02](logs/session-02-document-selftest.txt)).
+
+That reaches the paths typing could not. The ones that matter:
+
+| assertion | why |
+| --- | --- |
+| a preedit leaves the document empty, twice over | hazard 2, the half the real session did prove |
+| a preedit-only change triggers **no** resync; a document change triggers exactly one | the infinite loop described below, pinned so it cannot come back |
+| **delete 1 BYTE then commit 2 bytes leaves exactly `ă`** | hazard 1 — the Telex case, finally exercised |
+| delete-then-insert, not insert-then-delete | the fixed application order; reversing it eats the wrong character |
+| deleting 3 bytes removes exactly one 3-byte character | `ế` is 3 bytes, and a character-count implementation passes every ASCII test before failing here |
+| a delete length that would split a character snaps instead of corrupting | the compositor should never send one; if it does the document must survive |
+| a 2 740-byte multi-byte document stays valid UTF-8 with the cursor in bounds | past the protocol's 2 000-byte surrounding-text window |
+
+The boundary guard fired during the run, which is what it is for:
+
+```
+!! delete_surrounding_text(1,0) snapped to (0,0) at UTF-8 boundary
+PASS  a split-mid-character delete did not corrupt the buffer
+```
+
+**This proves the document model, not that a compositor drives it that way.**
+ibus-bamboo in mode 1 still never sends `delete_surrounding_text`, so the real
+path remains unobserved; bamboo input mode 2 (`Shift + ~`) would observe it.
+The distinction is the same one spike E draws about its lock state machine, and
+it is the reason the real sessions are kept in `logs/` alongside the tests.
 
 Also untested: selection replacement (cursor and anchor are kept equal), cursor
 movement during composition, and a raw key arriving while a preedit is live.

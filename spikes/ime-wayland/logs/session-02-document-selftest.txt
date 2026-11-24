@@ -1,0 +1,29 @@
+--- document model self test ---
+
+  PASS  a preedit leaves the document empty
+  PASS  the preedit is held separately
+  PASS  a changed preedit still leaves the document empty
+  PASS  a preedit-only change triggers no resync
+  PASS  a document change triggers exactly one resync
+  PASS  the commit string enters the document
+  PASS  the preedit is cleared by the commit
+  PASS  the cursor is in BYTES, past a 2-byte char
+  PASS  plain 'a' committed
+  PASS  delete 1 BYTE then commit 2 bytes leaves exactly "ă"
+  PASS  the document is 2 bytes
+  PASS  ...and 1 codepoint
+  PASS  delete-then-insert, not insert-then-delete
+  PASS  "tiế" is 5 bytes
+  PASS  deleting 3 bytes removes exactly one 3-byte character
+  !! delete_surrounding_text(1,0) snapped to (0,0) at UTF-8 boundary
+  PASS  a split-mid-character delete did not corrupt the buffer
+  PASS  the document is still valid UTF-8
+  PASS  delete_surrounding_text removes on both sides of the cursor
+  PASS  the document grew past the 2000-byte window
+  PASS  the cursor tracked to the end
+  PASS  a long multi-byte document is valid UTF-8
+
+  21 passed, 0 failed
+
+  NOTE: this proves the document model, not that a compositor drives
+  it this way. ibus-bamboo never sent delete_surrounding_text.

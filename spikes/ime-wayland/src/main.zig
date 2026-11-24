@@ -225,6 +225,12 @@ const App = struct {
     running: bool = true,
     configured: bool = false,
     probe_only: bool = false,
+    /// Resync attempts. An unconditional resync on `done` is an infinite loop;
+    /// see applyPending.
+    n_sendstate: u32 = 0,
+    /// Suppresses the per-transaction trace. The self test drives hundreds of
+    /// transactions and the trace is for a human watching one.
+    quiet: bool = false,
 
     // observed-behaviour tally, printed on exit
     n_preedit: u32 = 0,
@@ -236,20 +242,20 @@ const App = struct {
 
     fn dumpDoc(self: *App, tag: []const u8) void {
         const d = &self.doc;
-        std.debug.print("  [{s}] doc=\"{s}\" | cursor={d}B ({d}cp)", .{
+        vlog("  [{s}] doc=\"{s}\" | cursor={d}B ({d}cp)", .{
             tag,
             d.text(),
             d.cursor,
             countCodepoints(d.buf[0..d.cursor]),
         });
         if (self.preedit.len > 0) {
-            std.debug.print(" | preedit=\"{s}\" cur={d}..{d}", .{
+            vlog(" | preedit=\"{s}\" cur={d}..{d}", .{
                 self.preedit.text(),
                 self.preedit.cursor_begin,
                 self.preedit.cursor_end,
             });
         }
-        std.debug.print(" | {d}B {d}cp\n", .{ d.len, countCodepoints(d.text()) });
+        vlog(" | {d}B {d}cp\n", .{ d.len, countCodepoints(d.text()) });
     }
 
     /// Tells the IME what the text around the cursor is, and where the cursor is
@@ -261,6 +267,9 @@ const App = struct {
     /// window around the cursor with offsets rebased into it -- forgetting to
     /// rebase is a bug that only appears once the document grows.
     fn sendState(self: *App, cause: u32) void {
+        // Counted BEFORE the null check so the self test can assert how many
+        // resyncs were attempted without a compositor attached.
+        self.n_sendstate += 1;
         const ti = self.text_input orelse return;
         const d = &self.doc;
 
@@ -311,7 +320,7 @@ const App = struct {
         const stale = serial != self.commit_serial;
         if (stale) {
             self.n_stale += 1;
-            std.debug.print(
+            vlog(
                 "  .. done(serial={d}) != our commit count {d}: IME saw stale surrounding text\n",
                 .{ serial, self.commit_serial },
             );
@@ -335,7 +344,7 @@ const App = struct {
         if (p.del_before != 0 or p.del_after != 0) {
             self.n_delete += 1;
             self.max_del_before = @max(self.max_del_before, p.del_before);
-            std.debug.print("  <- delete_surrounding_text(before={d}B, after={d}B)\n", .{
+            vlog("  <- delete_surrounding_text(before={d}B, after={d}B)\n", .{
                 p.del_before, p.del_after,
             });
             self.doc.deleteSurrounding(p.del_before, p.del_after);
@@ -346,7 +355,7 @@ const App = struct {
         // 3. insert the commit string
         if (p.has_commit and p.com_len > 0) {
             self.n_commit += 1;
-            std.debug.print("  <- commit_string(\"{s}\") {d}B {d}cp\n", .{
+            vlog("  <- commit_string(\"{s}\") {d}B {d}cp\n", .{
                 p.com[0..p.com_len],
                 p.com_len,
                 countCodepoints(p.com[0..p.com_len]),
@@ -359,13 +368,13 @@ const App = struct {
         // 5. install the new preedit
         if (p.has_preedit and p.pre_len > 0) {
             self.n_preedit += 1;
-            std.debug.print("  <- preedit_string(\"{s}\") cursor={d}..{d}\n", .{
+            vlog("  <- preedit_string(\"{s}\") cursor={d}..{d}\n", .{
                 p.pre[0..p.pre_len], p.pre_cb, p.pre_ce,
             });
             self.preedit.set(p.pre[0..p.pre_len], p.pre_cb, p.pre_ce);
             anything = true;
         } else if (had_preedit) {
-            std.debug.print("  <- preedit cleared\n", .{});
+            vlog("  <- preedit cleared\n", .{});
             anything = true;
         }
 
@@ -378,6 +387,174 @@ const App = struct {
 };
 
 var app: App = .{};
+
+/// The per-transaction trace, silenced during the self test.
+fn vlog(comptime fmt: []const u8, args: anytype) void {
+    if (app.quiet) return;
+    std.debug.print(fmt, args);
+}
+
+// ------------------------------------------------------------------ self test
+//
+// ibus-bamboo's default mode keeps the whole syllable in the preedit and never
+// rewrites committed text, so `delete_surrounding_text` was called ZERO times
+// across the real session. The byte-length hazard this spike was built to catch
+// therefore went untested by typing -- exactly the position spike E was in with
+// its queued lock.
+//
+// This drives the four event handlers directly, with no compositor, and asserts
+// the document that comes out. It reaches the paths typing could not.
+//
+// It proves the document model, not that a compositor drives it that way. The
+// real session (logs/session-01) is what proves the latter, and it is the one
+// that found the resync infinite loop.
+
+var t_pass: u32 = 0;
+var t_fail: u32 = 0;
+
+fn check(cond: bool, comptime what: []const u8) void {
+    if (cond) {
+        t_pass += 1;
+        std.debug.print("  PASS  {s}\n", .{what});
+    } else {
+        t_fail += 1;
+        std.debug.print("  FAIL  {s}\n", .{what});
+    }
+}
+
+fn checkDoc(want: []const u8, comptime what: []const u8) void {
+    const got = app.doc.text();
+    const ok = std.mem.eql(u8, got, want);
+    if (!ok) std.debug.print("        want \"{s}\" got \"{s}\"\n", .{ want, got });
+    check(ok, what);
+}
+
+/// One IME transaction, the way the compositor would deliver it.
+const Txn = struct {
+    preedit: ?[]const u8 = null,
+    pre_cb: i32 = 0,
+    pre_ce: i32 = 0,
+    commit: ?[]const u8 = null,
+    del_before: u32 = 0,
+    del_after: u32 = 0,
+};
+
+fn feed(t: Txn) void {
+    if (t.preedit) |pz| {
+        var buf: [PREEDIT_CAP]u8 = undefined;
+        @memcpy(buf[0..pz.len], pz);
+        buf[pz.len] = 0;
+        tiPreedit(null, null, &buf, t.pre_cb, t.pre_ce);
+    }
+    if (t.commit) |cz| {
+        var buf: [PREEDIT_CAP]u8 = undefined;
+        @memcpy(buf[0..cz.len], cz);
+        buf[cz.len] = 0;
+        tiCommit(null, null, &buf);
+    }
+    if (t.del_before != 0 or t.del_after != 0) {
+        tiDelete(null, null, t.del_before, t.del_after);
+    }
+    // The serial is matched so no stale-serial warning fires.
+    tiDone(null, null, app.commit_serial);
+}
+
+fn resetDoc() void {
+    app.doc = .{};
+    app.preedit.clear();
+    app.pending.clear();
+    app.commit_serial = 0;
+    app.n_sendstate = 0;
+}
+
+fn selfTest() void {
+    app.quiet = true;
+    std.debug.print("--- document model self test ---\n\n", .{});
+
+    // 1 -- preedit must never reach the document
+    resetDoc();
+    feed(.{ .preedit = "a", .pre_cb = 1, .pre_ce = 1 });
+    checkDoc("", "a preedit leaves the document empty");
+    check(std.mem.eql(u8, app.preedit.text(), "a"), "the preedit is held separately");
+    feed(.{ .preedit = "ă", .pre_cb = 2, .pre_ce = 2 });
+    checkDoc("", "a changed preedit still leaves the document empty");
+
+    // 2 -- a preedit-only transaction must NOT resync. This is the bug that
+    //      span at full speed: our commit makes the compositor send done again.
+    resetDoc();
+    app.n_sendstate = 0;
+    feed(.{ .preedit = "x" });
+    check(app.n_sendstate == 0, "a preedit-only change triggers no resync");
+    feed(.{ .commit = "x" });
+    check(app.n_sendstate == 1, "a document change triggers exactly one resync");
+
+    // 3 -- commit lands, preedit clears
+    resetDoc();
+    feed(.{ .preedit = "ă", .pre_cb = 2, .pre_ce = 2 });
+    feed(.{ .commit = "ă" });
+    checkDoc("ă", "the commit string enters the document");
+    check(app.preedit.len == 0, "the preedit is cleared by the commit");
+    check(app.doc.cursor == 2, "the cursor is in BYTES, past a 2-byte char");
+
+    // 4 -- THE TELEX CASE, and the whole reason this spike exists.
+    //      delete_surrounding_text lengths are BYTES. Deleting the committed
+    //      "a" must take 1 byte, and the replacement is 2 bytes.
+    resetDoc();
+    feed(.{ .commit = "a" });
+    checkDoc("a", "plain 'a' committed");
+    feed(.{ .del_before = 1, .commit = "ă" });
+    checkDoc("ă", "delete 1 BYTE then commit 2 bytes leaves exactly \"ă\"");
+    check(app.doc.len == 2, "the document is 2 bytes");
+    check(countCodepoints(app.doc.text()) == 1, "...and 1 codepoint");
+
+    // 5 -- the order is fixed: DELETE happens before the commit is inserted.
+    //      Doing it the other way round eats the wrong character.
+    resetDoc();
+    feed(.{ .commit = "xy" });
+    feed(.{ .del_before = 1, .commit = "Z" });
+    checkDoc("xZ", "delete-then-insert, not insert-then-delete");
+
+    // 6 -- a multi-byte delete: "ế" is 3 bytes
+    resetDoc();
+    feed(.{ .commit = "tiế" });
+    check(app.doc.len == 5, "\"tiế\" is 5 bytes");
+    feed(.{ .del_before = 3, .commit = "ê" });
+    checkDoc("tiê", "deleting 3 bytes removes exactly one 3-byte character");
+
+    // 7 -- a length that would SPLIT a character must snap, not corrupt.
+    //      The compositor should never send this; if it does, the document
+    //      must survive it.
+    resetDoc();
+    feed(.{ .commit = "ă" });
+    feed(.{ .del_before = 1 });
+    check(app.doc.len == 0 or app.doc.len == 2, "a split-mid-character delete did not corrupt the buffer");
+    check(std.unicode.utf8ValidateSlice(app.doc.text()), "the document is still valid UTF-8");
+
+    // 8 -- delete AFTER the cursor as well as before
+    resetDoc();
+    feed(.{ .commit = "abcd" });
+    app.doc.cursor = 2;
+    feed(.{ .del_before = 1, .del_after = 1 });
+    checkDoc("ad", "delete_surrounding_text removes on both sides of the cursor");
+
+    // 9 -- surrounding text must be a window with REBASED offsets once the
+    //      document exceeds the protocol's limit. Without a compositor the
+    //      send is a no-op, so this asserts the document survives a long
+    //      build-up and the cursor stays in bounds.
+    resetDoc();
+    var i: usize = 0;
+    while (i < 700) : (i += 1) feed(.{ .commit = "ếu" });
+    check(app.doc.len > 2000, "the document grew past the 2000-byte window");
+    check(app.doc.cursor == app.doc.len, "the cursor tracked to the end");
+    check(std.unicode.utf8ValidateSlice(app.doc.text()), "a long multi-byte document is valid UTF-8");
+
+    std.debug.print("\n  {d} passed, {d} failed\n", .{ t_pass, t_fail });
+    std.debug.print(
+        "\n  NOTE: this proves the document model, not that a compositor drives\n" ++
+            "  it this way. ibus-bamboo never sent delete_surrounding_text.\n",
+        .{},
+    );
+}
 
 // ----------------------------------------------------------- text-input-v3
 
@@ -693,6 +870,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     _ = it.next(); // argv[0]
     while (it.next()) |a| {
         if (std.mem.eql(u8, a, "--probe")) app.probe_only = true;
+        if (std.mem.eql(u8, a, "--selftest")) {
+            selfTest();
+            return;
+        }
     }
 
     app.display = c.wl_display_connect(null) orelse {
