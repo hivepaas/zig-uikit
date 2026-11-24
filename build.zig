@@ -185,6 +185,33 @@ fn addLinux(
     wl_mod.addCSourceFile(.{ .file = xdg.code, .flags = &.{"-std=c99"} });
     wl_mod.addCSourceFile(.{ .file = ti.code, .flags = &.{"-std=c99"} });
 
+    // --- accessibility ---
+    //
+    // Its own module and its own library, because it is the one part of the
+    // platform layer an application can do without: a window with no AT-SPI
+    // bridge still runs, and on a machine with no accessibility bus the bridge
+    // declines to start rather than taking the application down with it.
+    const dbus_inc = pkgIncludes(b, &.{"dbus-1"});
+    const dbus_c = b.addTranslateC(.{
+        .root_source_file = b.path("src/platform/atspi.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    for (dbus_inc) |p| dbus_c.addIncludePath(.{ .cwd_relative = p });
+
+    const atspi_mod = b.addModule("zig-uikit-atspi", .{
+        .root_source_file = b.path("src/platform/atspi.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "dbus", .module = dbus_c.createModule() },
+            .{ .name = "zig-uikit", .module = mod },
+        },
+    });
+    for (dbus_inc) |p| atspi_mod.addIncludePath(.{ .cwd_relative = p });
+    atspi_mod.linkSystemLibrary("dbus-1", .{});
+
     const window_demo = b.addExecutable(.{
         .name = "window_demo",
         .root_module = b.createModule(.{
@@ -195,6 +222,7 @@ fn addLinux(
                 .{ .name = "zig-uikit", .module = mod },
                 .{ .name = "zig-uikit-vulkan", .module = gpu_mod },
                 .{ .name = "zig-uikit-wayland", .module = wl_mod },
+                .{ .name = "zig-uikit-atspi", .module = atspi_mod },
                 .{ .name = "zig-uikit-text", .module = text_mod },
             },
         }),

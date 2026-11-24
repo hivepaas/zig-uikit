@@ -26,6 +26,7 @@ const std = @import("std");
 const ui = @import("zig-uikit");
 const vk = @import("zig-uikit-vulkan");
 const wl = @import("zig-uikit-wayland");
+const atspi = @import("zig-uikit-atspi");
 const demo = @import("demo.zig");
 
 const bg = ui.Color.hex(0x1E1F22);
@@ -165,6 +166,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var capture = false;
     var sweep: u64 = 0;
     var type_test = false;
+    var a11y_events = false;
     var args = std.process.Args.Iterator.init(init.args);
     _ = args.next();
     while (args.next()) |a| {
@@ -173,6 +175,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // Feeds `typeScript` into the key queue, a keystroke every few frames,
         // and reports what each one cost.
         if (std.mem.eql(u8, a, "--type")) type_test = true;
+        // Emits accessibility signals even with nothing listening, so they can
+        // be captured with `dbus-monitor` on a machine with no screen reader.
+        if (std.mem.eql(u8, a, "--a11y-events")) a11y_events = true;
     }
 
     var win = try wl.Window.open(gpa, "zig-uikit", 900, 560);
@@ -193,6 +198,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var t = try ui.Tree.init(gpa);
     defer t.deinit();
+
+    // Registered while the interface is built, because that is when the
+    // structure is known. 71 of the demo's 201 layout elements are things a
+    // person would name; the rest are rows, spacers and the three elements
+    // each overlay needs for want of absolute positioning, and a screen reader
+    // walking layout would announce every one.
+    var ax = try ui.access.Tree.init(gpa, "zig-uikit demo");
+    defer ax.deinit();
+    demo.access_tree = &ax;
+    defer demo.access_tree = null;
+
     try demo.buildUi(&t, &fonts);
     // Uploaded once, after the interface is built, because that is when every
     // glyph it uses is in the atlas. Nothing in the loop adds text, so nothing
@@ -224,9 +240,47 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // to send.
     if (demo.editable) |ed| win.setCaretRect(t.bounds(ed.caret.box));
 
+    // The field's node already exists; this is what gives it a value. The
+    // document is the same one the keyboard and the input method write to, so
+    // a screen reader reads what is actually there rather than a copy.
+    if (demo.editable_node != ui.access.no_node) {
+        ax.setDocument(demo.editable_node, &doc);
+        ax.setFocus(demo.editable_node);
+    }
+
     // Hands the document to the input method. From here the compositor may
     // write into it from inside `win.pump`.
     win.focusTextInput(&doc);
+
+    // --- the accessibility tree ---
+    //
+    // The tree itself is `demo.access_tree`, registered while the interface
+    // was built and shared with the macOS adapter. What is created here is the
+    // Linux half: a DBus bridge that reads it.
+    //
+    // Optional in the strongest sense: on a machine with no accessibility bus
+    // this fails and the demo runs without it. A toolkit that refused to start
+    // because `org.a11y.Bus` was absent would be unusable on most systems.
+    const bridge: ?*atspi.Bridge = atspi.Bridge.init(gpa, &ax, &t, .{
+        .app_name = "zig-uikit demo",
+        .toolkit_version = "0.0.0",
+        .locale = "vi_VN.UTF-8",
+        .always_emit = a11y_events,
+    }) catch |e| blk: {
+        std.debug.print("no accessibility bridge: {s}\n", .{@errorName(e)});
+        break :blk null;
+    };
+    defer if (bridge) |b| b.deinit();
+
+    if (bridge) |b| {
+        b.windowActivated(true);
+        if (demo.editable_node != ui.access.no_node) b.focusChanged(demo.editable_node);
+        std.debug.print(
+            "accessibility: registered as {s}, {d} nodes, {d} event listeners\n" ++
+                "  (zero listeners means nothing is listening, and nothing is emitted)\n\n",
+            .{ b.busName(), ax.count(), b.listeners() },
+        );
+    }
 
     // The GPU's copy of the atlas is current as of here. Typing a character
     // the font has not rasterised yet changes the atlas, and this is how that
@@ -290,6 +344,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     while (!win.closed) {
         win.pump();
+        if (bridge) |b| b.pump();
         if (win.closed) break;
 
         if (win.resized) {
@@ -322,8 +377,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // application edit has to be told back to the input method -- the
         // input method's own edit is not news to it, and `tiDone` has already
         // answered it.
-        var text_dirty = win.takeImeDirty();
+        const ime_changed = win.takeImeDirty();
+        var text_dirty = ime_changed;
         var app_changed = false;
+        // The input method's edit happened inside `pump` and produced no
+        // `Edit` here, so the bridge recovers it by comparison.
+        if (ime_changed) {
+            if (bridge) |b| b.textChanged(demo.editable_node, null);
+        }
 
         if (type_test and frames % 4 == 0) {
             if (ime_at < ime_script.len) {
@@ -332,6 +393,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 const r = try ui.input_method.apply(&doc, ime_script[ime_at]);
                 ime_at += 1;
                 if (r.document_changed or r.preedit_changed) text_dirty = true;
+                if (r.document_changed) {
+                    if (bridge) |b| b.textChanged(demo.editable_node, null);
+                }
                 // Counted as an application change, which is what it is from
                 // the real input method's point of view: ibus is attached to
                 // this document and did not cause this, so the change cause it
@@ -370,6 +434,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
             if (r.edited or r.moved) {
                 text_dirty = true;
                 app_changed = true;
+            }
+            // Told to the screen reader per edit rather than per frame,
+            // because the events carry offsets into the text as it was at
+            // each step. Collapsing two edits into one frame's worth of
+            // signals would describe neither.
+            if (bridge) |b| {
+                if (r.edited) b.textChanged(demo.editable_node, r.edit) else if (r.moved) b.caretMoved(demo.editable_node);
             }
         }
         if (text_dirty) {
@@ -600,4 +671,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         win.ime_events.delete,
     });
     if (win.ime_error) |e| std.debug.print("the input-method path reported {s}\n", .{@errorName(e)});
+    if (bridge) |b| std.debug.print(
+        "\naccessibility: {d} dbus calls served, {d} events emitted, {d} listeners\n",
+        .{ b.calls_served, b.events_emitted, b.listeners() },
+    );
 }

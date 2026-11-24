@@ -4,12 +4,13 @@ A declarative GPU UI toolkit for Zig.
 
 > **Status: pre-alpha.** The layout core, the scene layer, a Vulkan renderer
 > with a Wayland window, a Metal renderer with a macOS window, a shaped-text
-> stack, a keyboard and a Wayland input method that both type into one document
-> exist and are tested. Both backends draw text; input is Wayland-only.
+> stack, a keyboard and input methods on both platforms that type into one
+> document, and an AT-SPI accessibility tree, exist and are tested. Both
+> backends draw text; accessibility is Linux-only so far.
 > There are no widgets. Expect the API to change without notice.
 
 ```sh
-zig build test                           # 131 tests, no platform dependencies
+zig build test                           # 144 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
 zig build test-text                      # 15 tests, needs a font installed
@@ -19,10 +20,13 @@ zig build gpu-demo                       # renders on the GPU, diffs against the
 zig build window                         # opens a window and renders into it
 ```
 
-`window` takes `--capture`, `--sweep` and `--type`; the last scripts a sequence
-of keystrokes through the editable field and reports what each one cost. The
-last two steps follow the target: Vulkan and Wayland on Linux, Metal and AppKit
-on macOS. `test-input` is Linux-only. `zig build test` needs nothing. Everything else links fontconfig,
+`window` takes `--capture`, `--sweep`, `--type` and `--a11y-events`; `--type`
+scripts a sequence of keystrokes through the editable field and reports what
+each one cost. The last two steps follow the target: Vulkan and Wayland on
+Linux, Metal and AppKit on macOS. `test-input` is Linux-only, and so is the
+AT-SPI bridge, which the window starts if an accessibility bus is there and
+runs without if it is not.
+`zig build test` needs nothing. Everything else links fontconfig,
 FreeType and HarfBuzz, because the demos share one source file and that file
 can set text — on macOS that means Homebrew:
 `brew install harfbuzz freetype fontconfig pkgconf`.
@@ -490,8 +494,9 @@ piece of work on top of it rather than something to half-do inside it.
 Of the eight requirements in
 [docs/text-and-accessibility.md](docs/text-and-accessibility.md), §1 (unit
 conversion), §2 (the provisional range), §6 (the edit guard) and §7 (cursor
-geometry) now exist, and §3 exists on Wayland. What does not: §4 and §5, the
-accessibility adapters, and §8; and §3 on the other two platforms.
+geometry) now exist; §3 exists on Wayland and macOS, and §4 and §5 exist on
+Linux through AT-SPI. What does not: §8, UI Automation, and the Windows half
+of everything.
 
 **One thing §7 said that turned out to be wrong.** This README claimed the
 caret rectangle still needed converting to *screen* coordinates, and that this
@@ -763,6 +768,139 @@ compositor and ibus-bamboo themselves.
 
 `ibus engine` reports `Bamboo` on this machine, so trying it is one command:
 `zig build window`, click into the third field, and type `tieengs`.
+
+## Accessibility
+
+The other half of tier A, and the half nobody in the Zig ecosystem has: dvui
+has no accessibility, and `ddalcu/zigui` has no accessibility files at all.
+`docs/native-vs-drawn.md` is blunt about why it matters — a widget that looks
+native but is invisible to a screen reader is strictly worse than the native
+widget it imitates.
+
+**There is no shortcut.** Three routes exist and two are closed. ATK plus the
+at-spi2-atk bridge requires being a GTK application. `libatspi` is the *client*
+library, for screen readers and inspection tools, not for applications exposing
+a tree. So an application that draws its own widgets implements the AT-SPI DBus
+interfaces directly, which is what AccessKit's Linux backend does.
+
+### The finding, and it is a trap rather than a difficulty
+
+```
+AT-SPI text offsets are in CHARACTERS.
+zwp_text_input_v3 offsets are in BYTES.
+```
+
+The same text field speaks bytes to the input method and characters to the
+screen reader. `Document` is byte-indexed throughout, deliberately, because
+that is what the input method needs — so every offset crossing into
+accessibility has to be converted. Getting it backwards does not crash and is
+invisible in ASCII: the screen reader simply reads the wrong characters.
+
+So the split is the same one the keyboard and the input method use. `src/a11y.zig`
+is in core, links nothing, and holds everything about *meaning* — roles,
+states, and every offset conversion. `src/platform/atspi.zig` is the wire:
+DBus, registration, and the signals. The role and state numbers come from
+`/usr/include/at-spi-2.0/atspi/atspi-constants.h`, not from memory; `entry` is
+79 and `frame` is 23, and a wrong one is a widget described as the wrong kind
+of thing.
+
+### Read back off the running registry
+
+`zig build window` registers with the AT-SPI registry and the desktop tree
+includes it. Every line below was asked of the running demo over DBus with
+`gdbus`, not asserted here:
+
+| query | answer |
+| --- | --- |
+| the registry's `GetChildren` on the desktop | includes our bus name |
+| `GetRoleName` / `GetRole` on the field | `entry` / 79 |
+| `GetState` | `[1191188864, 0]` |
+| `GetInterfaces` | Accessible, Component, Text |
+| `GetExtents` on the frame | `(0, 0, 900, 560)` |
+| `GetExtents` on the field | `(216, 294, 668, 34)` |
+| `Text.GetCharacterCount` | **18**, for a string of 24 bytes |
+| `Text.GetText(0, 5)` | `Gõ và` — five characters, seven bytes |
+| `Text.GetText(12, 18)` | `tiếng ` — starting at byte 16 |
+| `Cache.GetItems` | the whole tree in one call |
+| `GetApplicationBusAddress` | `""` |
+
+`1191188864` is the bit-exact state set for EDITABLE, ENABLED, FOCUSABLE,
+FOCUSED, SENSITIVE, SHOWING, SINGLE_LINE and VISIBLE, and it is asserted in
+`zig build test` as well — the same number from both ends.
+
+The extents and the text are **not snapshots**. A node points at its element
+and at its document, and every query reads them live, which is why resizing the
+window changes what `GetExtents` answers without anything having to remember to
+tell the bridge.
+
+Two of those rows exist because spike C ran Orca and not because it read the
+specification. `Cache.GetItems` is Orca's *first* move on a new application —
+it pulls the whole tree in one call rather than walking node by node, and
+without it an application is listed by name and then unreadable. Its path is a
+*sibling* of the accessible subtree, so the DBus fallback has to be registered
+one level higher or the call never reaches the handler at all.
+`GetApplicationBusAddress` is asked before Orca reads anything; an error there
+makes a client believe the application has a private bus it cannot reach.
+
+### The events, captured on the wire
+
+```
+member=TextChanged   string "insert"  int32 18  int32 4  variant string "Việt"
+member=TextCaretMoved                 int32 22
+member=TextChanged   string "insert"  int32 23  int32 1  variant string "—"
+member=TextChanged   string "delete"  int32 38  int32 1  variant string "ọ"
+```
+
+Captured with `dbus-monitor` from a real run. The first is an input method
+committing `Việt` into a document of 18 characters and **24 bytes**: the offset
+is 18. The caret then moves to 22, not to 30. The em dash is three bytes and
+one character, and the insert after it is at 24. The deleted `ọ` is three bytes
+and length 1. Byte offsets anywhere in that list would put a screen reader
+silently in the wrong place.
+
+An application's own edit carries a `Document.Edit`, which is exact — its
+extent was computed where both the old text and the new one existed. **An input
+method's edit does not**: it is applied inside the platform layer and the
+application never sees one. So the bridge keeps a mirror of what it last
+reported and recovers the change by comparing against it, which it needs the
+mirror for anyway, because `text-changed:delete` carries the text that was
+removed and after the edit it is gone.
+
+### Nothing is emitted when nothing is listening
+
+With no assistive technology running, `GetRegisteredEvents` returns an empty
+array and every signal goes to nobody. A toolkit that emits unconditionally
+puts traffic on the accessibility bus for the great majority of users, so the
+bridge asks and then stays quiet: **0 listeners, 0 events**, which is what the
+demo reports on a machine with no screen reader. `--a11y-events` overrides the
+gate so the signals can be captured with `dbus-monitor` anyway, which is how
+the table above was produced.
+
+The registry also broadcast our arrival to the desktop on registration and
+withdrew it on exit — `ChildrenChanged add` then `remove`, from the registry's
+own bus name, visible in the same capture. That is third-party confirmation
+that the registration is real and not just exported objects nobody looks at.
+
+### One thing that is wrong, and is reported rather than hidden
+
+`Component.GetExtents` is specified in **screen** coordinates. On Wayland a
+client is not told where its own window is, so the bridge reports surface
+coordinates and the origin stays at zero. The error is the window's position:
+a constant per window, not per element. It is the half of §7 that Wayland did
+not need — `set_cursor_rectangle` is surface-local — and the half it cannot
+supply.
+
+Also absent: `EditableText`, so a screen reader can read the field and not
+change it, and `GetAccessibleAtPoint`. UI Automation on Windows is its own
+piece of work; `NSAccessibility` on macOS is done, against the same internal
+tree, which is the argument for that tree being where it is.
+
+A note for anyone reading the code: `DBusError` carries five one-bit bitfields,
+and Zig has no C bitfield support, so `translate-c` renders the whole struct as
+`opaque`. It is redeclared by hand with `comptime` assertions on its size and
+field offsets. It is the only thing in this project that `translate-c` could
+not handle at all, and it is a layout no compiler will check against the real
+header.
 
 ## The Vulkan backend
 
