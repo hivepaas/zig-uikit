@@ -13,5 +13,13 @@
 #include <wayland-client.h>
 #include "xdg-shell-client-protocol.h"
 
+// The keymap a compositor sends is a string in xkb's own text format, and
+// turning a keycode into a character means compiling it. There is no way to
+// do keyboard input on Wayland without this library: the protocol carries
+// evdev scancodes and nothing else, so the client owns the entire translation
+// from scancode to text. Only the window module links it -- the renderer
+// never calls into it, so it costs the renderer nothing.
+#include <xkbcommon/xkbcommon.h>
+
 #define VK_USE_PLATFORM_WAYLAND_KHR
 #include <vulkan/vulkan.h>

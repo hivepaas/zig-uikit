@@ -26,6 +26,8 @@ pub const paint = @import("paint.zig");
 pub const glyph = @import("glyph.zig");
 pub const offsets = @import("offsets.zig");
 pub const document = @import("document.zig");
+pub const keys = @import("keys.zig");
+pub const editing = @import("editing.zig");
 pub const scene = @import("scene.zig");
 pub const raster = @import("raster.zig");
 
@@ -46,6 +48,11 @@ pub const layers = paint.layers;
 
 pub const Document = document.Document;
 pub const Range = document.Range;
+
+pub const Key = keys.Key;
+pub const Mods = keys.Mods;
+pub const KeyEvent = keys.KeyEvent;
+pub const KeyQueue = keys.Queue;
 
 pub const Glyph = glyph.Glyph;
 pub const TextRun = glyph.TextRun;
@@ -73,6 +80,8 @@ test {
     _ = glyph;
     _ = offsets;
     _ = document;
+    _ = keys;
+    _ = editing;
     _ = scene;
     _ = raster;
     _ = @import("layout_test.zig");

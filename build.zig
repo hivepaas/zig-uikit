@@ -154,9 +154,17 @@ fn addLinux(
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{.{ .name = "vk", .module = c_mod }},
+        .imports = &.{
+            .{ .name = "vk", .module = c_mod },
+            // For `keys.zig` only: the window fills a queue of plain-data key
+            // events and knows nothing else about the toolkit.
+            .{ .name = "zig-uikit", .module = mod },
+        },
     });
     wl_mod.linkSystemLibrary("wayland-client", .{});
+    // Only this module. The keymap compiler is what turns an evdev scancode
+    // into a character; the renderer never asks, so it never links it.
+    wl_mod.linkSystemLibrary("xkbcommon", .{});
     // The generated interface tables are plain C and have to be compiled in.
     wl_mod.addCSourceFile(.{ .file = xdg_code, .flags = &.{"-std=c99"} });
 
@@ -196,6 +204,15 @@ fn addLinux(
     gpu_tests.root_module.linkSystemLibrary("vulkan", .{});
     const run_gpu_tests = b.addRunArtifact(gpu_tests);
     b.step("test-gpu", "Run the tests that need a Vulkan device").dependOn(&run_gpu_tests.step);
+
+    // The keyboard translation, without a compositor. `xkbcommon` compiles a
+    // keymap from layout names alone, so the scancode-to-character path is
+    // testable on any machine with a keyboard layout installed -- which is a
+    // much weaker requirement than a seat, a window and someone pressing keys.
+    const input_tests = b.addTest(.{ .root_module = wl_mod });
+    const run_input_tests = b.addRunArtifact(input_tests);
+    b.step("test-input", "Run the keyboard tests, which need xkbcommon and a layout")
+        .dependOn(&run_input_tests.step);
 
     const gpu_demo = b.addExecutable(.{
         .name = "gpu_demo",

@@ -3,22 +3,26 @@
 A declarative GPU UI toolkit for Zig.
 
 > **Status: pre-alpha.** The layout core, the scene layer, a Vulkan renderer
-> with a Wayland window, a Metal renderer with a macOS window, and a shaped-text
-> stack exist and are tested. Both backends draw text.
+> with a Wayland window, a Metal renderer with a macOS window, a shaped-text
+> stack and a keyboard that types into a document exist and are tested. Both
+> backends draw text; the keyboard is Wayland-only.
 > There are no widgets. Expect the API to change without notice.
 
 ```sh
-zig build test                           # 79 tests, no platform dependencies
+zig build test                           # 100 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
 zig build test-text                      # 14 tests, needs a font installed
+zig build test-input                     # 7 tests, needs xkbcommon and a layout
 zig build test-gpu                       # Vulkan: 7 tests; Metal: 10 tests
 zig build gpu-demo                       # renders on the GPU, diffs against the reference
 zig build window                         # opens a window and renders into it
 ```
 
-The last two follow the target: Vulkan and Wayland on Linux, Metal and AppKit
-on macOS. `zig build test` needs nothing. Everything else links fontconfig,
+`window` takes `--capture`, `--sweep` and `--type`; the last scripts a sequence
+of keystrokes through the editable field and reports what each one cost. The
+last two steps follow the target: Vulkan and Wayland on Linux, Metal and AppKit
+on macOS. `test-input` is Linux-only. `zig build test` needs nothing. Everything else links fontconfig,
 FreeType and HarfBuzz, because the demos share one source file and that file
 can set text — on macOS that means Homebrew:
 `brew install harfbuzz freetype fontconfig pkgconf`.
@@ -200,6 +204,25 @@ scene costs. A window with 1 224 labels in it, re-shaped every frame, would be
 **2.6 ms** — which is, to within rounding, the 2.32 ms that this project exists
 to argue against. Element-level reactivity is not an optimisation here; it is
 the only thing that makes a text-heavy window affordable at all.
+
+**That 2.1 us is a hot-cache number, and a keystroke is not.** The figure above
+comes from a tight loop with the font tables, the glyph cache and the scratch
+buffer all in L1. A keystroke arrives tens of milliseconds after the last one
+with every one of those evicted, and the same line then shapes in **12-60 us**.
+Measured in the running window, not inferred: `zig build window` with `--type`
+reshapes after each scripted keystroke and then shapes the identical line a
+second time, so the report carries both numbers side by side and the
+disagreement explains itself.
+
+| | cost |
+| --- | --- |
+| reshape after a keystroke, cold | 15-27 us mean, 57-64 us worst |
+| the same line shaped again, immediately | **2.9-3.2 us** |
+
+Neither number changes the conclusion above — 1 224 labels shaped back to back
+are 1 224 hot shapes, so 2.6 ms stands — but a per-keystroke claim quoting
+2.1 us would have been wrong by an order of magnitude. A benchmark in a tight
+loop cannot tell you what a keystroke costs.
 
 Which is also why the text colour lives in `Paint` and not in the run. A theme
 switch recolours every label in the window. If colour were part of the shaped
@@ -437,9 +460,158 @@ Of the eight requirements in
 conversion), §2 (the provisional range) and §6 (the edit guard) now exist, and
 §7 exists in run coordinates. What does not: converting a caret rectangle from
 run coordinates to *screen* coordinates, which needs the window to say where it
-is; the adapters themselves, which is where §3, §4, §5 and §8 live; and any
-keyboard input at all, so nothing yet drives the document except its tests and
-the demo.
+is; and the adapters themselves, which is where §3, §4, §5 and §8 live. The
+keyboard now drives the document — see below — but no input method does yet.
+
+## The keyboard
+
+Wayland hands a client an evdev scancode and a keymap, and stops there.
+Everything between that and a character in a document belongs to the client:
+which key the scancode is, what Shift does to it, whether it should repeat and
+when. `xkbcommon` compiles the keymap; the rest is `src/platform/wayland.zig`.
+
+So the split is the same one the rest of the toolkit uses. The window produces
+**plain-data key events** and knows nothing else:
+
+```zig
+pub const KeyEvent = struct {
+    key: Key = .none,          // .backspace, .left, .enter -- named keys only
+    mods: Mods = .{},
+    repeat: bool = false,
+    text_buf: [16]u8, text_len: u8,   // what the key typed, UTF-8
+    base: u21 = 0,             // which key it was, no modifiers applied
+};
+```
+
+`src/keys.zig` and `src/editing.zig` are both in core, link nothing, and are
+tested against a document in memory. `zig build test` covers word movement,
+selection collapse, deletion of a multi-byte character and the refusals below,
+on a machine with no compositor and no seat.
+
+### `base` is separate from `text`, and that is the bug everyone writes once
+
+They answer different questions. `text` is what the key typed; `base` is which
+key it was. Pressing Ctrl with the A key produces the text `\x01` — so a field
+matching Ctrl+A against the typed text matches nothing at all, and one matching
+against `text == "a"` fails the moment Shift is also held. `base` is level 0 of
+the current layout, so it is `a` for the A key under every modifier
+combination, and it is what an accelerator compares against.
+
+The other half of the same problem is that `\x01` is not text. xkb translates
+Enter to `\r`, Tab to `\t` and Escape to `\x1b`, and a field that inserted
+whatever arrived would write control bytes into the document. The window drops
+control characters before the event leaves it, and `editing.apply` refuses them
+again — once in the layer that has a keyboard, once in the layer that has
+tests.
+
+And the scancode offset: evdev numbers keys from 0 and xkb from 8. Getting it
+wrong does not break the keyboard, it *shifts* it — the A key types `u`,
+because xkb keycode 30 is evdev 22. Every key types a different letter,
+consistently, which is the kind of wrong that gets blamed on the layout.
+`zig build test-input` pins both halves of that, the right answer and the wrong
+one, because a test asserting only "some character came out" passes with the
+offset missing.
+
+### Repeat is the client's job, and the bug is the key that never stops
+
+The protocol sends one press and one release. A client that does nothing has a
+keyboard where holding Backspace deletes one character, so the repeat is
+synthesised from `repeat_info`'s rate and delay, driven from the frame loop
+rather than a timer thread.
+
+Two cancellations matter more than the timing. Only keys the keymap says repeat
+are repeated, so a held Shift does not. And a repeat is cancelled on **focus
+loss**, because a key released while another window has focus sends this window
+no release event at all — without that cancellation it types forever. The
+modifier state is cleared on focus loss for the same reason: a Shift released
+elsewhere would stay held.
+
+A frame can hold several keystrokes, so the window carries a queue rather than
+a "last key pressed" field, and the queue **counts** what it had no room for.
+A text field that silently loses a keystroke is the hardest class of bug to get
+a believable report of; `keys dropped because the queue filled 0` in the
+counters is a claim that can be falsified.
+
+### What the editing layer refuses to do
+
+`.up` and `.down` are reported **unhandled**, not approximated. There is no
+line breaker in this toolkit yet, so nothing knows where the second line
+starts, and a caret that guesses is worse than one that does not move. `.home`
+and `.end` go to the ends of the *document* and the code says so. The clipboard
+keys are not handled either: Ctrl+C needs `wl_data_device` and a round trip
+through the compositor, which is a protocol dependency and not an editing
+operation with a key attached.
+
+Word movement is three classes — space, word, punctuation — and not UAX #29.
+The one thing it gets right that the obvious version does not is that **every
+codepoint above U+007F that is not a listed space is a word character**. An
+ASCII `isAlphanumeric` test makes `tiếng` three words, because `ế` is not
+ASCII, and Ctrl+Left then stops the caret inside a syllable. It still treats a
+run of Han characters as one word, which UAX #29 does not; a real segmenter
+replaces that one function.
+
+Typing during a composition returns `error.Locked` rather than interleaving.
+Spike B hit this and printed a warning about "two writers to one document";
+here §6 makes it an error the caller has to answer, because the right recovery
+— commit the composition, or cancel it — depends on which key it was.
+
+### What a keystroke costs, measured in the window
+
+The third field in the demo is a real text field: a `Document`, the window's
+key queue drained into `editing.apply`, and a reshape when something changed.
+`zig build window` with `--type` scripts a sequence through it — multi-byte
+insertion, deletion of a character whose bytes are not one, word movement
+across a Vietnamese syllable, and typing over a selection — and reports what
+each one cost. ReleaseFast, on an AMD Ryzen 9 9950X with RADV:
+
+| | cost |
+| --- | --- |
+| one keystroke: shape, move the caret, install the run | **15-27 us** mean, 57-64 us worst |
+| of which the shaping, measured hot immediately after | 2.9-3.2 us |
+| a frame that changed nothing | **306 ns** |
+| re-upload the atlas after a never-seen character | **1.7-2.1 ms** |
+
+The last row is the one to fix, and measuring it decided *how*. The obvious
+guess — 256 KB is too much to push for one new glyph, so upload only the
+glyph's rectangle — is wrong. Staging the whole image costs 11-80 us; the other
+1.8-4.9 ms is `vkQueueSubmit` plus a fence wait, serialised behind a swapchain
+presenting at 60 Hz. A partial upload would save nothing. The fix is to record
+the transfer into the frame's own command buffer instead of taking a
+synchronous round trip through the queue, and it is a swapchain change rather
+than a text one.
+
+The atlas gained a `generation` counter so this happens only when it has to:
+typing a character the font has already rasterised changes no texels and
+uploads nothing. Across 28 scripted keystrokes, two uploads.
+
+![the editable field three keystrokes in: "Gõ vào đây: tiếng Việt — " with the caret after it](docs/demo-typing.png)
+
+That is a 3x nearest-neighbour crop of the frame the compositor was handed,
+three scripted keystrokes in: a space, an em dash and a space, typed into a
+field that started out holding `Gõ vào đây: tiếng Việt`. Both the typed frame
+and the untouched one were captured out of the swapchain and diffed against the
+software rasteriser: **largest channel difference 1**, including the em dash
+that had just been rasterised into the atlas. The caret
+is a one-pixel box moved by changing a spacer's width, which is the
+absolute-positioning workaround showing up for the fourth time; it means every
+caret move is a frame that did layout work, and the counters say so rather than
+hiding it.
+
+### What the keyboard does not do yet
+
+`zwp_text_input_v3` is not attached to this document, so the field takes raw
+keystrokes and no input method — Vietnamese goes in through the keymap or not
+at all, and the composition row above it is still a still life rather than a
+live preedit. That is the next slice, and spike B is the working reference for
+it. Nothing here sends a `set_cursor_rectangle` either, which needs the caret
+rectangle converted from run coordinates to screen coordinates, which needs the
+window to say where it is.
+
+The keyboard is Wayland-only. macOS delivers key events through `NSResponder`
+and does its own keymap translation in AppKit, so the platform half has to be
+written again there — but only the platform half: `keys.zig` and `editing.zig`
+are in core and the second backend reuses both, which is the whole reason they
+are shaped as plain data rather than as something that owns an xkb state.
 
 ## The Vulkan backend
 

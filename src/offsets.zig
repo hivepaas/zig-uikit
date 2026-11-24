@@ -114,6 +114,34 @@ pub fn alignToChar(s: []const u8, b: usize) usize {
     return i;
 }
 
+/// The character boundary immediately before `b`, or 0.
+///
+/// Moving a caret left is this, not `b - 1`: one byte back from the end of
+/// `ế` lands in the middle of it.
+pub fn prevChar(s: []const u8, b: usize) usize {
+    if (b == 0) return 0;
+    return alignToChar(s, b - 1);
+}
+
+/// The character boundary immediately after `b`, or `s.len`.
+pub fn nextChar(s: []const u8, b: usize) usize {
+    if (b >= s.len) return s.len;
+    const seq = std.unicode.utf8ByteSequenceLength(s[b]) catch 1;
+    return @min(b + seq, s.len);
+}
+
+/// `b` itself when it is a boundary, otherwise the next one after it.
+///
+/// `alignToChar` rounds down, which is right for a caret and wrong for the end
+/// of a range being deleted: rounding the end down can make it smaller than
+/// the start.
+pub fn alignForward(s: []const u8, b: usize) usize {
+    const back = alignToChar(s, b);
+    if (back == b or back == s.len) return back;
+    const seq = std.unicode.utf8ByteSequenceLength(s[back]) catch 1;
+    return @min(back + seq, s.len);
+}
+
 fn isContinuation(byte: u8) bool {
     return byte & 0xC0 == 0x80;
 }

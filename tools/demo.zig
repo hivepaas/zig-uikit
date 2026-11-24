@@ -46,6 +46,46 @@ pub var composition_field: Index = std.math.maxInt(Index);
 /// guessed offset that moves whenever the string does.
 pub var composition_text_w: f32 = 0;
 
+/// The field `window_demo.zig` types into, and the three elements whose
+/// geometry a keystroke changes.
+///
+/// Null when `buildUi` was given no fonts: there is nothing to type into when
+/// there is no shaper. See `label`.
+pub const Editable = struct {
+    field: Index,
+    label: Index,
+    /// Behind the text, so it is created before the label.
+    selection: Overlay,
+    caret: Overlay,
+    run_h: f32,
+};
+pub var editable: ?Editable = null;
+
+/// What the editable field starts out holding. Chosen so that the field is
+/// interesting before anyone types: multi-byte characters, a word boundary
+/// that an ASCII word-scan would get wrong, and a colon to step over.
+pub const editable_initial = "Gõ vào đây: tiếng Việt";
+
+pub const caret_color = Color.white;
+pub const selection_color = Color.hex(0x2F4B8F);
+
+/// Reshapes the editable field and repositions its caret and selection.
+///
+/// Everything a keystroke costs is in this function: one shaping pass over the
+/// line, three style changes, and a copy of the run into the element. It is
+/// here rather than in `window_demo.zig` so that the software demo and the GPU
+/// demo can call it too, and so that the cost is measured in one place.
+pub fn refreshEditable(t: *Tree, fonts: *Fonts, doc: *const ui.Document) !void {
+    const e = editable orelse return;
+    const run = try fonts.ui.shape(&fonts.atlas, doc.text());
+    const sel = doc.selection();
+    const r = run.rangeRect(sel.start, sel.end);
+    try moveOverlay(t, e.selection, r.x, r.w);
+    try moveOverlay(t, e.caret, run.caretX(doc.focus), 1);
+    // Last, because it copies the run out of the font's scratch buffer and the
+    // two calls above read it.
+    try t.setText(e.label, run);
+}
 
 /// More rows than the panel can show, so the clip and the culling both have
 /// something to do.
@@ -141,13 +181,40 @@ fn textField(t: *Tree, parent: Index) !Index {
 /// the text -- which is what the first version of this did, and what the
 /// rendered image showed.
 fn overlay(t: *Tree, field: Index, x: f32, y: f32, w: f32, h: f32, run_h: f32, c: Color) !void {
+    _ = try overlayParts(t, field, x, y, w, h, run_h, c);
+}
+
+/// The pieces of an overlay whose geometry can be changed afterwards.
+///
+/// Three elements and not one, because the position is expressed as a spacer's
+/// width. That is the cost of having no absolute positioning: moving a caret
+/// is a style change on a layout element, so it dirties layout. It is honest
+/// about the missing feature rather than hiding it, and the counters in
+/// `window_demo.zig` show what it costs -- every caret move is a frame that
+/// did layout work.
+pub const Overlay = struct {
+    gap: Index,
+    column: Index,
+    box: Index,
+};
+
+fn overlayParts(
+    t: *Tree,
+    field: Index,
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+    run_h: f32,
+    c: Color,
+) !Overlay {
     const anchor = try t.appendChild(field, .{
         .axis = .row,
         .width = .{ .fixed = 0 },
         .height = .{ .fixed = run_h },
         .flex_shrink = 0,
     });
-    _ = try t.appendChild(anchor, .{
+    const gap = try t.appendChild(anchor, .{
         .width = .{ .fixed = x },
         .height = .{ .fixed = 1 },
         .flex_shrink = 0,
@@ -168,6 +235,24 @@ fn overlay(t: *Tree, field: Index, x: f32, y: f32, w: f32, h: f32, run_h: f32, c
         .flex_shrink = 0,
     });
     t.setPaint(box, .{ .background = c, .corner_radius = if (h > 4) 2 else 0 });
+    return .{ .gap = gap, .column = column, .box = box };
+}
+
+/// Moves an overlay to `x` and resizes it to `w`, both in run coordinates.
+///
+/// A width of zero leaves nothing visible: the scene builder culls a
+/// zero-width quad, so an empty selection needs no special case here.
+pub fn moveOverlay(t: *Tree, o: Overlay, x: f32, w: f32) !void {
+    var gs = t.style(o.gap);
+    gs.width = .{ .fixed = @max(0, x) };
+    try t.setStyle(o.gap, gs);
+    // The column and the box both carry the width: the column is what reserves
+    // the space on the row, the box is what is painted.
+    for ([_]Index{ o.column, o.box }) |el| {
+        var es = t.style(el);
+        es.width = .{ .fixed = @max(0, w) };
+        try t.setStyle(el, es);
+    }
 }
 
 fn spacer(t: *Tree, parent: Index) !Index {
@@ -231,9 +316,15 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
     });
     t.setPaint(sidebar, .{ .background = panel });
     const nav = [_][]const u8{
-        "Trang chủ",   "Dự án",    "Tài liệu",
-        "Hình ảnh",    "Âm nhạc",  "Tải về",
-        "Đã lưu",      "Thùng rác", "Cài đặt",
+        "Trang chủ",
+        "Dự án",
+        "Tài liệu",
+        "Hình ảnh",
+        "Âm nhạc",
+        "Tải về",
+        "Đã lưu",
+        "Thùng rác",
+        "Cài đặt",
     };
     for (nav, 0..) |name, i| {
         const selected = i == 2;
@@ -408,6 +499,41 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
         }
         _ = try label(t, field, ui_font, atlas, shown.text, bright);
     }
+    {
+        // --- the field that is actually typed into ---
+        //
+        // The two rows above are pictures of a text field. This one is a text
+        // field: `window_demo.zig` holds a `Document` for it, drains the
+        // window's key queue into `editing.apply`, and calls
+        // `refreshEditable` when something changed. Nothing about the
+        // keyboard reaches this file.
+        //
+        // No input method is attached to it yet, so what arrives is raw
+        // keystrokes and `displayText` would have nothing to splice in; the
+        // row above still stands in for composition. Wiring
+        // `zwp_text_input_v3` to this document is the next slice, and when it
+        // is done this field gains an underline and the row above becomes
+        // redundant.
+        _ = try label(t, content, ui_font, atlas, "Gõ được thật — bàn phím, xkb, và Document:", dim);
+
+        const field = try textField(t, content);
+        if (ui_font) |f| {
+            const run = try f.shape(atlas.?, editable_initial);
+            const h = run.height();
+            const sel = try overlayParts(t, field, 0, 0, 0, h, h, selection_color);
+            const caret = try overlayParts(t, field, run.width, 0, 1, h, h, caret_color);
+            const lbl = try label(t, field, ui_font, atlas, editable_initial, Color.white);
+            editable = .{
+                .field = field,
+                .label = lbl,
+                .selection = sel,
+                .caret = caret,
+                .run_h = h,
+            };
+        } else {
+            _ = try label(t, field, ui_font, atlas, editable_initial, Color.white);
+        }
+    }
 
     // --- the scrolling list: more rows than fit, clipped and culled ---
     const list = try t.appendChild(content, .{
@@ -454,7 +580,6 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
         const size = try std.fmt.bufPrint(&size_buf, "{d} KB", .{(i + 1) * 37});
         _ = try label(t, row, ui_font, atlas, size, dim);
     }
-
 }
 
 pub const viewport: ui.Size = .{ .w = width, .h = height };
@@ -512,11 +637,10 @@ pub fn main() !void {
         \\wrote {s} ({d}x{d})
         \\
     , .{
-        t.count(),         s.visited,          s.emitted, s.glyphs,
-        s.culled,          row_total,
-        s.layers_used,
-        fonts.atlas.w,     fonts.atlas.h,      fonts.atlas.fillRatio() * 100,
-        path,              width,              height,
+        t.count(),     s.visited,                     s.emitted,     s.glyphs,
+        s.culled,      row_total,                     s.layers_used, fonts.atlas.w,
+        fonts.atlas.h, fonts.atlas.fillRatio() * 100, path,          width,
+        height,
     });
 }
 
@@ -525,7 +649,9 @@ pub fn main() !void {
 /// Nearest-neighbour, because the point of magnifying a UI screenshot is to
 /// see the pixels as they are. Smoothing them would hide exactly the thing
 /// being looked at.
-fn writeCrop(
+/// A magnified crop of a framebuffer, for the details a 900x560 screenshot
+/// cannot carry: a one-pixel underline, a one-pixel caret.
+pub fn writeCrop(
     gpa: std.mem.Allocator,
     io: std.Io,
     src: *const ui.Framebuffer,

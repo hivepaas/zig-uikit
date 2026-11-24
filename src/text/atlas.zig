@@ -63,6 +63,16 @@ pub const Atlas = struct {
     /// Texels actually handed out, for reporting how full the atlas is.
     used: u32 = 0,
 
+    /// Bumped whenever texels change.
+    ///
+    /// The GPU holds a copy of this image, and the only way to know whether it
+    /// is stale is to be told. Comparing fill ratios would miss a glyph that
+    /// happened to replace one of the same area; re-uploading every frame
+    /// would cost a texture upload per frame for text that almost never
+    /// changes. A counter answers the question exactly: typing a character the
+    /// font has already rasterised changes nothing and uploads nothing.
+    generation: u32 = 0,
+
     pub fn init(gpa: Allocator, w: u16, h: u16) Error!Atlas {
         const pixels = try gpa.alloc(u8, @as(usize, w) * h);
         // Zero is "no coverage", so an empty atlas is a transparent one and a
@@ -122,6 +132,7 @@ pub const Atlas = struct {
     pub fn blit(self: *Atlas, slot: Slot, src: []const u8, src_stride: usize) void {
         const w = slot.width();
         const h = slot.height();
+        self.generation += 1;
         for (0..h) |row| {
             const dst = (@as(usize, slot.v0) + row) * self.w + slot.u0;
             const from = row * src_stride;

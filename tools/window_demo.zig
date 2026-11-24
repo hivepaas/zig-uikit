@@ -11,6 +11,12 @@
 //!   - a frame where the pointer did not move does nothing on the CPU at all,
 //!     and the scene build returns after one integer comparison
 //!
+//! The third text field is typeable. Keystrokes arrive as `ui.KeyEvent`s in
+//! the window's queue, `ui.editing.apply` turns them into edits on a
+//! `Document`, and `demo.refreshEditable` reshapes the line and moves the
+//! caret. That path is the one thing in this program that is NOT free on an
+//! unchanged frame, and the counters say what it costs.
+//!
 //! Frame pacing comes from FIFO present, so the loop runs at the display's
 //! refresh rate without a sleep anywhere in it.
 
@@ -36,6 +42,12 @@ fn checkPresentedFrame(
     swapchain: *vk.Swapchain,
     scene: *const ui.Scene,
     atlas: ui.AtlasView,
+    t: *const ui.Tree,
+    /// Whether to also write the magnified crop of the editable field. Only
+    /// under `--type`, so that the committed image is of a field something
+    /// actually typed into and a plain `--capture` does not quietly replace it
+    /// with an untouched one.
+    crop: bool,
 ) !void {
     const w = swapchain.extent.width;
     const h = swapchain.extent.height;
@@ -59,12 +71,56 @@ fn checkPresentedFrame(
     }
 
     var threaded: std.Io.Threaded = .init_single_threaded;
+    const io = threaded.io();
     var fb: ui.Framebuffer = .{ .gpa = gpa, .w = w, .h = h, .px = rgba };
-    try fb.writePng(threaded.io(), "docs/demo-window.png");
+    try fb.writePng(io, "docs/demo-window.png");
+
+    // And a magnified crop of the editable field, out of the same frame the
+    // compositor was handed. The caret is one pixel wide; in a 900x560
+    // screenshot it is a claim nobody can check.
+    if (crop) if (demo.editable) |ed| {
+        const b = t.bounds(ed.field);
+        try demo.writeCrop(gpa, io, &fb, .{
+            .x = b.x,
+            .y = b.y - 30,
+            .w = @min(b.w, 420),
+            .h = b.h + 30,
+        }, 3, "docs/demo-typing.png");
+        std.debug.print("wrote docs/demo-typing.png\n", .{});
+    };
     std.debug.print(
         "presented frame vs software reference: largest channel difference {d}\nwrote docs/demo-window.png\n\n",
         .{worst},
     );
+}
+
+/// A scripted sequence of keystrokes, for `--type`.
+///
+/// It exists for the same reason `--sweep` does: the per-keystroke cost is the
+/// claim this field is making, and a human typing is not a measurement. What
+/// it covers is chosen rather than arbitrary -- multi-byte insertion, deletion
+/// of a character whose bytes are not one, word movement across a Vietnamese
+/// syllable, and typing over a selection -- so a pass means those four things
+/// work and not just that the queue drains.
+fn typeScript(gpa: std.mem.Allocator) ![]ui.KeyEvent {
+    var list: std.ArrayList(ui.KeyEvent) = .empty;
+    const ctrl: ui.Mods = .{ .ctrl = true };
+    const shift: ui.Mods = .{ .shift = true };
+
+    // Typed one character at a time, as a keyboard delivers it.
+    var it = (std.unicode.Utf8View.init(" — thử xoá và chọn") catch unreachable).iterator();
+    while (it.nextCodepointSlice()) |ch| try list.append(gpa, ui.KeyEvent.typed(ch));
+
+    // Four characters back off the end; the last of them is multi-byte.
+    for (0..4) |_| try list.append(gpa, ui.KeyEvent.named(.backspace));
+    // To the start, one word in, then select to the end and type over it.
+    try list.append(gpa, ui.KeyEvent.named(.home));
+    try list.append(gpa, ui.KeyEvent.named(.right).withMods(ctrl));
+    try list.append(gpa, ui.KeyEvent.named(.right).withMods(ctrl));
+    try list.append(gpa, ui.KeyEvent.named(.end).withMods(shift));
+    try list.append(gpa, ui.KeyEvent.typed("X"));
+    try list.append(gpa, ui.KeyEvent.named(.backspace).withMods(ctrl));
+    return list.toOwnedSlice(gpa);
 }
 
 fn nowNs() u64 {
@@ -87,11 +143,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // measurement.
     var capture = false;
     var sweep: u64 = 0;
+    var type_test = false;
     var args = std.process.Args.Iterator.init(init.args);
     _ = args.next();
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--capture")) capture = true;
         if (std.mem.eql(u8, a, "--sweep")) sweep = 180;
+        // Feeds `typeScript` into the key queue, a keystroke every few frames,
+        // and reports what each one cost.
+        if (std.mem.eql(u8, a, "--type")) type_test = true;
     }
 
     var win = try wl.Window.open(gpa, "zig-uikit", 900, 560);
@@ -123,6 +183,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .h = @floatFromInt(swapchain.extent.height),
     });
 
+    // The text the editable field holds. `demo.buildUi` put the same string
+    // into the element, which is the one piece of duplication in this
+    // arrangement: the document is the truth and the element is a view of it,
+    // but the view has to exist before there is anything to drive it.
+    var doc = ui.Document.init(gpa);
+    defer doc.deinit();
+    _ = try doc.insert(.application, demo.editable_initial);
+
+    // The GPU's copy of the atlas is current as of here. Typing a character
+    // the font has not rasterised yet changes the atlas, and this is how that
+    // is noticed without re-uploading a texture every frame.
+    var atlas_gen = fonts.atlas.generation;
+
     var scene = ui.Scene.init(gpa);
     defer scene.deinit();
 
@@ -130,7 +203,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         \\{s}
         \\{d}x{d}, {s}{s}
         \\
-        \\move the pointer over the list; close the window to see the counters.
+        \\keyboard: {s}{s}
+        \\
+        \\move the pointer over the list, type into the third field, Escape to
+        \\close; the counters are printed on the way out.
         \\
         \\
     , .{
@@ -139,6 +215,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         swapchain.extent.height,
         if (swapchain.bgra) "B8G8R8A8_UNORM" else "R8G8B8A8_UNORM",
         if (swapchain.bgra) " (BGRA in memory; only the capture reorders)" else "",
+        if (win.keyboard == null) "none on this seat" else win.layoutName(),
+        if (win.keyboard == null) "" else " layout, repeating after the compositor's delay",
     });
 
     var hovered: ui.Index = 0;
@@ -152,6 +230,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var cpu_worst_ns: u64 = 0;
     var idle_frames: u64 = 0;
     var idle_cpu_ns: u64 = 0;
+    var keystrokes: u64 = 0;
+    var unhandled: u64 = 0;
+    var edit_ns_total: u64 = 0;
+    var edits: u64 = 0;
+    var edit_worst_ns: u64 = 0;
+    var atlas_uploads: u64 = 0;
+    var upload_ns_total: u64 = 0;
+    var hot_ns_total: u64 = 0;
+    var hot_shapes: u64 = 0;
+    var caret_visible = false;
+
+    const script: []ui.KeyEvent = if (type_test) try typeScript(gpa) else &.{};
+    defer if (type_test) gpa.free(script);
+    var script_at: usize = 0;
 
     while (!win.closed) {
         win.pump();
@@ -175,6 +267,106 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
 
         const t0 = nowNs();
+
+        // --- the keyboard: an edit, a reshape, and a caret that moves ---
+        //
+        // Drained in a loop rather than one per frame. A frame at 60 Hz is
+        // 16 ms, and a fast typist with key repeat on can put several
+        // keystrokes in one; taking one and leaving the rest would make the
+        // field lag behind the keyboard by a frame per character.
+        if (type_test and script_at < script.len and frames % 4 == 0) {
+            win.keys.push(script[script_at]);
+            script_at += 1;
+        }
+        var text_dirty = false;
+        while (win.keys.pop()) |ev| {
+            if (ev.key == .escape) {
+                win.closed = true;
+                break;
+            }
+            const r = ui.editing.apply(&doc, ev, .{}) catch |e| switch (e) {
+                // No input method is attached to this document yet, so there
+                // is nothing to hold a lock or to be composing. Reported
+                // rather than ignored, because if it ever happens it means the
+                // text-input path landed and this loop needs to decide what to
+                // do about it.
+                error.Locked => {
+                    std.debug.print("edit refused: the document is locked\n", .{});
+                    continue;
+                },
+                else => return e,
+            };
+            if (r.handled) keystrokes += 1 else unhandled += 1;
+            if (r.edited or r.moved) text_dirty = true;
+        }
+        if (text_dirty) {
+            const e0 = nowNs();
+            demo.refreshEditable(&t, &fonts, &doc) catch |e| switch (e) {
+                // 512x512 holds thousands of glyphs at this size, so this
+                // needs a lot of distinct characters to reach. It is caught
+                // rather than propagated because losing the window over it
+                // would be a worse answer than a field that stops updating,
+                // and because growing the atlas is a decision for whatever
+                // owns the tree -- every cached texel coordinate moves.
+                error.AtlasFull => std.debug.print("atlas full at {d:.0}% -- text stopped updating\n", .{fonts.atlas.fillRatio() * 100}),
+                else => return e,
+            };
+            const spent = nowNs() - e0;
+            // Shaped once more, and timed, only under `--type`.
+            //
+            // This is here because the first measurement of this field was
+            // misleading in a way worth keeping a number against. A keystroke
+            // reshapes a fifty-byte line in 12-60 us, and the benchmark says
+            // the same shaping costs 2 us. Both are true: the benchmark runs
+            // in a tight loop with the font tables, the glyph cache and the
+            // scratch buffer all in L1, and a keystroke arrives tens of
+            // milliseconds after the last one with all of that evicted. The
+            // second shape below is the hot number, measured in the same
+            // process on the same line a microsecond after the cold one, so
+            // the report carries its own explanation instead of a figure that
+            // disagrees with the benchmark for no stated reason.
+            if (type_test) {
+                const h0 = nowNs();
+                _ = try fonts.ui.shape(&fonts.atlas, doc.text());
+                hot_ns_total += nowNs() - h0;
+                hot_shapes += 1;
+            }
+            edit_ns_total += spent;
+            edit_worst_ns = @max(edit_worst_ns, spent);
+            edits += 1;
+
+            // Timed separately, because it is a different cost with a
+            // different fix, and folding the two into one number would have
+            // hidden which of them to work on.
+            //
+            // It costs 1.7-2.1 ms, and measuring where that goes changed the
+            // answer: staging the whole 256 KB image is 11-80 us, and the rest
+            // is `vkQueueSubmit` plus a fence wait, serialised behind a
+            // swapchain presenting at 60 Hz. So uploading only the new glyph's
+            // rectangle -- the obvious fix -- would save nothing. What this
+            // wants is the transfer recorded into the frame's own command
+            // buffer instead of a synchronous round trip through the queue,
+            // which is a swapchain change and not a text one.
+            if (fonts.atlas.generation != atlas_gen) {
+                const up0 = nowNs();
+                try renderer.setAtlas(fonts.atlas.view());
+                atlas_gen = fonts.atlas.generation;
+                atlas_uploads += 1;
+                upload_ns_total += nowNs() - up0;
+            }
+        }
+        // A window without keyboard focus draws no caret. A paint change, so
+        // it costs no layout -- which is the whole point of `Paint` being
+        // separate from `Style`, demonstrated on the smallest possible case.
+        if (demo.editable) |ed| {
+            const want_caret = win.focused;
+            if (want_caret != caret_visible) {
+                caret_visible = want_caret;
+                t.setPaint(ed.caret.box, .{
+                    .background = if (want_caret) demo.caret_color else ui.Color.rgba(0, 0, 0, 0),
+                });
+            }
+        }
 
         // --- hover: a paint change and nothing else ---
         var px = win.pointer_x;
@@ -242,11 +434,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
 
         if (capture and frames == 9) {
-            try checkPresentedFrame(gpa, &swapchain, &scene, fonts.atlas.view());
+            try checkPresentedFrame(gpa, &swapchain, &scene, fonts.atlas.view(), &t, type_test);
             capture = false;
             if (sweep == 0) break;
         }
         if (sweep > 0 and frames >= sweep) break;
+        // Long enough after the last scripted keystroke for the frame it
+        // produced to have been presented.
+        if (type_test and script_at >= script.len and win.keys.len() == 0 and frames >= script.len * 4 + 20) break;
     }
 
     if (frames == 0) return;
@@ -258,6 +453,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
         \\  mean CPU per frame                {d} ns
         \\  worst CPU in one frame            {d} ns
         \\  mean CPU on the {d} frames that changed nothing   {d} ns
+        \\
+        \\{d} keystrokes handled, {d} left for the application
+        \\  keys dropped because the queue filled   {d}
+        \\  {d} edits: mean {d} ns each, worst {d} ns
+        \\  the same line shaped again, hot         {d} ns ({d} samples)
+        \\  atlas re-uploads                        {d}, mean {d} ns each
         \\
         \\The CPU figure is everything between the pointer moving and the quads
         \\being ready to upload: hit test, layout flush, scene build. Timing the
@@ -276,5 +477,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
         cpu_worst_ns,
         idle_frames,
         if (idle_frames == 0) 0 else idle_cpu_ns / idle_frames,
+        keystrokes,
+        unhandled,
+        win.keys.dropped,
+        edits,
+        if (edits == 0) 0 else edit_ns_total / edits,
+        edit_worst_ns,
+        if (hot_shapes == 0) 0 else hot_ns_total / hot_shapes,
+        hot_shapes,
+        atlas_uploads,
+        if (atlas_uploads == 0) 0 else upload_ns_total / atlas_uploads,
     });
 }

@@ -241,7 +241,7 @@ pub const Document = struct {
         if (sel.start == 0) return emptyEdit(self, 0);
         // A whole character, not a byte. Deleting one byte of `ế` leaves the
         // buffer holding something that is not UTF-8 at all.
-        const before = prevCharBoundary(self.buf.items, sel.start);
+        const before = offsets.prevChar(self.buf.items, sel.start);
         return self.replaceRange(origin, .{ .start = before, .end = sel.start }, "");
     }
 
@@ -262,7 +262,7 @@ pub const Document = struct {
         const s = self.buf.items;
         const start = offsets.alignToChar(s, sel.start -| before);
         const end_raw = @min(sel.end + after, s.len);
-        const end = alignForward(s, end_raw);
+        const end = offsets.alignForward(s, end_raw);
         return self.replaceRange(origin, .{ .start = start, .end = end }, "");
     }
 
@@ -395,18 +395,6 @@ fn shiftOffset(off: usize, replaced: Range, new_end: usize) usize {
     if (off <= replaced.start) return off;
     if (off >= replaced.end) return off + new_end - replaced.end;
     return new_end;
-}
-
-fn prevCharBoundary(s: []const u8, at: usize) usize {
-    if (at == 0) return 0;
-    return offsets.alignToChar(s, at - 1);
-}
-
-fn alignForward(s: []const u8, at: usize) usize {
-    const back = offsets.alignToChar(s, at);
-    if (back == at or back == s.len) return back;
-    const seq = std.unicode.utf8ByteSequenceLength(s[back]) catch 1;
-    return @min(back + seq, s.len);
 }
 
 // ---------------------------------------------------------------------- tests
