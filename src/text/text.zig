@@ -511,8 +511,12 @@ test "Vietnamese is shaped, not mapped codepoint by codepoint" {
     defer atlas.deinit();
 
     // Decomposed: `e` + combining circumflex + combining acute. Three
-    // codepoints, and what a font should draw is one `ế`.
-    const decomposed = "ti\u{0065}\u{0302}\u{0301}ng vi\u{0065}\u{0323}t";
+    // codepoints, and what a font should draw is one `ế`. `ệ` is `e` + dot
+    // below + circumflex, in canonical order (the dot below has the lower
+    // combining class). It used to be spelled `e` + dot below alone, which is
+    // `ẹ` -- a different letter that happens to be as wide as `ệ` in every
+    // font this ran on, so the width assertion below still passed.
+    const decomposed = "ti\u{0065}\u{0302}\u{0301}ng vi\u{0065}\u{0323}\u{0302}t";
     const precomposed = "tiếng việt";
 
     const a = try font.shape(&atlas, precomposed);
@@ -532,15 +536,20 @@ test "Vietnamese is shaped, not mapped codepoint by codepoint" {
     // tone mark is a separate positioned glyph is a property of the font.
     try testing.expect(b.glyphs.len >= 9);
 
-    // The stacked marks put ink above the `i`'s dot: some glyph in `tiếng`
-    // must start higher than the plain `t` does.
-    const plain = try font.shape(&atlas, "ting");
-    var min_dy_plain: f32 = 1e9;
-    for (plain.glyphs) |g| min_dy_plain = @min(min_dy_plain, g.dy);
-    const marked = try font.shape(&atlas, "tiếng");
+    // The stacked marks put ink above the bare letter: `ế` must start higher
+    // than `e` does. This used to compare `tiếng` against `ting`, which asks
+    // whether the marks rise above the `i`'s dot -- a property of the font,
+    // not of shaping. Verdana, which fontconfig matches for "sans" on a Mac,
+    // sets `ế` at 15 px with its top exactly level with the dot.
+    // Read before shaping again: a run borrows the font's scratch buffer.
+    const plain = try font.shape(&atlas, "e");
+    try testing.expectEqual(@as(usize, 1), plain.glyphs.len);
+    const dy_plain = plain.glyphs[0].dy;
+    const marked = try font.shape(&atlas, "ế");
+    try testing.expect(marked.glyphs.len >= 1);
     var min_dy_marked: f32 = 1e9;
     for (marked.glyphs) |g| min_dy_marked = @min(min_dy_marked, g.dy);
-    try testing.expect(min_dy_marked < min_dy_plain);
+    try testing.expect(min_dy_marked < dy_plain);
 }
 
 test "a run installs on a tree and sizes the element" {

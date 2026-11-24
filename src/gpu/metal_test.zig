@@ -213,3 +213,97 @@ test "instance buffers are reused round the ring without mixing frames" {
         try testing.expect(try worstAgainstReference(target.pixels(), &scene, w, h, 1, clear) <= 2);
     }
 }
+
+test "an opaque glyph is bit-exact, not merely close" {
+    // The Vulkan test of the same name, against Metal: a glyph's coverage is a
+    // byte read from the atlas, so where it is 255 and the colour is opaque
+    // both sides write the source colour and nothing else, and any difference
+    // means they read different texels. The atlas is a diagonal so that
+    // transposed, off-by-one or ignored texel coordinates cannot pass.
+    var gpu = try openGpu();
+    defer gpu.deinit();
+
+    var pixels: [16]u8 = @splat(0);
+    for (0..4) |i| pixels[i * 4 + i] = 255;
+    const atlas: ui.AtlasView = .{ .pixels = &pixels, .w = 4, .h = 4 };
+
+    const w = 12;
+    const h = 12;
+    const clear = ui.Color.hex(0x101010);
+    const fg = ui.Color.hex(0xE0C040);
+
+    var scene = ui.Scene.init(testing.allocator);
+    defer scene.deinit();
+    try scene.quads.append(testing.allocator, .{
+        .x = 3,
+        .y = 2,
+        .w = 4,
+        .h = 4,
+        .background = fg.pack(),
+        .border_color = 0,
+        .border_width = 0,
+        .corner_radius = 0,
+        .cx = 0,
+        .cy = 0,
+        .cw = w,
+        .ch = h,
+        .u0 = 0,
+        .v0 = 0,
+        .u1 = 4,
+        .v1 = 4,
+        .flags = .{ .textured = true },
+    });
+
+    var fb = try ui.Framebuffer.init(testing.allocator, w, h);
+    defer fb.deinit();
+    fb.clear(clear);
+    ui.raster.drawScene(&fb, &scene, atlas);
+
+    var target = try mtl.Target.init(&gpu, w, h);
+    defer target.deinit();
+    var renderer = try mtl.Renderer.initDefault(&gpu);
+    defer renderer.deinit();
+    try renderer.setAtlas(atlas);
+    try renderer.render(&target, &scene, clear);
+
+    const got = target.pixels();
+    for (0..@as(usize, w) * h) |i| {
+        for (0..3) |ch| {
+            if (got[i * 4 + ch] != fb.px[i * 4 + ch]) {
+                std.debug.print(
+                    "  glyph pixel ({d},{d}) channel {d}: gpu {d}, reference {d}\n",
+                    .{ i % w, i / w, ch, got[i * 4 + ch], fb.px[i * 4 + ch] },
+                );
+                return error.GlyphDivergedFromReference;
+            }
+        }
+    }
+    for (0..4) |i| {
+        const on = (2 + i) * w + (3 + i);
+        try testing.expectEqual(fg.r, got[on * 4 + 0]);
+        if (i + 1 < 4) {
+            const off = (2 + i) * w + (3 + i + 1);
+            try testing.expectEqual(clear.r, got[off * 4 + 0]);
+        }
+    }
+}
+
+test "the atlas can be replaced at a different size" {
+    var gpu = try openGpu();
+    defer gpu.deinit();
+    var renderer = try mtl.Renderer.initDefault(&gpu);
+    defer renderer.deinit();
+
+    var big: [64 * 32]u8 = @splat(200);
+    try renderer.setAtlas(.{ .pixels = &big, .w = 64, .h = 32 });
+    try testing.expectEqual(@as(u32, 64), renderer.atlas_w);
+
+    var small: [8 * 8]u8 = @splat(7);
+    try renderer.setAtlas(.{ .pixels = &small, .w = 8, .h = 8 });
+    try testing.expectEqual(@as(u32, 8), renderer.atlas_w);
+
+    // The same size again reuses the texture and only re-uploads.
+    const before = renderer.atlas;
+    try renderer.setAtlas(.{ .pixels = &small, .w = 8, .h = 8 });
+    try testing.expectEqual(before, renderer.atlas);
+}

@@ -44,7 +44,11 @@ struct QuadIn {
     uint2  color  [[attribute(1)]]; // offset 16: background, border_color
     float2 params [[attribute(2)]]; // offset 24: border_width, corner_radius
     float4 clip   [[attribute(3)]]; // offset 32: cx, cy, cw, ch
+    ushort4 uv    [[attribute(4)]]; // offset 48: u0, v0, u1, v1
+    uint flags    [[attribute(5)]]; // offset 56
 };
+
+constant uint FLAG_TEXTURED = 1u;
 
 struct Varyings {
     float4 position [[position]];
@@ -52,6 +56,8 @@ struct Varyings {
     uint2  color  [[flat]];
     float2 params [[flat]];
     float4 clip   [[flat]];
+    int4   uv     [[flat]];
+    uint   flags  [[flat]];
 };
 
 vertex Varyings quad_vertex(QuadIn q [[stage_in]],
@@ -75,6 +81,8 @@ vertex Varyings quad_vertex(QuadIn q [[stage_in]],
     out.color = q.color;
     out.params = q.params * u.scale;
     out.clip = q.clip * u.scale;
+    out.uv = int4(q.uv);
+    out.flags = q.flags;
     return out;
 }
 
@@ -99,11 +107,30 @@ static float4 unpack(uint v) {
         float((v >> 24) & 0xffu)) / 255.0;
 }
 
-fragment float4 quad_fragment(Varyings in [[stage_in]]) {
+fragment float4 quad_fragment(Varyings in [[stage_in]],
+                              texture2d<float, access::read> atlas [[texture(0)]]) {
     float2 p = in.position.xy;
 
     float in_clip = boxCoverage(p, in.clip);
     if (in_clip <= 0.0) discard_fragment();
+
+    if ((in.flags & FLAG_TEXTURED) != 0u) {
+        // One destination pixel, one atlas texel, no filtering: `read` is
+        // Metal's texelFetch. The scene builder snapped the quad to the pixel
+        // grid, so the offset from its origin is the offset into its atlas
+        // rectangle -- the arithmetic `drawGlyph` in `src/raster.zig` does,
+        // which is why the two agree exactly on text.
+        //
+        // At a scale other than one this is wrong, and `Quad.scaled` asserts
+        // so: a glyph rasterised for one pixel per unit cannot cover two.
+        int2 t = int2(floor(p - in.rect.xy));
+        if (t.x < 0 || t.y < 0 || t.x >= in.uv.z - in.uv.x || t.y >= in.uv.w - in.uv.y) discard_fragment();
+        float cov = atlas.read(uint2(int2(in.uv.x, in.uv.y) + t)).r;
+        if (cov <= 0.0) discard_fragment();
+        float4 fg = unpack(in.color.x);
+        float a = fg.a * cov * in_clip;
+        return float4(fg.rgb * a, a);
+    }
 
     float sd = sdRoundedBox(p, in.rect, in.params.y);
     float outer = clamp(0.5 - sd, 0.0, 1.0);

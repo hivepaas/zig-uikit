@@ -4,7 +4,7 @@ A declarative GPU UI toolkit for Zig.
 
 > **Status: pre-alpha.** The layout core, the scene layer, a Vulkan renderer
 > with a Wayland window, a Metal renderer with a macOS window, and a shaped-text
-> stack exist and are tested. Text is drawn by the Vulkan backend only so far.
+> stack exist and are tested. Both backends draw text.
 > There are no widgets. Expect the API to change without notice.
 
 ```sh
@@ -12,7 +12,7 @@ zig build test                           # 79 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
 zig build test-text                      # 14 tests, needs a font installed
-zig build test-gpu                       # Vulkan: 7 tests; Metal: 8 tests
+zig build test-gpu                       # Vulkan: 7 tests; Metal: 10 tests
 zig build gpu-demo                       # renders on the GPU, diffs against the reference
 zig build window                         # opens a window and renders into it
 ```
@@ -20,8 +20,8 @@ zig build window                         # opens a window and renders into it
 The last two follow the target: Vulkan and Wayland on Linux, Metal and AppKit
 on macOS. `zig build test` needs nothing. Everything else links fontconfig,
 FreeType and HarfBuzz, because the demos share one source file and that file
-can set text — on macOS that means Homebrew, even for the demo that currently
-draws none.
+can set text — on macOS that means Homebrew:
+`brew install harfbuzz freetype fontconfig pkgconf`.
 
 ![a window's worth of interface, rendered by the software rasteriser](docs/demo.png)
 
@@ -145,7 +145,7 @@ discovered later.
 
 ## Text
 
-`zig build test-text` — 12 tests, and they need a font installed, which is why
+`zig build test-text` — 14 tests, and they need a font installed, which is why
 they are not in `zig build test`.
 
 **HarfBuzz is in the first slice of text, not a later one.** The tempting
@@ -160,6 +160,14 @@ with a missing feature; it is one built on a model that has to be thrown away.
 A test asserts the consequence directly: `tiếng việt` written with precomposed
 characters and written with combining marks must shape to the same width and
 the same glyph count. A per-codepoint renderer fails that.
+
+Running it on a Mac, where fontconfig matches Verdana rather than DejaVu, found
+two faults in the test itself. The combining spelling of `việt` was `e` + dot
+below, which is `ẹ` — a different letter that happens to be as wide as `ệ` — so
+the test compared two different words and passed. And it checked that the
+marks on `ế` rise above the dot of the `i` in `ting`, which is a property of
+the font: Verdana at 15 px sets them exactly level. It now checks that `ế`
+starts higher than a bare `e`, which holds for any font with marks at all.
 
 ### The core does not link a font engine
 
@@ -381,21 +389,35 @@ first picture of it. The image is a 3× nearest-neighbour crop written by
 `zig build demo` from the same framebuffer as the screenshot above, because a
 one-pixel underline in a 900×560 image is a claim nobody can check.
 
-### Text is Vulkan-only so far
+### Text on Metal
 
-The Metal backend has no glyph atlas yet, and until it does the macOS demo is
-built with **no text in it** — `demo.buildUi` takes an optional font set and
-draws the grey bars a design tool uses where text will go. That is deliberate
-rather than lazy: a textured quad reaching a shader with no atlas branch would
-be drawn by the rounded-rectangle branch instead, so every letter would come
-out as a small rounded box. A picture of a bug is worse than a picture of
-missing text.
+The Metal backend has the glyph atlas now: an `R8Unorm` texture, `setAtlas`,
+and the textured branch transcribed into `quad.metal` against
+`texture2d<float>::read`, Metal's `texelFetch`. `gpu-demo` therefore draws the
+same interface on both backends, and on an Apple M1 Pro:
 
-What the Metal side needs is a texture binding, a `setAtlas`, and the textured
-branch in `quad.metal` transcribed from the GLSL — the same ten lines, against
-`texture2d<float>::read` instead of `texelFetch`. It is not written here
-because none of it could be compiled or run on this machine, and three
-untested transcriptions of one formula is one too many.
+```
+631 quads, 37860 bytes uploaded with no repacking
+589 of those quads are glyphs, from a 512x512 atlas
+
+GPU vs software reference, 504000 pixels:
+  largest channel difference   1
+of which 37803 pixels are covered by a glyph:
+  largest channel difference   1
+  glyph pixels differing by > 1 0
+```
+
+`test-gpu` carries the same bit-exactness test as Vulkan's — a diagonal atlas,
+so transposed or off-by-one texel addressing cannot pass — and it passes.
+
+The macOS *window* still draws the grey bars, for the reason below: it is a
+Retina window, and a glyph cannot be scaled.
+
+Getting the text stack to build on a Mac at all found a fault in `build.zig`.
+It asks `pkg-config` where FreeType and HarfBuzz keep their headers, but
+`runAllowFail` does not search `PATH` for the program it runs, so the question
+had never once been asked: the Linux fallback paths answered it everywhere,
+correctly on Debian by coincidence. The program is now resolved first.
 
 One thing the Retina path already settles, though. `Quad.scaled` now asserts
 that the quad is not textured, because **a glyph cannot be scaled**: its atlas
@@ -652,6 +674,9 @@ yet.
 
 ### Not done on macOS
 
+- Text in the window. The renderer draws glyphs exactly; what is missing is
+  shaping at the device pixel size, so that a Retina window gets glyphs
+  rasterised for two pixels per point rather than none.
 - Live resize. While the user drags a window edge AppKit runs its own event
   loop inside `sendEvent:`, and this loop does not draw until it returns.
   Untested; rendering from the resize callback or a display link is the fix.

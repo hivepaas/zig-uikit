@@ -326,8 +326,14 @@ fn addMacos(
 /// failing the whole build over a missing helper would be worse than a clear
 /// compile error about a missing header.
 fn pkgIncludes(b: *std.Build, libs: []const []const u8) []const []const u8 {
+    // Resolved to an absolute path first. `runAllowFail` does not search PATH
+    // for argv[0] (`expand_arg0` defaults to `.no_expand`), so a bare
+    // "pkg-config" always failed to spawn and the Linux fallback below was
+    // what ran everywhere -- correct on Debian by coincidence, and the reason
+    // Homebrew's headers were never found on a Mac.
+    const pkg_config = b.findProgram(.{ .names = &.{ "pkg-config", "pkgconf" } }) orelse "pkg-config";
     var argv: std.ArrayList([]const u8) = .empty;
-    argv.appendSlice(b.allocator, &.{ "pkg-config", "--cflags-only-I" }) catch @panic("OOM");
+    argv.appendSlice(b.allocator, &.{ pkg_config, "--cflags-only-I" }) catch @panic("OOM");
     argv.appendSlice(b.allocator, libs) catch @panic("OOM");
 
     var out: std.ArrayList([]const u8) = .empty;

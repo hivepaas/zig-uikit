@@ -14,7 +14,7 @@
 //! `docs/native-vs-drawn.md` composes native views beside -- so the layer has to
 //! be understood directly either way.
 //!
-//! What carries over from Vulkan exactly: the scene's 48-byte `Quad` is the
+//! What carries over from Vulkan exactly: the scene's 60-byte `Quad` is the
 //! per-instance vertex layout, with attribute offsets taken from `@offsetOf`;
 //! one draw call; premultiplied-alpha blending; an eight-bit UNORM target and
 //! no sRGB conversion, for the reason given on `Target`.
@@ -50,6 +50,9 @@ const MTLPixelFormatBGRA8Unorm: objc.NSUInteger = 80;
 const MTLVertexFormatFloat2: objc.NSUInteger = 29;
 const MTLVertexFormatFloat4: objc.NSUInteger = 31;
 const MTLVertexFormatUInt2: objc.NSUInteger = 37;
+const MTLVertexFormatUShort4: objc.NSUInteger = 15;
+const MTLVertexFormatUInt: objc.NSUInteger = 36;
+const MTLPixelFormatR8Unorm: objc.NSUInteger = 10;
 const MTLVertexStepFunctionPerInstance: objc.NSUInteger = 2;
 const MTLBlendFactorOne: objc.NSUInteger = 1;
 const MTLBlendFactorOneMinusSourceAlpha: objc.NSUInteger = 5;
@@ -66,6 +69,7 @@ const MTLMathModeSafe: objc.NSInteger = 0;
 const MTLClearColor = extern struct { red: f64, green: f64, blue: f64, alpha: f64 };
 const MTLOrigin = extern struct { x: usize, y: usize, z: usize };
 const MTLSize = extern struct { width: usize, height: usize, depth: usize };
+const MTLRegion = extern struct { origin: MTLOrigin, size: MTLSize };
 
 extern "Metal" fn MTLCreateSystemDefaultDevice() ?id;
 
@@ -215,6 +219,13 @@ pub const Renderer = struct {
     slots: [frames_in_flight]Slot = @splat(.{}),
     next_slot: usize = 0,
 
+    /// The glyph atlas: one byte of coverage per texel. Starts as a single
+    /// texel so the fragment shader always has a texture bound, as the Vulkan
+    /// backend starts with one so its descriptor is always valid.
+    atlas: ?id = null,
+    atlas_w: u32 = 0,
+    atlas_h: u32 = 0,
+
     /// How long `newLibraryWithSource:` took. The price of not needing a
     /// Metal compiler at build time, paid once per process.
     compile_ns: u64 = 0,
@@ -267,6 +278,8 @@ pub const Renderer = struct {
         // The offscreen pipeline is built now so that a broken pipeline fails
         // at init, where the Vulkan backend fails, rather than at first draw.
         _ = try self.pipelineFor(MTLPixelFormatRGBA8Unorm);
+        const empty = [_]u8{0};
+        try self.setAtlas(.{ .pixels = &empty, .w = 1, .h = 1 });
         return self;
     }
 
@@ -279,10 +292,58 @@ pub const Renderer = struct {
             if (s.buffer) |b| objc.release(b);
             s.* = .{};
         }
-        inline for (.{ "pipeline_bgra", "pipeline_rgba", "fragment_fn", "vertex_fn", "library" }) |f| {
+        inline for (.{ "atlas", "pipeline_bgra", "pipeline_rgba", "fragment_fn", "vertex_fn", "library" }) |f| {
             if (@field(self, f)) |o| objc.release(o);
             @field(self, f) = null;
         }
+    }
+
+    /// Uploads the glyph atlas, replacing the previous one.
+    ///
+    /// The whole atlas every time, as on Vulkan: this happens when glyphs are
+    /// added, not per frame. A texture of a new size is a new texture; the
+    /// same size is overwritten in place, after waiting for every frame still
+    /// in flight, because `replaceRegion:` is a CPU write into memory a queued
+    /// frame may yet sample.
+    ///
+    /// The texture uses the default storage mode, which is shared on Apple
+    /// silicon and managed on Intel; `replaceRegion:` is correct for both.
+    pub fn setAtlas(self: *Renderer, atlas: ui.AtlasView) Error!void {
+        if (atlas.w == 0 or atlas.h == 0) return Error.SurfaceHasNoArea;
+        if (atlas.pixels.len < @as(usize, atlas.w) * atlas.h) return Error.SurfaceHasNoArea;
+
+        for (&self.slots) |*s| {
+            if (s.in_flight) |cb| {
+                send(void, cb, "waitUntilCompleted", .{});
+                objc.release(cb);
+                s.in_flight = null;
+            }
+        }
+
+        if (self.atlas == null or atlas.w != self.atlas_w or atlas.h != self.atlas_h) {
+            const pool = objc.AutoreleasePool.push();
+            defer pool.pop();
+            const desc = send(id, try objc.class("MTLTextureDescriptor"), "texture2DDescriptorWithPixelFormat:width:height:mipmapped:", .{
+                MTLPixelFormatR8Unorm, @as(usize, atlas.w), @as(usize, atlas.h), objc.NO,
+            });
+            send(void, desc, "setUsage:", .{MTLTextureUsageShaderRead});
+            const tex = send(?id, self.gpu.device, "newTextureWithDescriptor:", .{desc}) orelse
+                return Error.OutOfDeviceMemory;
+            if (self.atlas) |old| objc.release(old);
+            self.atlas = tex;
+            self.atlas_w = atlas.w;
+            self.atlas_h = atlas.h;
+        }
+
+        send(void, self.atlas.?, "replaceRegion:mipmapLevel:withBytes:bytesPerRow:", .{
+            MTLRegion{
+                .origin = .{ .x = 0, .y = 0, .z = 0 },
+                .size = .{ .width = atlas.w, .height = atlas.h, .depth = 1 },
+            },
+            @as(usize, 0),
+            @as(*const anyopaque, atlas.pixels.ptr),
+            @as(usize, atlas.w),
+        });
     }
 
     fn pipelineFor(self: *Renderer, pixel_format: objc.NSUInteger) Error!id {
@@ -376,6 +437,7 @@ pub const Renderer = struct {
         if (count > 0 and instances != null) {
             send(void, enc, "setRenderPipelineState:", .{try self.pipelineFor(pass.pixel_format)});
             send(void, enc, "setVertexBuffer:offset:atIndex:", .{ instances.?, @as(usize, 0), @as(usize, 0) });
+            send(void, enc, "setFragmentTexture:atIndex:", .{ self.atlas.?, @as(usize, 0) });
             const u: Uniforms = .{
                 .vw = @floatFromInt(pass.w),
                 .vh = @floatFromInt(pass.h),
@@ -420,11 +482,13 @@ pub const Renderer = struct {
 /// colour as a width.
 fn vertexDescriptor() Error!id {
     comptime {
-        std.debug.assert(@sizeOf(Quad) == 48);
+        std.debug.assert(@sizeOf(Quad) == 60);
         std.debug.assert(@offsetOf(Quad, "w") == @offsetOf(Quad, "x") + 8);
         std.debug.assert(@offsetOf(Quad, "border_color") == @offsetOf(Quad, "background") + 4);
         std.debug.assert(@offsetOf(Quad, "corner_radius") == @offsetOf(Quad, "border_width") + 4);
         std.debug.assert(@offsetOf(Quad, "ch") == @offsetOf(Quad, "cx") + 12);
+        std.debug.assert(@offsetOf(Quad, "v1") == @offsetOf(Quad, "u0") + 6);
+        std.debug.assert(@bitSizeOf(Quad.Flags) == 32);
     }
     const vd = send(id, try objc.class("MTLVertexDescriptor"), "vertexDescriptor", .{});
     const attrs = send(id, vd, "attributes", .{});
@@ -433,6 +497,9 @@ fn vertexDescriptor() Error!id {
         .{ .fmt = MTLVertexFormatUInt2, .off = @offsetOf(Quad, "background") },
         .{ .fmt = MTLVertexFormatFloat2, .off = @offsetOf(Quad, "border_width") },
         .{ .fmt = MTLVertexFormatFloat4, .off = @offsetOf(Quad, "cx") },
+        // The four atlas texels as one 16-bit vector, and the flags word.
+        .{ .fmt = MTLVertexFormatUShort4, .off = @offsetOf(Quad, "u0") },
+        .{ .fmt = MTLVertexFormatUInt, .off = @offsetOf(Quad, "flags") },
     };
     for (fields, 0..) |f, i| {
         const a = send(id, attrs, "objectAtIndexedSubscript:", .{i});
