@@ -55,6 +55,8 @@ extern "objc" fn sel_registerName(name: [*:0]const u8) SEL;
 extern "objc" fn sel_getName(s: SEL) [*:0]const u8;
 extern "objc" fn objc_msgSend() void;
 extern "objc" fn objc_msgSend_stret() void;
+extern "objc" fn objc_msgSendSuper() void;
+extern "objc" fn class_getSuperclass(cls: Class) ?Class;
 extern "objc" fn objc_allocateClassPair(superclass: Class, name: [*:0]const u8, extra: usize) ?Class;
 extern "objc" fn objc_registerClassPair(cls: Class) void;
 extern "objc" fn class_addMethod(cls: Class, name: SEL, imp: *const anyopaque, types: [*:0]const u8) BOOL;
@@ -131,6 +133,15 @@ pub fn send(comptime Ret: type, target: anytype, comptime selector: [:0]const u8
         &objc_msgSend;
     const f: *const F = @ptrCast(tramp);
     return @call(.auto, f, .{ target, sel(selector) } ++ args);
+}
+
+/// `[super selector]` from inside a method of `cls`: the superclass's
+/// implementation, run on `target`. What a `dealloc` override has to end with.
+pub fn sendSuper(comptime Ret: type, target: id, cls: Class, comptime selector: [:0]const u8) Ret {
+    const Super = extern struct { receiver: id, super_class: Class };
+    var sup: Super = .{ .receiver = target, .super_class = class_getSuperclass(cls).? };
+    const f: *const fn (*Super, SEL) callconv(.c) Ret = @ptrCast(&objc_msgSendSuper);
+    return f(&sup, sel(selector));
 }
 
 /// `[[cls alloc] init]`: a +1 reference the caller owns and must `release`.

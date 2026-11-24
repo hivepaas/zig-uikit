@@ -31,6 +31,12 @@
 //!     types `tieengs Vieetj` as key codes, so that the input method -- not
 //!     this program -- decides what they mean, and checks that the document
 //!     ends up holding `tiếng Việt`. It restores the input source it found.
+//!
+//! The interface is also described to accessibility clients, through an
+//! `access.Tree` that `demo.buildUi` fills (see `platform/macos_access.zig`).
+//! `--ax` runs for ten seconds, types `xin chào` into the field three seconds
+//! in, and reports every call a client made into the tree: start it, then
+//! point `ax_probe` -- or VoiceOver -- at it.
 
 const std = @import("std");
 const ui = @import("zig-uikit");
@@ -197,7 +203,7 @@ fn linuxEquivalent(gpa: std.mem.Allocator) !ui.Document {
     return doc;
 }
 
-/// `--telex`: to the end of the field, then ` tieengs Vieetj ` as key codes
+/// `--telex`: to the end of the field, then `tieengs Vieetj ` as key codes
 /// and nothing else. The characters come from the keyboard layout and their
 /// meaning from the input method; see `Window.sendKeyCode`.
 fn telexScript(gpa: std.mem.Allocator) ![]Stroke {
@@ -207,7 +213,12 @@ fn telexScript(gpa: std.mem.Allocator) ![]Stroke {
     // `doCommandBySelector:` is never called -- and the caret is already at
     // the end anyway. The letters are what the input method is for.
     try list.append(gpa, .{ .code = kVK_RightArrow, .chars = right_arrow, .bare = right_arrow, .mods = .{ .command = true, .function = true } });
-    for (" tieengs Vieetj ") |ch| try list.append(gpa, .{
+    // No leading space: the field already ends in one, and two in a row are
+    // not two spaces with this input method. Simple Telex turns them into
+    // ". ", as macOS's double-space shortcut does -- one more replacing
+    // `insertText:`, measured when the field's initial text gained its
+    // trailing space and this script did not lose its leading one.
+    for ("tieengs Vieetj ") |ch| try list.append(gpa, .{
         .code = if (ch == ' ') kVK_Space else letterCode(std.ascii.toLower(ch)),
         .chars = "",
         .bare = "",
@@ -234,6 +245,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var sweep: u64 = 0;
     var type_test = false;
     var telex = false;
+    var ax_test = false;
     var args = std.process.Args.Iterator.init(init.args);
     _ = args.next();
     while (args.next()) |a| {
@@ -241,6 +253,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (std.mem.eql(u8, a, "--sweep")) sweep = 180;
         if (std.mem.eql(u8, a, "--type")) type_test = true;
         if (std.mem.eql(u8, a, "--telex")) telex = true;
+        if (std.mem.eql(u8, a, "--ax")) ax_test = true;
     }
     // The capture of a composition in progress needs the swapchain to be
     // capturable.
@@ -266,6 +279,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     var t = try ui.Tree.init(gpa);
     defer t.deinit();
+    var at = try ui.access.Tree.init(gpa, "zig-uikit");
+    defer at.deinit();
+    demo.access_tree = &at;
     try demo.buildUi(&t, &fonts);
     t.layout(viewport(win));
     // Once, after the tree is built: nothing in the loop adds text, so nothing
@@ -291,6 +307,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     _ = try doc.insert(.application, demo.editable_initial);
     win.setTextTarget(.{ .doc = &doc, .rect = rangeRect, .ctx = &t });
     defer win.setTextTarget(null);
+    at.setDocument(demo.editable_node, &doc);
+    at.setFocus(demo.editable_node);
+    win.setAccessTarget(.{ .tree = &at, .layout = &t });
+    defer win.setAccessTarget(null);
+    // Whether the text changed or only the caret moved, for the notification
+    // a screen reader needs: a value change is read aloud, a caret move is not.
+    var text_hash = std.hash.Wyhash.hash(0, doc.text());
     var atlas_gen = fonts.atlas.generation;
 
     // A scripted run needs a known input source, and must give the user's
@@ -322,13 +345,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // `--telex` captures the frame after this keystroke: `Vieet` typed, which
     // the input method has already rewritten to `Viêt` in the document, before
     // the `j` and the space.
-    const telex_capture_after: usize = 1 + " tieengs Vieet".len;
+    const telex_capture_after: usize = 1 + "tieengs Vieet".len;
     var keystroke_ns_total: u64 = 0;
     var keystroke_ns_worst: u64 = 0;
     var unhandled: u64 = 0;
     var atlas_uploads: u64 = 0;
     var caret_visible = true;
     var capture_pending = false;
+    var ax_typed: usize = 0;
+    var ax_removed = false;
+    const frame_ns = win.refreshInterval() * 1e9;
+    var last_present_ns: u64 = 0;
     std.debug.print(
         \\{s}
         \\{d}x{d} points, {d}x{d} pixels at scale {d}, BGRA8Unorm
@@ -362,7 +389,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const started = nowNs();
 
     while (!win.closed) {
-        win.pump();
+        // Asleep in the run loop until about 2 ms before the next frame is
+        // due, rather than in `nextDrawable`: input and accessibility queries
+        // are then served as they arrive instead of once per vsync. See
+        // `Window.pumpFor`.
+        const since_present = nowNs() - last_present_ns;
+        const wait_ns = @as(i64, @intFromFloat(frame_ns)) - @as(i64, @intCast(since_present)) - 2_000_000;
+        if (wait_ns > 0) win.pumpFor(@as(f64, @floatFromInt(wait_ns)) / 1e9) else win.pump();
         if (win.closed) break;
 
         if (win.resized) {
@@ -382,7 +415,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 fonts_scale = win.scale;
                 t.deinit();
                 t = try ui.Tree.init(gpa);
+                // The accessibility tree goes with it: its nodes name layout
+                // elements that no longer exist. Every object a client held
+                // is retired, and the client is told.
+                win.setAccessTarget(null);
+                at.deinit();
+                at = try ui.access.Tree.init(gpa, "zig-uikit");
                 try demo.buildUi(&t, &fonts);
+                at.setDocument(demo.editable_node, &doc);
+                at.setFocus(demo.editable_node);
+                win.setAccessTarget(.{ .tree = &at, .layout = &t });
                 try demo.refreshEditable(&t, &fonts, &doc, &shown);
                 try renderer.setAtlas(fonts.atlas.view());
                 atlas_gen = fonts.atlas.generation;
@@ -435,6 +477,37 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 atlas_uploads += 1;
             }
             win.textGeometryChanged();
+            const h = std.hash.Wyhash.hash(0, doc.text());
+            win.accessibilityTextChanged(demo.editable_node, h != text_hash);
+            text_hash = h;
+        }
+        while (win.access_presses.pop()) |n| {
+            std.debug.print("pressed through accessibility: \"{s}\"\n", .{if (at.get(n)) |node| node.name else "?"});
+        }
+        // `--ax`: `xin chào` three seconds in, one character every 100 ms,
+        // through the key bindings (no input method), so that a client that
+        // registered for notifications has something to be told about.
+        if (ax_test) {
+            const since = nowNs() - started;
+            const typed = "xin chào";
+            const due: usize = if (since < 3_000_000_000) 0 else @min(typed.len, (since - 3_000_000_000) / 100_000_000 + 1);
+            while (ax_typed < due) {
+                const n = std.unicode.utf8ByteSequenceLength(typed[ax_typed]) catch 1;
+                const ch = typed[ax_typed..][0..n];
+                win.sendKey(0, ch, ch, .{});
+                ax_typed += n;
+            }
+            // Five seconds in, the button's node goes, as it would when a
+            // popover closes: the probe holds an object for it and must be
+            // told, and must get an error rather than a crash when it asks.
+            if (since > 5_000_000_000 and !ax_removed) {
+                for (at.nodes.items) |n| if (n.alive and n.role == .button) {
+                    at.remove(n.id);
+                    break;
+                };
+                ax_removed = true;
+            }
+            if (since > 10_000_000_000) break;
         }
         if (demo.editable) |ed| {
             if (win.focused != caret_visible) {
@@ -487,6 +560,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
 
         const presented = try swapchain.drawAndPresent(&renderer, &scene, bg);
+        last_present_ns = nowNs();
         if (!presented) {
             skipped += 1;
             continue;
@@ -546,10 +620,26 @@ pub fn main(init: std.process.Init.Minimal) !void {
             if (!same) return error.TypeScriptDiverged;
         }
         if (telex) {
-            const want = demo.editable_initial ++ " tiếng Việt ";
+            const want = demo.editable_initial ++ "tiếng Việt ";
             const ok = std.mem.eql(u8, want, doc.text());
             std.debug.print("expected \"{s}\" -- {s}\n", .{ want, if (ok) "composed" else "DIFFERENT" });
             if (!ok) return error.TelexDiverged;
+        }
+    }
+
+    if (ax_test) {
+        const st = &win.access_stats;
+        std.debug.print(
+            \\
+            \\accessibility: {d} nodes, {d} calls into the tree from clients
+            \\  objects made {d}, retired {d}, freed {d}
+            \\  notifications posted {d}, held back before any client asked {d}
+            \\document: "{s}"
+            \\
+        , .{ at.count(), st.total(), st.elements_made, st.elements_retired, mac.ax.elements_freed, st.notifications_posted, st.notifications_gated, doc.text() });
+        for (std.enums.values(mac.ax.Method)) |m| {
+            const c = st.count(m);
+            if (c > 0) std.debug.print("  {s:<26} {d}\n", .{ @tagName(m), c });
         }
     }
 

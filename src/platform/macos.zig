@@ -42,6 +42,7 @@ const ui = @import("zig-uikit");
 const id = objc.id;
 const send = objc.send;
 const ic = ui.input_client;
+pub const ax = @import("macos_access.zig");
 
 pub const Error = error{ WindowFailed, NotMainThread } || objc.Error || Allocator.Error;
 
@@ -104,6 +105,16 @@ pub const Window = struct {
     text_changed: bool = false,
     /// What the input method did, counted. The evidence a spike reports.
     ime: ImeStats = .{},
+
+    /// The accessibility tree this window describes, if any. See
+    /// `setAccessTarget` and `macos_access.zig`.
+    access: ?ax.Target = null,
+    access_revision: u64 = 0,
+    /// One `ZigUIKitAXElement` per node a client has asked about, retained.
+    access_elements: std.AutoHashMapUnmanaged(ui.access.NodeId, id) = .empty,
+    access_stats: ax.Stats = .{},
+    /// Buttons pressed by an accessibility client, for the application.
+    access_presses: ax.Presses = .{},
 
     pub const TextTarget = struct {
         doc: *ui.Document,
@@ -214,6 +225,8 @@ pub const Window = struct {
         send(void, self.window, "setDelegate:", .{@as(?id, null)});
         objc.setState(self.delegate, delegateClass() catch unreachable, null);
         objc.setState(self.view, viewClass() catch unreachable, null);
+        ax.detach(self);
+        self.access_elements.deinit(self.gpa);
         if (!self.closed) send(void, self.window, "close", .{});
         objc.release(self.delegate);
         objc.release(self.layer);
@@ -221,6 +234,13 @@ pub const Window = struct {
         objc.release(self.window);
         const gpa = self.gpa;
         gpa.destroy(self);
+    }
+
+    /// The display's refresh interval in seconds: 1/120 on a ProMotion panel.
+    pub fn refreshInterval(self: *const Window) f64 {
+        const screen = send(?id, self.window, "screen", .{}) orelse return 1.0 / 60.0;
+        const fps = send(objc.NSInteger, screen, "maximumFramesPerSecond", .{});
+        return if (fps > 0) 1.0 / @as(f64, @floatFromInt(fps)) else 1.0 / 60.0;
     }
 
     /// The content size in pixels: what the layer's drawables should be.
@@ -247,6 +267,43 @@ pub const Window = struct {
         defer pool.pop();
         if (send(?id, self.view, "inputContext", .{})) |ctx| send(void, ctx, "discardMarkedText", .{});
         self.text = target;
+    }
+
+    /// Attaches the accessibility tree this window describes, or detaches it.
+    /// Both trees are borrowed and must outlive the attachment.
+    pub fn setAccessTarget(self: *Window, target: ?ax.Target) void {
+        ax.attach(self, target);
+    }
+
+    /// A text node's value or selection changed: tells accessibility clients,
+    /// if any has asked about this window.
+    pub fn accessibilityTextChanged(self: *Window, node: ui.access.NodeId, edited: bool) void {
+        ax.textChanged(self, node, edited);
+    }
+
+    pub fn accessibilityFocusChanged(self: *Window) void {
+        ax.focusChanged(self);
+    }
+
+    /// A rectangle in layout units, from the top-left of the content, in
+    /// screen coordinates: what both the input method and accessibility
+    /// clients want (§7). The view is not flipped, so the y axis turns over on
+    /// the way.
+    pub fn layoutRectToScreen(self: *Window, r: ui.Rect) objc.CGRect {
+        const bounds = send(objc.CGRect, self.view, "bounds", .{});
+        const in_view: objc.CGRect = .{
+            .origin = .{ .x = r.x, .y = bounds.size.height - (r.y + r.h) },
+            .size = .{ .width = r.w, .height = r.h },
+        };
+        const in_window = send(objc.CGRect, self.view, "convertRect:toView:", .{ in_view, @as(?id, null) });
+        return send(objc.CGRect, self.window, "convertRectToScreen:", .{in_window});
+    }
+
+    pub fn screenPointToLayout(self: *Window, p: objc.CGPoint) ui.Point {
+        const r = send(objc.CGRect, self.window, "convertRectFromScreen:", .{objc.CGRect{ .origin = p, .size = .{ .width = 0, .height = 0 } }});
+        const v = send(objc.CGPoint, self.view, "convertPoint:fromView:", .{ r.origin, @as(?id, null) });
+        const bounds = send(objc.CGRect, self.view, "bounds", .{});
+        return .{ .x = @floatCast(v.x), .y = @floatCast(bounds.size.height - v.y) };
     }
 
     /// Tells the input method that the text moved on screen, so that it asks
@@ -364,16 +421,37 @@ pub const Window = struct {
     /// not every intermediate position, and polling needs no view subclass and
     /// no tracking area. Clicks and keys will need events; hover does not.
     pub fn pump(self: *Window) void {
+        self.pumpFor(0);
+    }
+
+    /// `pump`, but spending `seconds` in the run loop first, handling events
+    /// as they arrive, before sampling.
+    ///
+    /// This is for accessibility, and the reason is measured. A client's
+    /// queries are served by AppKit on the main run loop, one at a time, and a
+    /// frame loop that blocks in `nextDrawable` turns the run loop once per
+    /// frame -- so every query waits for a vsync. `ax_probe` walking 76 nodes
+    /// made 457 queries and took 3.9 s. Waiting here instead, until shortly
+    /// before the next frame is due, leaves the main thread asleep in the run
+    /// loop where a query is answered the moment it arrives.
+    pub fn pumpFor(self: *Window, seconds: f64) void {
         const pool = objc.AutoreleasePool.push();
         defer pool.pop();
 
-        const distant_past = send(id, objc.class("NSDate") catch unreachable, "distantPast", .{});
+        const NSDate = objc.class("NSDate") catch unreachable;
+        const now = send(id, NSDate, "date", .{});
+        const until = if (seconds > 0)
+            send(id, now, "dateByAddingTimeInterval:", .{seconds})
+        else
+            send(id, NSDate, "distantPast", .{});
         while (send(?id, self.app, "nextEventMatchingMask:untilDate:inMode:dequeue:", .{
-            NSEventMaskAny, distant_past, NSDefaultRunLoopMode, objc.YES,
+            NSEventMaskAny, until, NSDefaultRunLoopMode, objc.YES,
         })) |ev| {
             send(void, self.app, "sendEvent:", .{ev});
+            if (self.closed) break;
         }
         if (self.closed) return;
+        ax.sweep(self);
 
         const bounds = send(objc.CGRect, self.view, "bounds", .{});
         const w: u32 = @intFromFloat(@max(bounds.size.width, 0));
@@ -556,6 +634,11 @@ fn viewClass() Error!objc.Class {
         try b.method("validAttributesForMarkedText", &validAttributes, "@@:");
         try b.method("firstRectForCharacterRange:actualRange:", &firstRect, RECT ++ "@:" ++ R ++ "^" ++ R);
         try b.method("characterIndexForPoint:", &characterIndex, "Q@:{CGPoint=dd}");
+
+        // The accessibility side: the view stands for the tree's root.
+        try b.method("accessibilityChildren", &axChildren, "@@:");
+        try b.method("accessibilityFocusedUIElement", &axFocused, "@@:");
+        try b.method("accessibilityHitTest:", &axHitTest, "@@:{CGPoint=dd}");
         view_class = b.finish();
     } else {
         view_class = try objc.class("ZigUIKitView");
@@ -705,15 +788,22 @@ fn firstRect(self: id, _: objc.SEL, range: ic.Utf16Range, actual: ?*ic.Utf16Rang
         if (actual) |a| a.* = ic.fromBytes(t.doc.text(), b);
         if (t.rect) |f| local = f(t.ctx, b);
     }
-    // Points from the top-left, as the layout has them, to the view's own
-    // coordinates (bottom-left: it is not flipped), then to the screen.
-    const bounds = send(objc.CGRect, self, "bounds", .{});
-    const in_view: objc.CGRect = .{
-        .origin = .{ .x = local.x, .y = bounds.size.height - (local.y + local.h) },
-        .size = .{ .width = local.w, .height = local.h },
-    };
-    const in_window = send(objc.CGRect, self, "convertRect:toView:", .{ in_view, @as(?id, null) });
-    return send(objc.CGRect, w.window, "convertRectToScreen:", .{in_window});
+    return w.layoutRectToScreen(local);
+}
+
+fn axChildren(self: id, _: objc.SEL) callconv(.c) ?id {
+    const w = stateOf(self) orelse return null;
+    return ax.viewChildren(w);
+}
+
+fn axFocused(self: id, _: objc.SEL) callconv(.c) ?id {
+    const w = stateOf(self) orelse return self;
+    return ax.viewFocused(w, self);
+}
+
+fn axHitTest(self: id, _: objc.SEL, p: objc.CGPoint) callconv(.c) ?id {
+    const w = stateOf(self) orelse return self;
+    return ax.viewHitTest(w, self, p);
 }
 
 fn characterIndex(_: id, _: objc.SEL, _: objc.CGPoint) callconv(.c) objc.NSUInteger {

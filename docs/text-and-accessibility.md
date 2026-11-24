@@ -224,18 +224,20 @@ on Windows.
 
 ## What this does not settle
 
-- **macOS accessibility.** `NSAccessibility` is unexamined. `NSTextInputClient`
-  is no longer: it is implemented in the toolkit rather than as a spike
-  (`src/input_client.zig`, `src/platform/macos.zig`), and Apple's Vietnamese
-  Simple Telex composes through it. It confirmed §2's choice — macOS has the
-  TSF shape, provisional text in the document — and then showed a third
-  shape none of B-E met: Simple Telex **never marks text at all**. Each key is
-  an `insertText:` with an explicit UTF-16 replacement range that rewrites the
-  syllable in place, after reading it back about five times
-  (`attributedSubstringForProposedRange:`). So the replacement range is the
-  whole mechanism, not an edge case, and §1's unit rule decides whether
-  Vietnamese can be typed on a Mac at all. The README's macOS section has the
-  measurements.
+- **macOS.** Both protocols are implemented in the toolkit rather than as
+  spikes, and the README's macOS section has the measurements.
+  `NSTextInputClient` (`src/input_client.zig`) confirmed §2's choice — macOS
+  has the TSF shape — and then showed a third shape none of B–E met: Apple's
+  Simple Telex **never marks text**, rewriting each syllable in place with an
+  explicit UTF-16 replacement range. `NSAccessibility`
+  (`src/access.zig`, `src/platform/macos_access.zig`) is pull and in process,
+  like UIA, and adds two things to §3–§5: a pull client's queries are served
+  on the main run loop, so a frame loop that blocks until vsync answers **one
+  query per frame** (3.9 s to walk 76 nodes, 20-24 ms after the fix); and §5's
+  lifetime problem does not arise, because a client holds a token that
+  AppKit's server invalidates, and AppKit announces the destruction itself.
+  "Is anyone listening" (§4) is answered precisely by whether any client has
+  called in: none does, with none attached.
 - **X11.** XIM or ibus over DBus, a separate problem of similar size to spike B.
 - **Provider lifetimes** (§5), the largest gap.
 - **Text layout** (§7), which everything in §1 and §7 ultimately depends on.

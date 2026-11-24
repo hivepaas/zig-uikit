@@ -66,6 +66,27 @@ pub const Editable = struct {
 };
 pub var editable: ?Editable = null;
 
+/// The accessibility tree `buildUi` registers its nodes in, when the caller
+/// wants one: a screen reader's view of the same interface. Null for the
+/// software and GPU demos, which have no screen reader to talk to.
+///
+/// What is registered is what a person would name: each label as static
+/// text, each card as a group, the button, and the typeable field as a text
+/// field. The layout elements in between -- rows, spacers, the three elements
+/// of each overlay -- are not, which is the reason the accessibility tree is a
+/// separate tree; see `access.zig`.
+pub var access_tree: ?*ui.access.Tree = null;
+/// The typeable field's node, for the window to attach the document to.
+pub var editable_node: ui.access.NodeId = ui.access.no_node;
+/// Set while building something whose own node already says what its label
+/// would: the button, the text field.
+var access_mute = false;
+
+fn register(t: *Tree, el: Index, info: ui.access.Info) !ui.access.NodeId {
+    const at = access_tree orelse return ui.access.no_node;
+    return at.add(t, el, info);
+}
+
 /// What the editable field starts out holding.
 ///
 /// Chosen so that the field is interesting before anyone types: multi-byte
@@ -219,6 +240,7 @@ fn label(t: *Tree, parent: Index, f: ?*text.Font, atlas: ?*text.Atlas, s: []cons
     const e = try t.appendChild(parent, .{ .flex_shrink = 0 });
     t.setPaint(e, .{ .text_color = c });
     try text.setText(t, e, f.?, atlas.?, s);
+    if (!access_mute) _ = try register(t, e, .{ .role = .static_text, .name = s });
     return e;
 }
 
@@ -457,7 +479,10 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
             .align_items = .center,
         });
         t.setPaint(ok, .{ .background = accent, .corner_radius = 6 });
+        _ = try register(t, ok, .{ .role = .button, .name = "Đồng ý", .state = .{ .focusable = true } });
+        access_mute = true;
         _ = try label(t, ok, ui_font, atlas, "Đồng ý", Color.white);
+        access_mute = false;
     }
 
     // --- content ---
@@ -494,6 +519,7 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
             .border_width = 1,
             .corner_radius = 10,
         });
+        _ = try register(t, c, .{ .role = .group, .name = cell[0] });
         _ = try label(t, c, ui_font, atlas, cell[0], bright);
         _ = try label(t, c, big_font, atlas, cell[1], Color.white);
         _ = try label(t, c, ui_font, atlas, cell[2], dim);
@@ -591,7 +617,16 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
             // The same place and thickness as the composition row above.
             const under = try overlayParts(t, field, 0, run.ascent + 2, 0, 1, h, accent);
             const caret = try overlayParts(t, field, run.width, 0, 1, h, h, caret_color);
+            // Named by the label above it, as a form would be; its value is
+            // the document, attached by the window that owns the document.
+            editable_node = try register(t, field, .{
+                .role = .text_field,
+                .name = "Gõ được thật",
+                .state = .{ .focusable = true, .editable = true },
+            });
+            access_mute = true;
             const lbl = try label(t, field, ui_font, atlas, editable_initial, Color.white);
+            access_mute = false;
             editable = .{
                 .field = field,
                 .label = lbl,

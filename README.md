@@ -9,7 +9,7 @@ A declarative GPU UI toolkit for Zig.
 > There are no widgets. Expect the API to change without notice.
 
 ```sh
-zig build test                           # 127 tests, no platform dependencies
+zig build test                           # 131 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
 zig build test-text                      # 15 tests, needs a font installed
@@ -1048,12 +1048,12 @@ document: "Gõ "
 the same edits with Linux chords through editing.apply: "Gõ " -- identical, selection included
 
 ./zig-out/bin/window_demo --telex    # Apple's Vietnamese Simple Telex
-17 scripted keystrokes through AppKit: mean 5392274 ns, worst 24351917 ns
-  insertText            16 (11 of them replacing text already there)
+16 scripted keystrokes through AppKit: mean 4837138 ns, worst 13444625 ns
+  insertText            15 (11 of them replacing text already there)
   setMarkedText         0 (and 0 cancelling)
-  substring queries     77, rectangle queries 0
-document: "Gõ vào đây: tiếng Việt tiếng Việt "
-expected "Gõ vào đây: tiếng Việt tiếng Việt " -- composed
+  substring queries     72, rectangle queries 0
+document: "Gõ vào đây: tiếng tiếng Việt "
+expected "Gõ vào đây: tiếng tiếng Việt " -- composed
 ```
 
 `--type` is the Wayland demo's script in Mac chords — Cmd+Left, Option+Right
@@ -1073,32 +1073,160 @@ replacement range that rewrites the syllable in place: with `tiêng` in the
 document, `s` is `insertText("tiếng", replacementRange: 23..28)`. No underline is ever shown
 because nothing is ever provisional, and the replacement range is not an edge
 case to be clamped but the entire mechanism — in UTF-16 units. The field already
-holds `Gõ vào đây: tiếng Việt `, which is 23 units and 31 bytes, so a client
-that read the range as bytes would rewrite the middle of `Việt` instead. This is a third shape, beside "outside
+held `Gõ vào đây: tiếng Việt ` when this was measured, which is 23 units and
+31 bytes, so a client that read the range as bytes would have rewritten the
+middle of `Việt` instead. This is a third shape, beside "outside
 the document" and "inside it, marked": inside it and final, rewritten.
 
-**The input method reads the document about five times per key** — 77
-`attributedSubstringForProposedRange:` calls for 17 keys — to see the syllable
-it is about to rewrite. A keystroke through it costs **5.4 ms on average,
-24 ms at worst**, against 0.12 ms for one that goes only through the key
-bindings. Almost all of that is the round trip to the input method's process;
+**The input method reads the document about five times per key** — 72
+`attributedSubstringForProposedRange:` calls for 16 keys — to see the syllable
+it is about to rewrite. A keystroke through it costs **4.8 ms on average,
+13 ms at worst** (5.4 and 24 in an earlier run), against 0.12 ms for one that
+goes only through the key bindings. Almost all of that is the round trip to the input method's process;
 it is why `substring` returns a borrowed slice and allocates nothing.
 
 **A synthesised key event does not reach an input method unless Core
 Graphics made it.** An `NSEvent` from `keyEventWithType:...characters:` goes
 through the key bindings normally, and Apple's Vietnamese input method ignores
 it: every key arrives as a plain `insertText:` of its own character, with 5
-context queries in the whole run instead of 77. Made with
+context queries in the whole run instead of 72. Made with
 `CGEventCreateKeyboardEvent` and wrapped by `eventWithCGEvent:`, the same key
 codes compose. Hence two calls on the window: `sendKey` for text a layout
 cannot type and for the key bindings, `sendKeyCode` for input methods. Neither
 needs accessibility permission, because both are delivered to this window
 rather than posted to the system.
 
+**Two spaces are not two spaces.** When the field's initial text gained a
+trailing space and the script still typed a leading one, the document came
+out as `tiếng. tiếng Việt`: Simple Telex turned the pair into ". ", as the
+macOS double-space shortcut does, with one more replacing `insertText:`. A
+toolkit sees this only as an input method rewriting text it already
+committed — which it is — so nothing in it needs to know the rule exists, but
+a test that types two spaces has to.
+
 Cmd+A is not a key binding on a Mac but the Select All menu item's key
 equivalent, so the application menu gained an Edit menu with that one item.
 Cut, Copy and Paste need the pasteboard and are left out rather than added
 inert.
+
+### Accessibility on macOS
+
+`src/access.zig` is the internal accessibility tree that
+`docs/text-and-accessibility.md` §3 asks for — role, name, bounds, state, text,
+parent, children, index, stable id — in core, with no platform in it, and
+`src/platform/macos_access.zig` describes it to AppKit as
+`NSAccessibilityElement`s defined at run time.
+
+It is **a separate tree from layout**, by registration rather than by
+derivation. The demo's caret is three layout elements and a row of cards has
+a container whose only job is a gap; a screen reader walking layout would
+announce all of them. So the builder registers the elements a person would
+name — labels as static text, cards as groups, the button, the typeable field
+as a text field backed by its `Document` — and a node's parent is its nearest
+registered layout ancestor. The demo has 201 layout elements and 71
+accessible nodes. Bounds are not stored: a node names its element and
+reads layout when asked, so a relayout cannot leave it describing where things
+were. Ids are slots and are never reused.
+
+`tools/ax_probe.zig` is a client in another process, using the `AXUIElement`
+API that VoiceOver and Accessibility Inspector use:
+
+```
+./zig-out/bin/window_demo --ax &     # ten seconds; types `xin chào` at 3 s,
+sleep 1; ./zig-out/bin/ax_probe $!   # removes the button's node at 5 s
+
+76 nodes: 66 static text, 4 groups, 457 queries, 20.4 ms to walk
+text field "Gõ vào đây: tiếng "
+  AXValue is the document -- ok
+  AXNumberOfCharacters 18 is UTF-16 units, not 24 bytes -- ok
+  AXSelectedTextRange is the caret at the end -- ok
+  AXStringForRange(12, 5) is "tiếng" -- ok
+  AXBoundsForRange puts the word inside the field, in screen coordinates -- ok
+  AXFocusedUIElement is the text field -- ok
+  the element at the button's centre is the button -- ok
+  AXPress on the button -- ok
+listening while the demo types...
+  8 AXValueChanged, 8 AXSelectedTextChanged
+  one value change per character of "xin chào" -- ok
+  AXValue afterwards is "Gõ vào đây: tiếng xin chào" -- ok
+  AXUIElementDestroyed for the removed button, 1 of them -- ok
+  asking the removed button its role is error -25202 -- ok
+473 queries in all, 0 wrong
+```
+
+And what the demo counted coming in, for those 473 queries:
+
+| method | calls |
+| --- | --- |
+| `accessibilityParent` | 1292 |
+| `accessibilityFrame` | 216 |
+| `accessibilityRole` | 72 |
+| `accessibilityLabel` | 70 |
+| `accessibilityChildren` | 70 |
+| `accessibilityValue` | 67 |
+| the view's children, focus, hit test | 9 |
+| the text field's text methods | 4 |
+| `accessibilityPerformPress` | 1 |
+
+**1,801 calls into the tree for 473 client queries**, 1,292 of them asking
+for a parent — AppKit's server walking up from each element it is asked
+about. It is the Mac's version of spike D's surprise, where Narrator called
+`Navigate(Parent)` 18 times and `get_HostRawElementProvider` 26 times on a
+two-node tree: a pull model is chatty in a direction no reading of the
+protocol predicts, and the accessor it hammers has to be O(1). Here it is a
+slot lookup.
+
+Five things this measured:
+
+**A pull model also needs the main thread to be there.** The first walk took
+**3.9 seconds**: 457 queries at one per frame. AppKit answers a client on the
+main run loop, one request at a time, and the frame loop was blocked in
+`nextDrawable` until vsync, turning the run loop once per frame. The loop now
+waits in the run loop instead (`Window.pumpFor`) until about 2 ms before the
+next frame is due, and the same walk takes **20-24 ms**. The frame rate does not
+change — measured with the wait on and off in one build. §3 said a UIA backend
+needs every accessor to be cheap; this says the loop must also be idle where a
+query can reach it, and that is true of any in-process pull protocol, UIA
+included.
+
+**"Is anyone listening" has a precise answer here, by asking whether anyone
+has asked.** AppKit exposes no such query — VoiceOver's flag says nothing about
+Accessibility Inspector or automation — but with no client attached, ten
+seconds of the demo made **zero** calls into the tree. AppKit does not touch it
+on its own. So the window posts nothing and makes no objects until the first
+call arrives (16 notifications held back in that run), which is the gate
+Chromium uses, and on this evidence it is as exact as Linux's
+`GetRegisteredEvents` and better than Windows' `UiaClientsAreListening`.
+
+**§5's lifetime problem does not exist on a Mac, and the obvious extra care
+breaks it.** A client in another process holds an `AXUIElementRef` token, not
+a pointer: when the button's node is removed and the window releases its
+object, the object is freed at once — its `dealloc` runs and frees the Zig
+state — while the probe still holds the token, and the probe's next question
+gets `kAXErrorInvalidUIElement`. AppKit also posts `AXUIElementDestroyed`
+itself when the object is deallocated. Posting it by hand as well, which is
+what the first version did, was measured three ways:
+
+```
+release only                         client told once
+post, then release a second later    client told twice
+post, then release at once           client told never
+```
+
+So removing a node is releasing an object, nothing more. There is no
+`UiaDisconnectProvider` to call because there is nothing to disconnect.
+
+**A notification's name is the constant's value, not its name.**
+`NSAccessibilityValueChangedNotification` is `@"AXValueChanged"`. Posting the
+string `"NSAccessibilityValueChangedNotification"` is accepted, counted and
+delivered to nobody — sixteen of them, in the first run.
+
+**The text field reads its own document, in UTF-16.** Value, length,
+selection, substring and bounds all come from the live `Document` through
+`input_client.zig`, the same conversions the input method uses, and
+`AXBoundsForRange` asks the same geometry callback the input method's
+`firstRectForCharacterRange:` does: one answer to §7's question for both
+clients.
 
 ### Not done on macOS
 
@@ -1108,7 +1236,14 @@ inert.
 - Live resize. While the user drags a window edge AppKit runs its own event
   loop inside `sendEvent:`, and this loop does not draw until it returns.
   Untested; rendering from the resize callback or a display link is the fix.
-- `NSAccessibility` — the spike Linux and Windows have.
+- VoiceOver itself. `ax_probe` uses the API VoiceOver uses and checks what it
+  reads; nobody has listened to it yet, which is the test spikes C and D
+  passed with Orca and Narrator.
+- Editing through accessibility: `AXValue` and `AXSelectedTextRange` are read
+  only, so VoiceOver cannot set the caret. The tree is also flat where the
+  interface is not — the list's rows are static text, not list items.
+- The accessibility tree on Linux and Windows. It is in core and shaped for
+  both (§3), and only the Mac reads it.
 - An input method that uses marked text. Apple's Simple Telex does not, and
   the other Vietnamese input methods are not enabled on this Mac; the marked
   path is covered by `zig build test` and not by a live input method. Japanese

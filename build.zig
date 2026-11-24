@@ -320,6 +320,21 @@ fn addMacos(
     const run_window_demo = b.addRunArtifact(window_demo);
     b.step("window", "Open a window and render the demo on the GPU").dependOn(&run_window_demo.step);
 
+    // An accessibility client in another process, for `window_demo --ax`.
+    // Links nothing of the toolkit: it sees only what any client sees.
+    const ax_probe = b.addExecutable(.{
+        .name = "ax_probe",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/ax_probe.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    ax_probe.root_module.linkFramework("ApplicationServices", .{});
+    ax_probe.root_module.linkFramework("CoreFoundation", .{});
+    b.installArtifact(ax_probe);
+
     const gpu_tests = b.addTest(.{
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/gpu/metal_test.zig"),
