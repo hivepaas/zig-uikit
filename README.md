@@ -2,9 +2,9 @@
 
 A declarative GPU UI toolkit for Zig.
 
-> **Status: pre-alpha.** The layout core and the scene layer exist and are
-> tested; there is no GPU renderer, no text and no widgets. Expect the API to
-> change without notice.
+> **Status: pre-alpha.** The layout core, the scene layer and a Vulkan renderer
+> exist and are tested. There is no window yet, no text and no widgets. Expect
+> the API to change without notice.
 
 ```sh
 zig build test                           # 46 tests, no platform dependencies
@@ -117,10 +117,30 @@ per-instance vertex attribute layout, and the pipeline's attribute offsets are
 `@offsetOf` on the struct's own fields, asserted at compile time. That is what
 the 48-byte `extern struct` was for.
 
-Working today, on an AMD RADV device and verified by `zig build test-gpu`:
-device and queue selection, offscreen `R8G8B8A8_UNORM` target, dynamic
-rendering, both image layout transitions, image-to-buffer copy and host
-readback. A clear comes back at 0 of 504 000 pixels wrong.
+Verified by `zig build test-gpu` on an AMD RADV device: device and queue
+selection, offscreen `R8G8B8A8_UNORM` target, dynamic rendering, both image
+layout transitions, image-to-buffer copy and host readback, and the quad
+pipeline itself.
+
+**The renderer agrees with the software reference to within one unit of 255.**
+`zig build gpu-demo` renders the demo above through both paths and diffs every
+pixel:
+
+```
+GPU vs software reference, 504000 pixels:
+  largest channel difference   1
+  mean channel difference      0.0008
+  pixels differing by > 1      0 (0.000%)
+```
+
+That matters because the signed distance field exists twice — once as
+`coverage` and `roundedBoxSdf` in `src/raster.zig`, once in GLSL — and two
+implementations of one formula are exactly the thing that drifts. They are not
+expected to be bit-identical: the reference blends fill and border as two
+eight-bit steps where the shader folds them into one premultiplied source. So
+the comparison bounds the disagreement rather than forbidding it, and
+`docs/demo-diff.png` (amplified 64x) shows where it lives — antialiased edges
+and rounded corners, nothing on flat fills.
 
 `UNORM` and not `SRGB` deliberately: the software reference blends eight-bit
 sRGB values directly, which is what every shipping UI toolkit does, and an sRGB
@@ -128,15 +148,17 @@ format would make the GPU blend in linear space so the two disagreed by
 construction. Gamma-correct compositing is one decision to make for both, not a
 difference to discover.
 
-**Not working yet: the pipeline**, because the two shaders have not been
-compiled. `zig build gpu-demo` says so and runs everything else. See
-[src/gpu/shaders/README.md](src/gpu/shaders/README.md), which also records why
-they are GLSL and not Zig — Zig 0.17's SPIR-V backend decorates builtins
-correctly but emits no `Location` decoration for user-declared interface
-variables, so the module it produces cannot be used in a graphics pipeline at
-all. That was worth establishing rather than assuming, because sharing one
-source between the shader and `src/raster.zig` would have removed the only real
-risk in this part of the design.
+The compiled SPIR-V is committed and embedded in the binary, so building the
+toolkit needs no shader compiler; only changing a shader does.
+[src/gpu/shaders/README.md](src/gpu/shaders/README.md) records why they are
+GLSL and not Zig — Zig 0.17's SPIR-V backend decorates builtins correctly but
+emits no `Location` decoration for user-declared interface variables, so the
+module it produces cannot be used in a graphics pipeline at all. Worth
+establishing rather than assuming, because sharing one source with
+`src/raster.zig` would have removed the duplication described above.
+
+**Not there yet: a window.** Everything renders offscreen and is read back.
+A Wayland surface and a swapchain are the next piece.
 
 ## What it is meant to be
 

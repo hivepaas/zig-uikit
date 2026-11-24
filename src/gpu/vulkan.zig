@@ -401,6 +401,24 @@ comptime {
 
 const Push = extern struct { vw: f32, vh: f32 };
 
+/// The compiled shaders, built into the binary.
+///
+/// Embedded rather than loaded at runtime so that a program using this backend
+/// is one file and cannot be started next to the wrong `.spv`. They are
+/// committed to the repository for the same reason the build does not need a
+/// shader compiler; see `src/gpu/shaders/README.md`.
+/// SPIR-V is a stream of 32-bit words and `vkCreateShaderModule` takes a
+/// `u32` pointer, while `@embedFile` yields a byte array aligned to one. The
+/// alignment is in the type here, and in `Renderer.init`'s parameter, so a
+/// caller handing over a misaligned buffer is a compile error rather than a
+/// panic inside the backend.
+pub const shaders = struct {
+    const vert_bytes = @embedFile("shaders/quad.vert.spv");
+    const frag_bytes = @embedFile("shaders/quad.frag.spv");
+    pub const vert: [vert_bytes.len]u8 align(4) = vert_bytes.*;
+    pub const frag: [frag_bytes.len]u8 align(4) = frag_bytes.*;
+};
+
 pub const Renderer = struct {
     gpu: *Gpu,
     vert: c.VkShaderModule = null,
@@ -413,10 +431,15 @@ pub const Renderer = struct {
     instance_mapped: [*]u8 = undefined,
     instance_capacity: usize = 0,
 
-    /// Takes the compiled shaders as bytes rather than reading files, so the
-    /// caller decides whether they are embedded in the binary or loaded at
-    /// runtime. See `src/gpu/shaders/README.md` for how they are produced.
-    pub fn init(gpu: *Gpu, vert_spv: []const u8, frag_spv: []const u8) Error!Renderer {
+    /// The ordinary case: the quad pipeline with the shaders this module ships.
+    pub fn initDefault(gpu: *Gpu) Error!Renderer {
+        return init(gpu, &shaders.vert, &shaders.frag);
+    }
+
+    /// Takes the compiled shaders as bytes, so a caller replacing them -- a
+    /// test, or an application with its own primitive -- does not have to go
+    /// through a file. See `src/gpu/shaders/README.md` for how they are built.
+    pub fn init(gpu: *Gpu, vert_spv: []align(4) const u8, frag_spv: []align(4) const u8) Error!Renderer {
         var self: Renderer = .{ .gpu = gpu };
         errdefer self.deinit();
 
@@ -718,13 +741,13 @@ pub const Renderer = struct {
     }
 };
 
-fn shaderModule(gpu: *Gpu, spv: []const u8) Error!c.VkShaderModule {
+fn shaderModule(gpu: *Gpu, spv: []align(4) const u8) Error!c.VkShaderModule {
     if (spv.len % 4 != 0 or spv.len < 20) return Error.ShaderRejected;
     if (std.mem.readInt(u32, spv[0..4], .little) != 0x07230203) return Error.ShaderRejected;
     const ci: c.VkShaderModuleCreateInfo = .{
         .sType = c.VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
         .codeSize = spv.len,
-        .pCode = @ptrCast(@alignCast(spv.ptr)),
+        .pCode = @ptrCast(spv.ptr),
     };
     var m: c.VkShaderModule = null;
     try check("vkCreateShaderModule", c.vkCreateShaderModule(gpu.device, &ci, null, &m));
