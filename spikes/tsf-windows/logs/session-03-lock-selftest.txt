@@ -1,0 +1,35 @@
+--- lock state machine self test ---
+  -> RequestLock(0x6) -> granting [read/write]
+  PASS  RequestLock returns S_OK
+  PASS  hrSession is the session result
+  PASS  the sink was granted exactly once
+  PASS  the lock is released after the grant
+  -> RequestLock(0x6) -> granting [read/write]
+  -> RequestLock(0x6) while locked -> queued, TS_S_ASYNC
+  -> granting queued lock(0x6)
+  PASS  re-entrant: outer RequestLock still returns S_OK
+  PASS  re-entrant: inner RequestLock returns S_OK
+  PASS  re-entrant: inner hrSession is TS_S_ASYNC
+  PASS  re-entrant: the queued lock WAS granted afterwards
+  PASS  re-entrant: nothing left held or queued
+  -> RequestLock(0x6) -> granting [read/write]
+  -> RequestLock(0x7) while locked -> TS_E_SYNCHRONOUS
+  PASS  sync re-entry is refused with TS_E_SYNCHRONOUS
+  PASS  sync re-entry granted no second lock
+  PASS  sync re-entry queued nothing
+  -> RequestLock(0x6) -> granting [read/write]
+  -> RequestLock(0x6) while locked -> queued, TS_S_ASYNC
+  -> granting queued lock(0x6)
+  -> RequestLock(0x6) while locked -> queued, TS_S_ASYNC
+  -> granting queued lock(0x6)
+  PASS  a request queued from the deferred grant is also drained
+  PASS  drain loop finished clean
+  -> RequestLock(0x2) -> granting [read only]
+  PASS  SetText under a read-only lock is TS_E_NOLOCK
+  PASS  the refused write left the document untouched
+  PASS  GetSelection with no lock is TS_E_NOLOCK
+
+  17 passed, 0 failed
+
+  NOTE: this proves the state machine, not that a real input
+  processor drives it. Telex never re-entered RequestLock.

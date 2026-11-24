@@ -72,9 +72,13 @@ document manager associated with the window
 - The full bring-up succeeds: `CoCreateInstance` → `Activate` →
   `CreateDocumentMgr` → `CreateContext` → `Push` → `AssociateFocus`.
 - **TSF advised our sink** (`mask=0x1f`) and then drove the store itself.
-- **Both lock types are exercised by real TSF**: `0x6` is `TS_LF_READWRITE`,
-  `0x3` is `TS_LF_READ`. The lock protocol works against the real framework, not
-  a test harness.
+- **Both lock types are exercised by real TSF.** The flags are
+  `TS_LF_SYNC = 0x1`, `TS_LF_READ = 0x2`, `TS_LF_READWRITE = 0x6`, so `0x6` is a
+  read/write lock and the `0x3` seen during start-up is a **synchronous read**
+  lock, not a plain read. (An earlier version of this file called `0x3`
+  `TS_LF_READ`; the self test, which asks for `0x2` and logs it as read-only,
+  made the difference visible.) The protocol works against the real framework,
+  not a test harness.
 - `CLSID_TF_ThreadMgr` is **not** in the mingw headers and had to be hardcoded.
   It is confirmed correct: a wrong value fails `CoCreateInstance` with
   `REGDB_E_CLASSNOTREG`, and `ITfThreadMgr created` is the proof that it did not.
@@ -161,8 +165,8 @@ that run 4 of the benchmark punished with two fast-path bugs that reported
 themselves as improvements.
 
 `tsf-spike.exe --selftest` drives the machine directly through a fake
-`ITextStoreACPSink` and asserts the results. It needs no IME, no window and no
-typing:
+`ITextStoreACPSink` and asserts the results -- 17 assertions in six groups. It
+needs no IME, no window and no typing:
 
 | assertion | why it matters |
 | --- | --- |
@@ -178,20 +182,30 @@ processor exercises it.** That distinction is the whole reason these spikes
 insisted on running Orca and Narrator instead of trusting the code — and in both
 cases the real run found gaps that reading the protocol had not.
 
-### Status: written, not yet run
+### Result: 17 passed, 0 failed
 
-The self test is **unverified on Windows.** After the Telex session the VM was
-saved and resumed, and `VBoxManage guestcontrol` stopped being able to create a
-guest session ("current status is: terminated") despite correct credentials,
-`Additions run level 3`, and a mapped shared folder. A graceful shutdown and
-cold boot did not restore it. Roughly 130 attempts across four approaches; the
-cause was not found.
-
-It needs one command inside the VM:
+Run on Windows 11. The drain loop is the part worth seeing, because it is the
+case a single `if` would get wrong:
 
 ```
-Z:\tsf-spike.exe --selftest
+-> RequestLock(0x6) -> granting [read/write]
+-> RequestLock(0x6) while locked -> queued, TS_S_ASYNC
+-> granting queued lock(0x6)
+-> RequestLock(0x6) while locked -> queued, TS_S_ASYNC   <- queued from INSIDE
+-> granting queued lock(0x6)                             <- the deferred grant
 ```
+
+Full output in [logs/session-03-lock-selftest.txt](logs/session-03-lock-selftest.txt).
+
+Getting it run took longer than writing it. After the Telex session the VM was
+saved and resumed, and `VBoxManage guestcontrol` could no longer create a guest
+session ("current status is: terminated") despite correct credentials,
+`Additions run level 3` and a mapped shared folder; a graceful shutdown and cold
+boot did not restore it either. It started working again the moment a human
+logged into the guest interactively. So the cause was almost certainly that
+guest control needs an interactive session, and a cold-booted VM sitting at the
+lock screen has none — worth knowing before trusting `guestcontrol` for
+unattended testing.
 
 ## App-side editing
 
