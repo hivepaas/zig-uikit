@@ -217,7 +217,33 @@ pub fn main() !void {
         }
         const dt = nowNs() - t0;
         std.mem.doNotOptimizeAway(&sink);
-        report("hitTest, pointer anywhere", dt, iters, "a tree walk, not a dirty check");
+        report("hitTest, 8 columns of 51 rows", dt, iters, "depth 4, widest sibling list 51");
+    }
+    {
+        // The shape that would actually hurt. `hitTest` scans every child of
+        // each element on the path, so its cost is the widest sibling list, not
+        // the element count -- and a long list is exactly one parent with
+        // thousands of children. Measuring the grid alone would have said hit
+        // testing was cheap and meant nothing.
+        var flat = try Tree.init(gpa);
+        defer flat.deinit();
+        try flat.setStyle(flat.root(), .{ .axis = .col });
+        for (0..10_000) |_| {
+            _ = try flat.appendChild(flat.root(), .{ .height = .{ .fixed = 20 }, .flex_shrink = 0 });
+        }
+        flat.layout(viewport);
+        _ = flat.flush();
+
+        const iters = 20_000;
+        var sink: u64 = 0;
+        const t0 = nowNs();
+        for (0..iters) |i| {
+            const fi: f32 = @floatFromInt(i % 500);
+            sink += flat.hitTest(.{ .x = 10, .y = fi });
+        }
+        const dt = nowNs() - t0;
+        std.mem.doNotOptimizeAway(&sink);
+        report("hitTest, 10 000 rows under one parent", dt, iters, "widest sibling list 10 000");
     }
 
     // --- scene ---

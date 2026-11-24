@@ -470,3 +470,111 @@ test "randomised: incremental always matches full" {
         }
     }
 }
+
+test "randomised: binary-search hit testing matches scanning every child" {
+    // `hitChild` binary searches on the claim that a non-wrapping container's
+    // children occupy increasing, non-overlapping ranges along its main axis.
+    // That is a property of how `positionChildren` places them, not something
+    // the type system enforces, so it is checked against the definition it
+    // replaced -- on trees that include wrapping containers, overflowing lines,
+    // zero-sized children and every alignment, because those are the cases
+    // where the claim could fail.
+    var seed: u64 = 0;
+    while (seed < 40) : (seed += 1) {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const rnd = prng.random();
+
+        var t = try Tree.init(testing.allocator);
+        defer t.deinit();
+
+        const wide = seed % 2 == 0;
+        try t.setStyle(t.root(), .{
+            .axis = if (rnd.boolean()) .row else .col,
+            .padding = @floatFromInt(rnd.intRangeAtMost(u32, 0, 12)),
+            .gap = @floatFromInt(rnd.intRangeAtMost(u32, 0, 8)),
+            .align_items = randomAlign(rnd),
+            .justify = randomJustify(rnd),
+        });
+
+        var parents: [64]Index = undefined;
+        var n_parents: usize = 1;
+        parents[0] = t.root();
+
+        const count: usize = if (wide) 220 else 70;
+        for (0..count) |_| {
+            const parent = parents[rnd.uintLessThan(usize, n_parents)];
+            const wrap = rnd.uintLessThan(u32, 8) == 0;
+            const style: ui.Style = .{
+                .axis = if (rnd.boolean()) .row else .col,
+                // A wrapping container needs a definite cross size.
+                .width = if (wrap or rnd.boolean())
+                    .{ .fixed = @floatFromInt(rnd.intRangeAtMost(u32, 0, 90)) }
+                else
+                    .content,
+                .height = if (wrap or rnd.boolean())
+                    .{ .fixed = @floatFromInt(rnd.intRangeAtMost(u32, 0, 70)) }
+                else
+                    .content,
+                // Zero shrink makes lines overflow, which is where the
+                // monotonicity claim is least obvious.
+                .flex_shrink = if (rnd.boolean()) 0 else 1,
+                .padding = @floatFromInt(rnd.intRangeAtMost(u32, 0, 6)),
+                .gap = @floatFromInt(rnd.intRangeAtMost(u32, 0, 6)),
+                .wrap = wrap,
+                .align_items = randomAlign(rnd),
+                .justify = randomJustify(rnd),
+            };
+            const e = try t.appendChild(parent, style);
+            // Biased towards wide containers on even seeds, so the binary
+            // search path (eight children or more) is actually taken.
+            if (!wide and n_parents < parents.len and rnd.uintLessThan(u32, 3) == 0) {
+                parents[n_parents] = e;
+                n_parents += 1;
+            }
+        }
+        t.layout(viewport);
+
+        // Without this the test could pass by never taking the binary search
+        // at all: containers with fewer than eight children are scanned.
+        var widest: usize = 0;
+        var e: Index = 0;
+        while (e < t.count()) : (e += 1) widest = @max(widest, t.childrenOf(e).len);
+        if (wide) try testing.expect(widest >= 8);
+
+        var probe: u32 = 0;
+        while (probe < 400) : (probe += 1) {
+            const p: ui.Point = .{
+                .x = @as(f32, @floatFromInt(rnd.intRangeAtMost(i32, -20, 1020))) + 0.5,
+                .y = @as(f32, @floatFromInt(rnd.intRangeAtMost(i32, -20, 620))) + 0.5,
+            };
+            const fast = t.hitTest(p);
+            const slow = t.hitTestLinear(p);
+            if (fast != slow) {
+                std.debug.print(
+                    "  seed {d}: point {d},{d} -> binary search {d}, scan {d}\n",
+                    .{ seed, p.x, p.y, fast, slow },
+                );
+                return error.HitTestDiverged;
+            }
+        }
+    }
+}
+
+fn randomAlign(rnd: std.Random) ui.AlignItems {
+    return switch (rnd.uintLessThan(u32, 5)) {
+        0 => .start,
+        1 => .center,
+        2 => .end,
+        3 => .stretch,
+        else => .baseline,
+    };
+}
+
+fn randomJustify(rnd: std.Random) ui.Justify {
+    return switch (rnd.uintLessThan(u32, 4)) {
+        0 => .start,
+        1 => .center,
+        2 => .end,
+        else => .space_between,
+    };
+}

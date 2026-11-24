@@ -175,20 +175,44 @@ person moving a mouse:
 180 frames
   frames that did any layout work   0 (0.0%)
   frames that rebuilt the scene     25 (13.9%)
-  mean CPU per frame                1081 ns
-  mean CPU on the 155 frames that changed nothing   462 ns
+  mean CPU per frame                 787 ns
+  mean CPU on the 155 frames that changed nothing   256 ns
 ```
 
 The pointer moves on every one of those frames. Layout work happens on none of
 them, and the scene is rebuilt only when the highlighted row actually changes.
 
-**Which moved the bottleneck somewhere else.** On an idle frame the most
-expensive thing left is *hit testing*: 73 ns on a 1641-element tree against
-1.3 ns for the layout flush and 3.8 ns for the scene check. A pointer move
-costs about fifty times the entire layout system. Hit testing is a tree walk
-with no dirty tracking of its own, and making it incremental — the pointer is
-usually still inside the rectangle it was in last frame — is the obvious next
-thing to measure.
+### The bottleneck moved, and measuring it properly changed the answer
+
+Once layout and scene build cost nanoseconds, the most expensive thing on an
+idle frame was *hit testing*: 73 ns against 1.3 ns for the layout flush. The
+obvious reading was that 73 ns does not matter. The obvious reading was wrong,
+because 73 ns was measured on the wrong shape.
+
+`hitTest` scanned every child of each element on the path, so its cost is the
+**widest sibling list**, not the element count — and a long list is one parent
+with ten thousand children. On a tree of the same size shaped that way:
+
+| | before | after |
+| --- | --- | --- |
+| 8 columns of 51 rows | 73.2 ns | **12.7 ns** |
+| 10 000 rows under one parent | 16 910 ns | **10.7 ns** |
+
+The fix is a binary search, and what makes it correct is an invariant the
+layout engine already guarantees: a non-wrapping container places its children
+by prefix scan along its main axis, so their ranges increase and never overlap
+and at most one can contain the point. A wrapping container breaks that — its
+lines share a main range — and is scanned.
+
+That invariant is a property of `positionChildren`, not of the type system, so
+a randomised test compares the binary search against the scan it replaced over
+16 000 points on trees containing wrapping containers, overflowing lines,
+zero-sized children and every alignment. The test also asserts that the search
+path was actually taken, since containers under eight children are scanned and
+the comparison would otherwise pass by proving nothing.
+
+The 10 000-row case is now *faster* than the grid, because it is one binary
+search at depth one instead of four levels of descent.
 
 `--capture` copies the frame the compositor was actually handed out of the
 swapchain and compares it to the software reference. **Largest channel

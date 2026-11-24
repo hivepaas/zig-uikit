@@ -179,6 +179,16 @@ pub const Tree = struct {
     /// Elements whose own size inputs changed since the last flush.
     dirty: std.ArrayList(Index) = .empty,
 
+    /// Every element's children, grouped by parent, with `child_off[i]` the
+    /// start of element `i`'s run. Rebuilt alongside `pre` and `post`, because
+    /// it changes for exactly the same reason they do.
+    ///
+    /// The tree's own structure is a linked list of children, which is right
+    /// for building and wrong for searching: `hitTest` wants to binary search
+    /// a container's children, and a linked list cannot be indexed.
+    child_list: std.ArrayList(Index) = .empty,
+    child_off: std.ArrayList(u32) = .empty,
+
     /// Scratch, all sized to the element count because a single container may
     /// hold every element in the tree.
     stack: []Index = &.{},
@@ -227,6 +237,8 @@ pub const Tree = struct {
         self.pre.deinit(self.gpa);
         self.post.deinit(self.gpa);
         self.dirty.deinit(self.gpa);
+        self.child_list.deinit(self.gpa);
+        self.child_off.deinit(self.gpa);
         self.freeScratch();
         self.* = undefined;
     }
@@ -445,15 +457,88 @@ pub const Tree = struct {
     /// order `Scene` already holds, against the clip each primitive already
     /// carries. So it belongs to a scene-driven hit test and is left undone
     /// rather than approximated here.
+    /// A container's children, in order. Empty until the first `layout`.
+    pub fn childrenOf(self: *const Tree, el: Index) []const Index {
+        if (self.child_off.items.len <= el + 1) return &.{};
+        const a = self.child_off.items[el];
+        const b = self.child_off.items[el + 1];
+        return self.child_list.items[a..b];
+    }
+
     pub fn hitTest(self: *const Tree, p: Point) Index {
         var hit: Index = self.root();
         if (!self.els.items[hit].bounds.contains(p)) return hit;
         while (true) {
-            var c = self.els.items[hit].first_child;
-            var found: Index = none;
-            while (c != none) : (c = self.els.items[c].next_sibling) {
-                if (self.els.items[c].bounds.contains(p)) found = c;
-            }
+            const found = self.hitChild(hit, p);
+            if (found == none) break;
+            hit = found;
+        }
+        return hit;
+    }
+
+    /// The child of `parent` containing `p`, or `none`.
+    ///
+    /// A non-wrapping container places its children by prefix scan along its
+    /// main axis, so their main-axis ranges are increasing and do not overlap:
+    /// a child's bounds are exactly the slot it was given, and the next slot
+    /// starts where this one ends. At most one child can contain the point, and
+    /// it can be found by binary search.
+    ///
+    /// That invariant is worth the code. Scanning every child makes hit testing
+    /// cost the widest sibling list rather than the depth, and a long list is
+    /// one parent with ten thousand children: measured at 16.9 us per pointer
+    /// move against 73 ns on a tree of the same size shaped as a grid.
+    ///
+    /// A wrapping container breaks the invariant -- several lines share a main
+    /// range -- so it is scanned.
+    fn hitChild(self: *const Tree, parent: Index, p: Point) Index {
+        const kids = self.childrenOf(parent);
+        if (kids.len == 0) return none;
+        const e = &self.els.items[parent];
+
+        if (e.style.wrap or kids.len < 8) return self.hitChildLinear(kids, p);
+
+        const want = switch (e.axis) {
+            .row => p.x,
+            .col => p.y,
+        };
+        // The last child whose main-axis start is at or before the point. A
+        // child that starts after it cannot contain it, and an earlier one
+        // ended before the candidate began.
+        var lo: usize = 0;
+        var hi: usize = kids.len;
+        while (lo < hi) {
+            const mid = lo + (hi - lo) / 2;
+            const b = self.els.items[kids[mid]].bounds;
+            const start = switch (e.axis) {
+                .row => b.x,
+                .col => b.y,
+            };
+            if (start <= want) lo = mid + 1 else hi = mid;
+        }
+        if (lo == 0) return none;
+        const candidate = kids[lo - 1];
+        return if (self.els.items[candidate].bounds.contains(p)) candidate else none;
+    }
+
+    /// The definition `hitChild` has to agree with: the last child containing
+    /// the point, later children being painted over earlier ones.
+    fn hitChildLinear(self: *const Tree, kids: []const Index, p: Point) Index {
+        var found: Index = none;
+        for (kids) |c| {
+            if (self.els.items[c].bounds.contains(p)) found = c;
+        }
+        return found;
+    }
+
+    /// Hit testing with every container scanned. Kept so the randomised test in
+    /// `layout_test.zig` has something to compare the binary search against;
+    /// the two must agree for every point on every tree.
+    pub fn hitTestLinear(self: *const Tree, p: Point) Index {
+        var hit: Index = self.root();
+        if (!self.els.items[hit].bounds.contains(p)) return hit;
+        while (true) {
+            const found = self.hitChildLinear(self.childrenOf(hit), p);
             if (found == none) break;
             hit = found;
         }
@@ -522,6 +607,19 @@ pub const Tree = struct {
             i -= 1;
             self.post.appendAssumeCapacity(self.pre.items[i]);
         }
+
+        self.child_list.clearRetainingCapacity();
+        self.child_off.clearRetainingCapacity();
+        self.child_list.ensureTotalCapacity(self.gpa, n) catch return;
+        self.child_off.ensureTotalCapacity(self.gpa, n + 1) catch return;
+        for (self.els.items) |*e| {
+            self.child_off.appendAssumeCapacity(@intCast(self.child_list.items.len));
+            var c = e.first_child;
+            while (c != none) : (c = self.els.items[c].next_sibling) {
+                self.child_list.appendAssumeCapacity(c);
+            }
+        }
+        self.child_off.appendAssumeCapacity(@intCast(self.child_list.items.len));
     }
 
     fn refreshPredicates(self: *Tree) void {
