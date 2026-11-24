@@ -436,8 +436,7 @@ comptime {
     std.debug.assert(@sizeOf(Quad) == 60);
 }
 
-const Push = extern struct { vw: f32, vh: f32, flags: u32 };
-const flag_swap_rb: u32 = 1;
+const Push = extern struct { vw: f32, vh: f32 };
 
 /// The compiled shaders, built into the binary.
 ///
@@ -957,8 +956,6 @@ pub const Renderer = struct {
         final_layout: c.VkImageLayout,
         final_stage: c.VkPipelineStageFlags,
         final_access: c.VkAccessFlags,
-        /// The target stores blue first. See `Swapchain.swap_rb`.
-        swap_rb: bool = false,
     };
 
     const Frame = struct {
@@ -1052,7 +1049,6 @@ pub const Renderer = struct {
             const push: Push = .{
                 .vw = @floatFromInt(pass.w),
                 .vh = @floatFromInt(pass.h),
-                .flags = if (pass.swap_rb) flag_swap_rb else 0,
             };
             c.vkCmdPushConstants(cb, self.layout, c.VK_SHADER_STAGE_VERTEX_BIT, 0, @sizeOf(Push), &push);
             c.vkCmdDraw(cb, 6, count, 0, 0);

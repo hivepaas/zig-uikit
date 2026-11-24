@@ -24,9 +24,9 @@
 //   - No red/blue swap. A layer's drawables are BGRA8Unorm, and a pixel
 //     format names channels rather than reordering what the shader writes, so
 //     the shader writes RGBA into a BGRA target and the result is correct.
-//     Measured, not assumed: with the Vulkan shader's swap enabled, the
-//     presented frame differs from the reference by 208 of 255 on 98.5% of its
-//     pixels.
+//     Measured, not assumed: with a swap like the one the Vulkan shader used
+//     to have, the presented frame differs from the reference by 208 of 255
+//     on 98.5% of its pixels. The Vulkan swap was the same bug and is gone.
 
 #include <metal_stdlib>
 using namespace metal;

@@ -9,12 +9,13 @@
 
 layout(push_constant) uniform Push {
     vec2 viewport;
-    // Bit 0: the target stores blue first, so swap red and blue on the way in.
-    // Done here rather than in the fragment shader because the colours are
-    // still packed integers at this point and it is two instructions on six
-    // vertices instead of on every covered pixel.
-    uint flags;
 } pc;
+
+// There is no red/blue swap, whatever the target's byte order. A format such
+// as B8G8R8A8_UNORM names channels; it does not reorder what the shader
+// writes. An earlier version swapped here for BGRA targets and crossed the
+// channels on every one of them -- a difference of 208 of 255 -- which went
+// unseen because the machine it was written on offered R8G8B8A8_UNORM.
 
 layout(location = 0) in vec4 in_rect;    // offset  0: x, y, w, h
 layout(location = 1) in uvec2 in_color;  // offset 16: background, border_color
@@ -29,10 +30,6 @@ layout(location = 2) flat out vec2 v_params;
 layout(location = 3) flat out vec4 v_clip;
 layout(location = 4) flat out ivec4 v_uv;
 layout(location = 5) flat out uint v_flags;
-
-uint swapRB(uint v) {
-    return (v & 0xFF00FF00u) | ((v & 0xFFu) << 16) | ((v >> 16) & 0xFFu);
-}
 
 void main() {
     // 0:(0,0) 1:(1,0) 2:(1,1) 3:(0,0) 4:(1,1) 5:(0,1)
@@ -57,9 +54,7 @@ void main() {
     gl_Position = vec4(p / pc.viewport * 2.0 - 1.0, 0.0, 1.0);
 
     v_rect = in_rect;
-    v_color = ((pc.flags & 1u) != 0u)
-        ? uvec2(swapRB(in_color.x), swapRB(in_color.y))
-        : in_color;
+    v_color = in_color;
     v_params = in_params;
     v_clip = in_clip;
     v_uv = ivec4(in_uv);

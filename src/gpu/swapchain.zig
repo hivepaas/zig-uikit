@@ -48,11 +48,18 @@ pub const Swapchain = struct {
 
     handle: c.VkSwapchainKHR = null,
     format: c.VkFormat = c.VK_FORMAT_UNDEFINED,
-    /// True when the chosen format stores blue first, so the shader has to swap
-    /// red and blue on the way in. `B8G8R8A8_UNORM` is frequently the only
-    /// eight-bit UNORM format a surface offers, and silently rendering with the
-    /// channels crossed is the kind of bug that looks like a palette mistake.
-    swap_rb: bool = false,
+    /// True when the chosen format stores blue first in memory.
+    /// `B8G8R8A8_UNORM` is frequently the only eight-bit UNORM format a surface
+    /// offers. It changes nothing about rendering -- a format names channels,
+    /// so the shader's red lands in the red channel wherever the format keeps
+    /// it -- and only `captureRgba` has to reorder bytes.
+    ///
+    /// This used to be `swap_rb` and made the vertex shader swap red and blue,
+    /// which crossed the channels on exactly the surfaces it was written for.
+    /// The development machine offered `R8G8B8A8_UNORM`, so the branch never
+    /// ran until lavapipe under a headless weston offered only BGRA and
+    /// `--capture` reported a difference of 208.
+    bgra: bool = false,
     extent: c.VkExtent2D = .{ .width = 0, .height = 0 },
 
     images: []c.VkImage = &.{},
@@ -181,7 +188,7 @@ pub const Swapchain = struct {
         }
         const fmt = chosen orelse return Error.NoSuitableSurfaceFormat;
         self.format = fmt.format;
-        self.swap_rb = fmt.format == c.VK_FORMAT_B8G8R8A8_UNORM;
+        self.bgra = fmt.format == c.VK_FORMAT_B8G8R8A8_UNORM;
 
         var count = caps.minImageCount + 1;
         if (caps.maxImageCount > 0 and count > caps.maxImageCount) count = caps.maxImageCount;
@@ -307,7 +314,7 @@ pub const Swapchain = struct {
     }
 
     /// The last captured frame, in the swapchain's own channel order. When
-    /// `swap_rb` is set this is BGRA, which is what `captureRgba` exists for.
+    /// `bgra` is set this is BGRA, which is what `captureRgba` exists for.
     pub fn captured(self: *const Swapchain) []const u8 {
         return self.capture_mapped[0 .. @as(usize, self.extent.width) * self.extent.height * 4];
     }
@@ -316,7 +323,7 @@ pub const Swapchain = struct {
     pub fn captureRgba(self: *const Swapchain, gpa: Allocator) Allocator.Error![]u8 {
         const src = self.captured();
         const out = try gpa.alloc(u8, src.len);
-        if (!self.swap_rb) {
+        if (!self.bgra) {
             @memcpy(out, src);
             return out;
         }
@@ -383,7 +390,6 @@ pub const Swapchain = struct {
             else
                 c.VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
             .final_access = if (capturing) c.VK_ACCESS_TRANSFER_READ_BIT else 0,
-            .swap_rb = self.swap_rb,
         }, count, clear);
         if (capturing) self.recordCapture(index);
         try check("vkEndCommandBuffer", c.vkEndCommandBuffer(self.cmd));

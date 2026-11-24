@@ -411,10 +411,17 @@ search at depth one instead of four levels of descent.
 swapchain and compares it to the software reference. **Largest channel
 difference: 1**, the same as the offscreen path. That check is not redundant
 with the offscreen one: a swapchain brings its own format, extent and channel
-order, and none of those exist offscreen. This machine's surface offers
-`R8G8B8A8_UNORM`; where only `B8G8R8A8_UNORM` is available the vertex shader
-swaps red and blue on the way in, which is cheaper than doing it per pixel and
-far cheaper than shipping a picture with the channels crossed.
+order, and none of those exist offscreen.
+
+It also caught a bug this README used to describe as a feature. This machine's
+surface offers `R8G8B8A8_UNORM`; where only `B8G8R8A8_UNORM` was available,
+the vertex shader swapped red and blue "so the channels would not be crossed".
+That swap *was* the crossing: a format names channels, it does not reorder what
+the shader writes. The branch never ran here, and it took the Mac, where every
+layer is BGRA, to make it suspect. Run under lavapipe with a headless weston,
+which offers only `B8G8R8A8_UNORM`, `--capture` reported **208**; with the swap
+removed, **1**. The byte order now matters only to the capture, which reorders
+when it copies the frame out.
 
 ![the frame the compositor was handed](docs/demo-window.png)
 
@@ -485,10 +492,12 @@ work is the 130 ns.
 
 **Channel order is a name, not a reordering.** A `CAMetalLayer` offers
 `BGRA8Unorm` and no eight-bit RGBA format, so every Mac meets the case the
-Vulkan backend handles by swapping red and blue in the shader. Doing the same
-here makes the presented frame differ from the reference by **208 of 255 on
+Vulkan backend used to handle by swapping red and blue in the shader. Doing the
+same here made the presented frame differ from the reference by **208 of 255 on
 98.5% of its pixels**: a format names channels, and the shader's red lands in
 the red channel wherever the format stores it. Only the copy out to RGBA swaps.
+The Vulkan swap was the same bug, confirmed and removed; see the window section
+above.
 
 **Not needing a shader compiler moves the cost to start-up.** The Metal source
 is compiled by `newLibraryWithSource:` at run time, because the build should

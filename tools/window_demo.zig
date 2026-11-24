@@ -137,8 +137,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         gpu.name(),
         swapchain.extent.width,
         swapchain.extent.height,
-        if (swapchain.swap_rb) "B8G8R8A8_UNORM" else "R8G8B8A8_UNORM",
-        if (swapchain.swap_rb) " (red and blue swapped in the shader)" else "",
+        if (swapchain.bgra) "B8G8R8A8_UNORM" else "R8G8B8A8_UNORM",
+        if (swapchain.bgra) " (BGRA in memory; only the capture reorders)" else "",
     });
 
     var hovered: ui.Index = 0;
