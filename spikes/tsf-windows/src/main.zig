@@ -192,10 +192,6 @@ fn hasReadLock() bool {
 var sink: [*c]c.ITextStoreACPSink = null;
 var sink_mask: c.DWORD = 0;
 
-fn sinkCall(comptime name: []const u8) void {
-    _ = name;
-}
-
 fn notifyTextChange(start: usize, old_end: usize, new_end: usize) void {
     if (sink == null) return;
     var tc = c.TS_TEXTCHANGE{
@@ -211,6 +207,77 @@ fn notifySelectionChange() void {
     if (sink == null) return;
     std.debug.print("  <= OnSelectionChange()\n", .{});
     _ = sink.*.lpVtbl.*.OnSelectionChange.?(sink);
+}
+
+/// Edits the application makes ITSELF -- a plain keystroke, Backspace, a caret
+/// move. These are the only changes the sink must be told about: when the input
+/// processor calls SetText it already knows what it did, and notifying it about
+/// its own edit is how notification storms start.
+///
+/// The deferral rule matters more than it looks. While the processor holds a
+/// lock the application MUST NOT touch the text; doing so changes the document
+/// underneath a reader that believes it has exclusive access. There is no queue
+/// here because a spike has nowhere to put one -- the edit is refused and
+/// logged, which at least makes the collision visible instead of silent.
+fn appEdit(kind: enum { insert, backspace, left, right }, ch: u16) void {
+    if (lock_flags != 0) {
+        std.debug.print("  !! app edit refused: the input processor holds a lock (0x{x})\n", .{lock_flags});
+        return;
+    }
+    if (comp_active) {
+        // Editing under an active composition would desynchronise the
+        // processor's idea of the composing range from the document.
+        std.debug.print("  !! app edit refused: a composition is active\n", .{});
+        return;
+    }
+
+    const old_start = sel_start;
+    switch (kind) {
+        .insert => {
+            if (doc_len + 1 > DOC_CAP) return;
+            const tail = doc_len - sel_end;
+            std.mem.copyBackwards(u16, doc[sel_start + 1 ..][0..tail], doc[sel_end..][0..tail]);
+            doc[sel_start] = ch;
+            doc_len = doc_len - (sel_end - sel_start) + 1;
+            sel_start += 1;
+            sel_end = sel_start;
+            notifyTextChange(old_start, old_start, sel_start);
+            notifySelectionChange();
+        },
+        .backspace => {
+            if (sel_start == 0 and sel_end == 0) return;
+            var from = sel_start;
+            const to = sel_end;
+            if (from == to) {
+                // One UTF-16 unit is not one character: step over a low
+                // surrogate so a backspace cannot split a pair.
+                from -= 1;
+                if (from > 0 and doc[from] >= 0xDC00 and doc[from] <= 0xDFFF) from -= 1;
+            }
+            const tail = doc_len - to;
+            std.mem.copyForwards(u16, doc[from..], doc[to..][0..tail]);
+            doc_len -= to - from;
+            sel_start = from;
+            sel_end = from;
+            notifyTextChange(from, to, from);
+            notifySelectionChange();
+        },
+        .left => {
+            if (sel_start == 0) return;
+            sel_start -= 1;
+            if (sel_start > 0 and doc[sel_start] >= 0xDC00 and doc[sel_start] <= 0xDFFF) sel_start -= 1;
+            sel_end = sel_start;
+            notifySelectionChange();
+        },
+        .right => {
+            if (sel_end >= doc_len) return;
+            sel_end += 1;
+            if (sel_end < doc_len and doc[sel_end] >= 0xDC00 and doc[sel_end] <= 0xDFFF) sel_end += 1;
+            sel_start = sel_end;
+            notifySelectionChange();
+        },
+    }
+    reportUnits();
 }
 
 // ------------------------------------------------------------- the text store
@@ -828,6 +895,249 @@ const comp_vtbl = c.ITfContextOwnerCompositionSinkVtbl{
     .OnEndComposition = k_OnEndComposition,
 };
 
+// ------------------------------------------------------------------ self test
+//
+// A real input processor decides for itself whether to re-enter RequestLock,
+// and Vietnamese Telex never did: 27 grants, every one already read/write, so
+// no upgrade was ever needed. The queued path therefore cannot be reached by
+// typing, and shipping it untested would be exactly the kind of "it compiles,
+// so it works" that run 4 of the benchmark punished.
+//
+// This drives the state machine directly through a fake sink and asserts what
+// comes back. It proves the state machine is internally correct. It does NOT
+// prove a real processor exercises it -- that distinction is the whole reason
+// the spikes insist on running Orca and Narrator rather than trusting the code.
+
+var test_pass: u32 = 0;
+var test_fail: u32 = 0;
+
+fn check(cond: bool, comptime what: []const u8) void {
+    if (cond) {
+        test_pass += 1;
+        std.debug.print("  PASS  {s}\n", .{what});
+    } else {
+        test_fail += 1;
+        std.debug.print("  FAIL  {s}\n", .{what});
+    }
+}
+
+/// What the fake sink does when the lock is granted.
+const Script = enum {
+    nothing,
+    /// Re-request asynchronously: must be queued and granted later.
+    reenter_async,
+    /// Re-request synchronously: cannot be deferred, must be refused.
+    reenter_sync,
+    /// Re-request once from the outer grant and once from the deferred grant,
+    /// which is what distinguishes a drain LOOP from a single deferred grant.
+    reenter_twice,
+    /// Attempt a write while holding a read-only lock.
+    write_under_read,
+};
+
+var script: Script = .nothing;
+var grants: u32 = 0;
+var inner_hr: c.HRESULT = 0;
+var inner_ret: c.HRESULT = 0;
+var write_hr: c.HRESULT = 0;
+
+const FakeSink = extern struct {
+    sink: c.ITextStoreACPSink,
+    refs: i32,
+};
+var fake: FakeSink = undefined;
+
+fn fs_QI(this: [*c]c.ITextStoreACPSink, riid: [*c]const c.IID, out: [*c]?*anyopaque) callconv(.c) c.HRESULT {
+    if (out == null) return E_POINTER;
+    out.* = null;
+    if (sameGuid(riid, &IID_IUnknown) or sameGuid(riid, &IID_ITextStoreACPSinkLocal)) {
+        out.* = @ptrCast(this);
+        fake.refs += 1;
+        return S_OK;
+    }
+    return E_NOINTERFACE;
+}
+fn fs_AddRef(this: [*c]c.ITextStoreACPSink) callconv(.c) c.ULONG {
+    _ = this;
+    fake.refs += 1;
+    return @intCast(fake.refs);
+}
+fn fs_Release(this: [*c]c.ITextStoreACPSink) callconv(.c) c.ULONG {
+    _ = this;
+    if (fake.refs > 0) fake.refs -= 1;
+    return @intCast(fake.refs);
+}
+
+fn fs_OnLockGranted(this: [*c]c.ITextStoreACPSink, flags: c.DWORD) callconv(.c) c.HRESULT {
+    _ = this;
+    grants += 1;
+    const depth = grants;
+    switch (script) {
+        .nothing => {},
+        .reenter_async, .reenter_twice => {
+            // Only re-enter from the first grant unless the script wants a
+            // second round from inside the deferred one.
+            const again = (depth == 1) or (script == .reenter_twice and depth == 2);
+            if (again) {
+                inner_ret = a_RequestLock(@ptrCast(&store.acp), c.TS_LF_READWRITE, &inner_hr);
+            }
+        },
+        .reenter_sync => {
+            if (depth == 1) {
+                inner_ret = a_RequestLock(
+                    @ptrCast(&store.acp),
+                    c.TS_LF_READWRITE | c.TS_LF_SYNC,
+                    &inner_hr,
+                );
+            }
+        },
+        .write_under_read => {
+            if (depth == 1) {
+                var tc: c.TS_TEXTCHANGE = undefined;
+                const txt = [_]u16{ 'x', 0 };
+                write_hr = a_SetText(@ptrCast(&store.acp), 0, 0, 0, &txt, 1, &tc);
+            }
+        },
+    }
+    _ = flags;
+    return S_OK;
+}
+
+fn fs_OnTextChange(this: [*c]c.ITextStoreACPSink, flags: c.DWORD, ch: [*c]const c.TS_TEXTCHANGE) callconv(.c) c.HRESULT {
+    _ = this;
+    _ = flags;
+    _ = ch;
+    return S_OK;
+}
+fn fs_OnSelectionChange(this: [*c]c.ITextStoreACPSink) callconv(.c) c.HRESULT {
+    _ = this;
+    return S_OK;
+}
+fn fs_OnLayoutChange(this: [*c]c.ITextStoreACPSink, lcode: c.TsLayoutCode, vc: c.TsViewCookie) callconv(.c) c.HRESULT {
+    _ = this;
+    _ = lcode;
+    _ = vc;
+    return S_OK;
+}
+fn fs_OnStatusChange(this: [*c]c.ITextStoreACPSink, flags: c.DWORD) callconv(.c) c.HRESULT {
+    _ = this;
+    _ = flags;
+    return S_OK;
+}
+fn fs_OnAttrsChange(this: [*c]c.ITextStoreACPSink, s0: c.LONG, s1: c.LONG, n: c.ULONG, a: [*c]const c.TS_ATTRID) callconv(.c) c.HRESULT {
+    _ = this;
+    _ = s0;
+    _ = s1;
+    _ = n;
+    _ = a;
+    return S_OK;
+}
+fn fs_OnStartEditTransaction(this: [*c]c.ITextStoreACPSink) callconv(.c) c.HRESULT {
+    _ = this;
+    return S_OK;
+}
+fn fs_OnEndEditTransaction(this: [*c]c.ITextStoreACPSink) callconv(.c) c.HRESULT {
+    _ = this;
+    return S_OK;
+}
+
+const fake_vtbl = c.ITextStoreACPSinkVtbl{
+    .QueryInterface = fs_QI,
+    .AddRef = fs_AddRef,
+    .Release = fs_Release,
+    .OnTextChange = fs_OnTextChange,
+    .OnSelectionChange = fs_OnSelectionChange,
+    .OnLayoutChange = fs_OnLayoutChange,
+    .OnStatusChange = fs_OnStatusChange,
+    .OnAttrsChange = fs_OnAttrsChange,
+    .OnLockGranted = fs_OnLockGranted,
+    .OnStartEditTransaction = fs_OnStartEditTransaction,
+    .OnEndEditTransaction = fs_OnEndEditTransaction,
+};
+
+fn resetStore() void {
+    doc_len = 0;
+    sel_start = 0;
+    sel_end = 0;
+    comp_active = false;
+    lock_flags = 0;
+    pending_lock = 0;
+    grants = 0;
+    inner_hr = 0;
+    inner_ret = 0;
+    write_hr = 0;
+}
+
+fn selfTest() void {
+    std.debug.print("--- lock state machine self test ---\n", .{});
+
+    store = .{
+        .acp = .{ .lpVtbl = @constCast(&acp_vtbl) },
+        .comp = .{ .lpVtbl = @constCast(&comp_vtbl) },
+        .refs = 1,
+        .hwnd = null,
+    };
+    fake = .{ .sink = .{ .lpVtbl = @constCast(&fake_vtbl) }, .refs = 1 };
+    sink = @ptrCast(&fake.sink);
+
+    // 1 -- a plain grant, and the lock must be released afterwards
+    resetStore();
+    script = .nothing;
+    var hr: c.HRESULT = 0;
+    var ret = a_RequestLock(@ptrCast(&store.acp), c.TS_LF_READWRITE, &hr);
+    check(ret == S_OK, "RequestLock returns S_OK");
+    check(hr == S_OK, "hrSession is the session result");
+    check(grants == 1, "the sink was granted exactly once");
+    check(lock_flags == 0, "the lock is released after the grant");
+
+    // 2 -- re-entrant async request: queued, then granted
+    resetStore();
+    script = .reenter_async;
+    ret = a_RequestLock(@ptrCast(&store.acp), c.TS_LF_READWRITE, &hr);
+    check(ret == S_OK, "re-entrant: outer RequestLock still returns S_OK");
+    check(inner_ret == S_OK, "re-entrant: inner RequestLock returns S_OK");
+    check(inner_hr == TS_S_ASYNC, "re-entrant: inner hrSession is TS_S_ASYNC");
+    check(grants == 2, "re-entrant: the queued lock WAS granted afterwards");
+    check(lock_flags == 0 and pending_lock == 0, "re-entrant: nothing left held or queued");
+
+    // 3 -- a synchronous request cannot be deferred
+    resetStore();
+    script = .reenter_sync;
+    ret = a_RequestLock(@ptrCast(&store.acp), c.TS_LF_READWRITE, &hr);
+    check(inner_hr == TS_E_SYNCHRONOUS, "sync re-entry is refused with TS_E_SYNCHRONOUS");
+    check(grants == 1, "sync re-entry granted no second lock");
+    check(pending_lock == 0, "sync re-entry queued nothing");
+
+    // 4 -- the drain must LOOP, not grant once
+    resetStore();
+    script = .reenter_twice;
+    ret = a_RequestLock(@ptrCast(&store.acp), c.TS_LF_READWRITE, &hr);
+    check(grants == 3, "a request queued from the deferred grant is also drained");
+    check(lock_flags == 0 and pending_lock == 0, "drain loop finished clean");
+
+    // 5 -- writes need a write lock
+    resetStore();
+    script = .write_under_read;
+    ret = a_RequestLock(@ptrCast(&store.acp), c.TS_LF_READ, &hr);
+    check(write_hr == TS_E_NOLOCK, "SetText under a read-only lock is TS_E_NOLOCK");
+    check(doc_len == 0, "the refused write left the document untouched");
+
+    // 6 -- and without any lock at all
+    resetStore();
+    script = .nothing;
+    var sel: c.TS_SELECTION_ACP = undefined;
+    var fetched: c.ULONG = 0;
+    const ghr = a_GetSelection(@ptrCast(&store.acp), c.TS_DEFAULT_SELECTION, 1, &sel, &fetched);
+    check(ghr == TS_E_NOLOCK, "GetSelection with no lock is TS_E_NOLOCK");
+
+    std.debug.print("\n  {d} passed, {d} failed\n", .{ test_pass, test_fail });
+    std.debug.print(
+        "\n  NOTE: this proves the state machine, not that a real input\n" ++
+            "  processor drives it. Telex never re-entered RequestLock.\n",
+        .{},
+    );
+}
+
 // ---------------------------------------------------------------- the window
 
 var g_hwnd: c.HWND = null;
@@ -843,6 +1153,26 @@ fn wndProc(h: c.HWND, msg: c.UINT, wp: c.WPARAM, lp: c.LPARAM) callconv(.c) c.LR
             _ = c.FillRect(hdc, &rc, br);
             _ = c.DeleteObject(br);
             _ = c.EndPaint(h, &ps);
+            return 0;
+        },
+        // Keys the input processor did not consume. With an IME active this is
+        // the minority path, but it is the one that edits the document directly
+        // and therefore the only one that owes the sink a notification.
+        c.WM_CHAR => {
+            const ch: u16 = @truncate(wp);
+            if (ch == 8) {
+                appEdit(.backspace, 0);
+            } else if (ch >= 0x20) {
+                appEdit(.insert, ch);
+            }
+            return 0;
+        },
+        c.WM_KEYDOWN => {
+            switch (wp) {
+                c.VK_LEFT => appEdit(.left, 0),
+                c.VK_RIGHT => appEdit(.right, 0),
+                else => {},
+            }
             return 0;
         },
         c.WM_DESTROY => {
@@ -865,7 +1195,30 @@ var context: [*c]c.ITfContext = null;
 var client_id: c.TfClientId = 0;
 var edit_cookie: c.TfEditCookie = 0;
 
+/// Zig's argument API is not portable the way the rest of std is:
+/// `std.process.Args.Iterator.init` is a hard @compileError on Windows
+/// ("In Windows, use initAllocator instead"), because Windows hands over a
+/// WTF-16 command line that has to be converted. Rather than carry an allocator
+/// into a spike for one flag, this reads the native command line and searches
+/// it -- no allocation, and nothing to break on the next std reshuffle.
+fn hasFlag(comptime flag: []const u8) bool {
+    const w = std.unicode.utf8ToUtf16LeStringLiteral(flag);
+    const cmd = c.GetCommandLineW() orelse return false;
+    var i: usize = 0;
+    while (cmd[i] != 0) : (i += 1) {
+        var k: usize = 0;
+        while (k < w.len and cmd[i + k] == w[k]) k += 1;
+        if (k == w.len) return true;
+    }
+    return false;
+}
+
 pub fn main() !void {
+    if (hasFlag("--selftest")) {
+        selfTest();
+        return;
+    }
+
     const hr_init = c.CoInitializeEx(null, c.COINIT_APARTMENTTHREADED);
     if (hr_init < 0) {
         std.debug.print("CoInitializeEx failed: {s}\n", .{hrName(hr_init)});

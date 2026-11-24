@@ -140,9 +140,8 @@ cheap, and neither was done.
 
 ### Still not exercised
 
-- **Queued locks.** `RequestLock` while a lock is held, returning `TS_S_ASYNC`,
-  never fired: 0 occurrences across 27 grants. The path is implemented and
-  untested, and it is the part most likely to be wrong.
+- **Queued locks** are now covered by a self test, not by a real input
+  processor. See below.
 - **Read-only locks during composition.** All 27 grants in the Telex session were
   read/write; the read-only path (`0x3`) appeared only during start-up queries.
 - **Longer phrases.** `keyboardputstring` delivers keys far faster than a human,
@@ -151,6 +150,68 @@ cheap, and neither was done.
   `tiếng`. That is the injection harness outrunning the IME's own state machine,
   not a text-store fault, but it means only short sequences are actually
   verified.
+
+## The lock state machine, and what `--selftest` does
+
+A real input processor decides for itself whether to re-enter `RequestLock`, and
+Telex never did: 27 grants, every one already read/write, so no read-to-write
+upgrade was ever needed. **The queued path cannot be reached by typing**, which
+left it implemented and unexercised — the kind of "it compiles, so it works"
+that run 4 of the benchmark punished with two fast-path bugs that reported
+themselves as improvements.
+
+`tsf-spike.exe --selftest` drives the machine directly through a fake
+`ITextStoreACPSink` and asserts the results. It needs no IME, no window and no
+typing:
+
+| assertion | why it matters |
+| --- | --- |
+| a plain grant releases the lock afterwards | a leaked lock blocks the processor forever |
+| re-entrant async request returns `TS_S_ASYNC` **and is granted afterwards** | queueing without draining loses the processor's edit |
+| re-entrant **sync** request returns `TS_E_SYNCHRONOUS` | a synchronous lock cannot be deferred, so it must be refused rather than queued |
+| a request queued **from inside the deferred grant** is also drained | distinguishes a drain `while` loop from a single `if`, which is the subtle version of the bug |
+| `SetText` under a read-only lock returns `TS_E_NOLOCK` and leaves the document untouched | allowing it produces text the processor does not know about |
+| `GetSelection` with no lock returns `TS_E_NOLOCK` | the lock is not advisory |
+
+**This proves the state machine is internally correct. It does not prove a real
+processor exercises it.** That distinction is the whole reason these spikes
+insisted on running Orca and Narrator instead of trusting the code — and in both
+cases the real run found gaps that reading the protocol had not.
+
+### Status: written, not yet run
+
+The self test is **unverified on Windows.** After the Telex session the VM was
+saved and resumed, and `VBoxManage guestcontrol` stopped being able to create a
+guest session ("current status is: terminated") despite correct credentials,
+`Additions run level 3`, and a mapped shared folder. A graceful shutdown and
+cold boot did not restore it. Roughly 130 attempts across four approaches; the
+cause was not found.
+
+It needs one command inside the VM:
+
+```
+Z:\tsf-spike.exe --selftest
+```
+
+## App-side editing
+
+Also added, and it was missing entirely: the window handled **no** key input, so
+`OnTextChange` and `OnSelectionChange` were dead code. A text store that never
+notifies its sink is only half a text store — the processor's cached copy of the
+document silently diverges the first time the user presses Backspace.
+
+Two rules TSF imposes here, both easy to miss:
+
+- **The application must not touch the text while the processor holds a lock.**
+  Doing so changes the document underneath a reader that believes it has
+  exclusive access. The edit is refused and logged, so a collision is visible
+  rather than silent.
+- **Nor while a composition is active**, which would desynchronise the
+  processor's composing range from the document.
+
+And backspace must step over a **low surrogate**: one UTF-16 code unit is not one
+character, so deleting one unit can split a surrogate pair. The same hazard the
+offset-unit table warns about, in its most concrete form.
 
 ## A bug this found in itself
 
