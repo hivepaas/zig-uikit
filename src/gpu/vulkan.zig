@@ -32,6 +32,10 @@ pub const Error = error{
     NoGraphicsQueue,
     NoSuitableMemoryType,
     ShaderRejected,
+    /// The surface reported a zero-sized extent, which a compositor does while
+    /// a window is minimised or mid-resize. Not fatal: try again.
+    SurfaceHasNoArea,
+    NoSuitableSurfaceFormat,
     VulkanCallFailed,
 } || Allocator.Error;
 
@@ -41,7 +45,7 @@ pub const Error = error{
 pub var last_result: c.VkResult = c.VK_SUCCESS;
 pub var last_call: []const u8 = "";
 
-fn check(where: []const u8, r: c.VkResult) Error!void {
+pub fn check(where: []const u8, r: c.VkResult) Error!void {
     if (r == c.VK_SUCCESS) return;
     last_result = r;
     last_call = where;
@@ -70,6 +74,12 @@ pub const Gpu = struct {
         /// Prefer a CPU implementation. Useful for reproducing a rendering
         /// difference on a machine with different hardware.
         prefer_software: bool = false,
+        /// The Wayland display to present to, if this device will drive a
+        /// window. When set, the surface and swapchain extensions are enabled
+        /// and the queue family is additionally required to support
+        /// presentation to this display -- which is a real constraint and not a
+        /// formality, because a queue that can draw cannot necessarily present.
+        present_to: ?*c.struct_wl_display = null,
     };
 
     pub fn init(gpa: Allocator, opts: Options) Error!Gpu {
@@ -81,9 +91,15 @@ pub const Gpu = struct {
             .pApplicationName = "zig-uikit",
             .apiVersion = c.VK_API_VERSION_1_3,
         };
+        const surface_exts = [_][*:0]const u8{
+            c.VK_KHR_SURFACE_EXTENSION_NAME,
+            c.VK_KHR_WAYLAND_SURFACE_EXTENSION_NAME,
+        };
         const ici: c.VkInstanceCreateInfo = .{
             .sType = c.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
             .pApplicationInfo = &app,
+            .enabledExtensionCount = if (opts.present_to != null) surface_exts.len else 0,
+            .ppEnabledExtensionNames = if (opts.present_to != null) @ptrCast(&surface_exts) else null,
         };
         try check("vkCreateInstance", c.vkCreateInstance(&ici, null, &self.instance));
 
@@ -129,11 +145,18 @@ pub const Gpu = struct {
         c.vkGetPhysicalDeviceQueueFamilyProperties(self.physical, &qn, families.ptr);
         var found = false;
         for (families[0..qn], 0..) |f, i| {
-            if (f.queueFlags & c.VK_QUEUE_GRAPHICS_BIT != 0) {
-                self.queue_family = @intCast(i);
-                found = true;
-                break;
+            if (f.queueFlags & c.VK_QUEUE_GRAPHICS_BIT == 0) continue;
+            if (opts.present_to) |display| {
+                const ok = c.vkGetPhysicalDeviceWaylandPresentationSupportKHR(
+                    self.physical,
+                    @intCast(i),
+                    display,
+                );
+                if (ok != c.VK_TRUE) continue;
             }
+            self.queue_family = @intCast(i);
+            found = true;
+            break;
         }
         if (!found) return Error.NoGraphicsQueue;
 
@@ -150,11 +173,14 @@ pub const Gpu = struct {
             .sType = c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
             .dynamicRendering = c.VK_TRUE,
         };
+        const device_exts = [_][*:0]const u8{c.VK_KHR_SWAPCHAIN_EXTENSION_NAME};
         const dci: c.VkDeviceCreateInfo = .{
             .sType = c.VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
             .pNext = &f13,
             .queueCreateInfoCount = 1,
             .pQueueCreateInfos = &qci,
+            .enabledExtensionCount = if (opts.present_to != null) device_exts.len else 0,
+            .ppEnabledExtensionNames = if (opts.present_to != null) @ptrCast(&device_exts) else null,
         };
         try check("vkCreateDevice", c.vkCreateDevice(self.physical, &dci, null, &self.device));
         c.vkGetDeviceQueue(self.device, self.queue_family, 0, &self.queue);
@@ -184,7 +210,7 @@ pub const Gpu = struct {
         return std.mem.sliceTo(&self.name_buf, 0);
     }
 
-    fn memoryType(self: *const Gpu, bits: u32, want: c.VkMemoryPropertyFlags) Error!u32 {
+    pub fn memoryType(self: *const Gpu, bits: u32, want: c.VkMemoryPropertyFlags) Error!u32 {
         for (0..self.mem_props.memoryTypeCount) |i| {
             const usable = bits & (@as(u32, 1) << @intCast(i)) != 0;
             const has = self.mem_props.memoryTypes[i].propertyFlags & want == want;
@@ -344,6 +370,8 @@ pub const Target = struct {
 
 // ------------------------------------------------------------ the quad pipeline
 
+pub const transitionPublic = transition;
+
 fn transition(
     cb: c.VkCommandBuffer,
     image: c.VkImage,
@@ -399,7 +427,8 @@ comptime {
     std.debug.assert(@sizeOf(Quad) == 48);
 }
 
-const Push = extern struct { vw: f32, vh: f32 };
+const Push = extern struct { vw: f32, vh: f32, flags: u32 };
+const flag_swap_rb: u32 = 1;
 
 /// The compiled shaders, built into the binary.
 ///
@@ -620,6 +649,22 @@ pub const Renderer = struct {
         self.instance_capacity = cap;
     }
 
+    /// Where a frame is drawn, and what the image has to be ready for when it
+    /// is done. The offscreen path finishes in `TRANSFER_SRC_OPTIMAL` so it can
+    /// be copied out; the swapchain path finishes in `PRESENT_SRC_KHR`. Nothing
+    /// else differs between them, so nothing else is duplicated.
+    pub const Pass = struct {
+        image: c.VkImage,
+        view: c.VkImageView,
+        w: u32,
+        h: u32,
+        final_layout: c.VkImageLayout,
+        final_stage: c.VkPipelineStageFlags,
+        final_access: c.VkAccessFlags,
+        /// The target stores blue first. See `Swapchain.swap_rb`.
+        swap_rb: bool = false,
+    };
+
     const Frame = struct {
         self: *Renderer,
         target: *Target,
@@ -630,26 +675,22 @@ pub const Renderer = struct {
     /// Uploads the scene's quads and draws them into the target, then reads the
     /// result back. `target.pixels()` holds the image when this returns.
     pub fn render(self: *Renderer, target: *Target, scene: *const Scene, clear: Color) Error!void {
-        const quads = scene.items();
-        try self.ensureInstances(quads.len);
-        // The one and only upload: the scene's own memory, byte for byte.
-        if (quads.len > 0) {
-            @memcpy(self.instance_mapped[0 .. quads.len * @sizeOf(Quad)], std.mem.sliceAsBytes(quads));
-        }
+        const count = try self.upload(scene);
         const frame: Frame = .{
             .self = self,
             .target = target,
-            .count = @intCast(quads.len),
+            .count = count,
             .clear = clear,
         };
         try self.gpu.oneShot(Frame, frame, recordFrame);
     }
 
-    fn recordFrame(f: Frame, cb: c.VkCommandBuffer) void {
-        const t = f.target;
+    /// Records a whole frame: the transition in, the clear, the draw, and the
+    /// transition out. Shared by the offscreen path and the swapchain path.
+    pub fn recordPass(self: *Renderer, cb: c.VkCommandBuffer, pass: Pass, count: u32, clear: Color) void {
         transition(
             cb,
-            t.image,
+            pass.image,
             c.VK_IMAGE_LAYOUT_UNDEFINED,
             c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             c.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
@@ -660,14 +701,14 @@ pub const Renderer = struct {
 
         var clear_value: c.VkClearValue = undefined;
         clear_value.color.float32 = .{
-            @as(f32, @floatFromInt(f.clear.r)) / 255.0,
-            @as(f32, @floatFromInt(f.clear.g)) / 255.0,
-            @as(f32, @floatFromInt(f.clear.b)) / 255.0,
-            @as(f32, @floatFromInt(f.clear.a)) / 255.0,
+            @as(f32, @floatFromInt(clear.r)) / 255.0,
+            @as(f32, @floatFromInt(clear.g)) / 255.0,
+            @as(f32, @floatFromInt(clear.b)) / 255.0,
+            @as(f32, @floatFromInt(clear.a)) / 255.0,
         };
         const attachment: c.VkRenderingAttachmentInfo = .{
             .sType = c.VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-            .imageView = t.view,
+            .imageView = pass.view,
             .imageLayout = c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
             .loadOp = c.VK_ATTACHMENT_LOAD_OP_CLEAR,
             .storeOp = c.VK_ATTACHMENT_STORE_OP_STORE,
@@ -675,48 +716,79 @@ pub const Renderer = struct {
         };
         const ri: c.VkRenderingInfo = .{
             .sType = c.VK_STRUCTURE_TYPE_RENDERING_INFO,
-            .renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = t.w, .height = t.h } },
+            .renderArea = .{ .offset = .{ .x = 0, .y = 0 }, .extent = .{ .width = pass.w, .height = pass.h } },
             .layerCount = 1,
             .colorAttachmentCount = 1,
             .pColorAttachments = &attachment,
         };
         c.vkCmdBeginRendering(cb, &ri);
 
-        if (f.count > 0 and f.self.pipeline != null) {
+        if (count > 0 and self.pipeline != null) {
             const viewport: c.VkViewport = .{
                 .x = 0,
                 .y = 0,
-                .width = @floatFromInt(t.w),
-                .height = @floatFromInt(t.h),
+                .width = @floatFromInt(pass.w),
+                .height = @floatFromInt(pass.h),
                 .minDepth = 0,
                 .maxDepth = 1,
             };
             const scissor: c.VkRect2D = .{
                 .offset = .{ .x = 0, .y = 0 },
-                .extent = .{ .width = t.w, .height = t.h },
+                .extent = .{ .width = pass.w, .height = pass.h },
             };
             c.vkCmdSetViewport(cb, 0, 1, &viewport);
             c.vkCmdSetScissor(cb, 0, 1, &scissor);
-            c.vkCmdBindPipeline(cb, c.VK_PIPELINE_BIND_POINT_GRAPHICS, f.self.pipeline);
+            c.vkCmdBindPipeline(cb, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline);
             const offset: c.VkDeviceSize = 0;
-            c.vkCmdBindVertexBuffers(cb, 0, 1, &f.self.instances, &offset);
-            const push: Push = .{ .vw = @floatFromInt(t.w), .vh = @floatFromInt(t.h) };
-            c.vkCmdPushConstants(cb, f.self.layout, c.VK_SHADER_STAGE_VERTEX_BIT, 0, @sizeOf(Push), &push);
-            c.vkCmdDraw(cb, 6, f.count, 0, 0);
+            c.vkCmdBindVertexBuffers(cb, 0, 1, &self.instances, &offset);
+            const push: Push = .{
+                .vw = @floatFromInt(pass.w),
+                .vh = @floatFromInt(pass.h),
+                .flags = if (pass.swap_rb) flag_swap_rb else 0,
+            };
+            c.vkCmdPushConstants(cb, self.layout, c.VK_SHADER_STAGE_VERTEX_BIT, 0, @sizeOf(Push), &push);
+            c.vkCmdDraw(cb, 6, count, 0, 0);
         }
 
         c.vkCmdEndRendering(cb);
 
         transition(
             cb,
-            t.image,
+            pass.image,
             c.VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-            c.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            pass.final_layout,
             c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
-            c.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            pass.final_stage,
             c.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
-            c.VK_ACCESS_TRANSFER_READ_BIT,
+            pass.final_access,
         );
+    }
+
+    /// Uploads the scene's quads into the instance buffer. Separated from
+    /// recording because the swapchain path uploads once and records into a
+    /// command buffer it owns.
+    pub fn upload(self: *Renderer, scene: *const Scene) Error!u32 {
+        const quads = scene.items();
+        try self.ensureInstances(quads.len);
+        // The one and only upload: the scene's own memory, byte for byte.
+        if (quads.len > 0) {
+            @memcpy(self.instance_mapped[0 .. quads.len * @sizeOf(Quad)], std.mem.sliceAsBytes(quads));
+        }
+        return @intCast(quads.len);
+    }
+
+    fn recordFrame(f: Frame, cb: c.VkCommandBuffer) void {
+        const t = f.target;
+        f.self.recordPass(cb, .{
+            .image = t.image,
+            .view = t.view,
+            .w = t.w,
+            .h = t.h,
+            .final_layout = c.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .final_stage = c.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            .final_access = c.VK_ACCESS_TRANSFER_READ_BIT,
+        }, f.count, f.clear);
+
         const copy: c.VkBufferImageCopy = .{
             .bufferOffset = 0,
             .bufferRowLength = 0,

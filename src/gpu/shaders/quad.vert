@@ -9,6 +9,11 @@
 
 layout(push_constant) uniform Push {
     vec2 viewport;
+    // Bit 0: the target stores blue first, so swap red and blue on the way in.
+    // Done here rather than in the fragment shader because the colours are
+    // still packed integers at this point and it is two instructions on six
+    // vertices instead of on every covered pixel.
+    uint flags;
 } pc;
 
 layout(location = 0) in vec4 in_rect;    // offset  0: x, y, w, h
@@ -20,6 +25,10 @@ layout(location = 0) flat out vec4 v_rect;
 layout(location = 1) flat out uvec2 v_color;
 layout(location = 2) flat out vec2 v_params;
 layout(location = 3) flat out vec4 v_clip;
+
+uint swapRB(uint v) {
+    return (v & 0xFF00FF00u) | ((v & 0xFFu) << 16) | ((v >> 16) & 0xFFu);
+}
 
 void main() {
     // 0:(0,0) 1:(1,0) 2:(1,1) 3:(0,0) 4:(1,1) 5:(0,1)
@@ -38,7 +47,9 @@ void main() {
     gl_Position = vec4(p / pc.viewport * 2.0 - 1.0, 0.0, 1.0);
 
     v_rect = in_rect;
-    v_color = in_color;
+    v_color = ((pc.flags & 1u) != 0u)
+        ? uvec2(swapRB(in_color.x), swapRB(in_color.y))
+        : in_color;
     v_params = in_params;
     v_clip = in_clip;
 }

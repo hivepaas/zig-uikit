@@ -200,6 +200,26 @@ pub fn main() !void {
         report("setPaint a leaf + flush", dt, iters, "GPUI leaf style: 3.9 ms");
     }
 
+    // --- hit testing ---
+    //
+    // Here because the window demo showed it dominating an idle frame: once
+    // layout and scene build cost nanoseconds, a tree walk per pointer move is
+    // what is left. Measured on the same tree, so the number is comparable to
+    // the ones above.
+    std.debug.print("\nhit test\n", .{});
+    {
+        const iters = 200_000;
+        var sink: u64 = 0;
+        const t0 = nowNs();
+        for (0..iters) |i| {
+            const fi: f32 = @floatFromInt(i % 977);
+            sink += b.t.hitTest(.{ .x = 40 + fi, .y = 20 + fi * 0.7 });
+        }
+        const dt = nowNs() - t0;
+        std.mem.doNotOptimizeAway(&sink);
+        report("hitTest, pointer anywhere", dt, iters, "a tree walk, not a dirty check");
+    }
+
     // --- scene ---
     std.debug.print("\nscene\n", .{});
     {

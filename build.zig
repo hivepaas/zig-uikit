@@ -52,22 +52,68 @@ pub fn build(b: *std.Build) void {
     // dependencies and its tests run anywhere; this links libvulkan and needs a
     // device, so it gets its own module and its own steps. A toolkit whose unit
     // tests need a GPU is a toolkit nobody runs the tests of.
+    // wayland-scanner turns protocol XML into a header of request wrappers and
+    // a .c file of interface tables. Both are needed: the header to call
+    // through, the tables to link against.
+    const proto_dir = "/usr/share/wayland-protocols";
+    const xdg_header_cmd = b.addSystemCommand(&.{ "wayland-scanner", "client-header", proto_dir ++ "/stable/xdg-shell/xdg-shell.xml" });
+    const xdg_header = xdg_header_cmd.addOutputFileArg("xdg-shell-client-protocol.h");
+    const xdg_code_cmd = b.addSystemCommand(&.{ "wayland-scanner", "private-code", proto_dir ++ "/stable/xdg-shell/xdg-shell.xml" });
+    const xdg_code = xdg_code_cmd.addOutputFileArg("xdg-shell-protocol.c");
+
     const vk_c = b.addTranslateC(.{
-        .root_source_file = b.path("src/gpu/vk.h"),
+        .root_source_file = b.path("src/native.h"),
         .target = target,
         .optimize = optimize,
     });
+    vk_c.addIncludePath(xdg_header.dirname());
+    const c_mod = vk_c.createModule();
+
     const gpu_mod = b.addModule("zig-uikit-vulkan", .{
-        .root_source_file = b.path("src/gpu/vulkan.zig"),
+        .root_source_file = b.path("src/gpu/gpu.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{
-            .{ .name = "vk", .module = vk_c.createModule() },
+            .{ .name = "vk", .module = c_mod },
             .{ .name = "zig-uikit", .module = mod },
         },
     });
     gpu_mod.linkSystemLibrary("vulkan", .{});
+
+    // The window. Separate from the renderer because they are separate
+    // concerns even on the one platform that exists so far: this module knows
+    // nothing about Vulkan beyond handing over a surface.
+    const wl_mod = b.addModule("zig-uikit-wayland", .{
+        .root_source_file = b.path("src/platform/wayland.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "vk", .module = c_mod }},
+    });
+    wl_mod.linkSystemLibrary("wayland-client", .{});
+    // The generated interface tables are plain C and have to be compiled in.
+    wl_mod.addCSourceFile(.{ .file = xdg_code, .flags = &.{"-std=c99"} });
+
+    const window_demo = b.addExecutable(.{
+        .name = "window_demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/window_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zig-uikit", .module = mod },
+                .{ .name = "zig-uikit-vulkan", .module = gpu_mod },
+                .{ .name = "zig-uikit-wayland", .module = wl_mod },
+            },
+        }),
+    });
+    // Installed as well as runnable, because `zig build window` cannot forward
+    // arguments -- `b.args` was removed in Zig 0.17 -- and the capture mode
+    // needs one.
+    b.installArtifact(window_demo);
+    const run_window_demo = b.addRunArtifact(window_demo);
+    b.step("window", "Open a window and render the demo on the GPU").dependOn(&run_window_demo.step);
 
     const gpu_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -77,7 +123,7 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
             .imports = &.{
                 .{ .name = "zig-uikit", .module = mod },
-                .{ .name = "vk", .module = vk_c.createModule() },
+                .{ .name = "vk", .module = c_mod },
             },
         }),
     });

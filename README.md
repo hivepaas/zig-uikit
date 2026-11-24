@@ -2,16 +2,17 @@
 
 A declarative GPU UI toolkit for Zig.
 
-> **Status: pre-alpha.** The layout core, the scene layer and a Vulkan renderer
-> exist and are tested. There is no window yet, no text and no widgets. Expect
-> the API to change without notice.
+> **Status: pre-alpha.** The layout core, the scene layer, a Vulkan renderer
+> and a Wayland window exist and are tested. There is no text and there are no
+> widgets. Expect the API to change without notice.
 
 ```sh
 zig build test                           # 46 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
-zig build test-gpu                       # 4 tests, needs a Vulkan device
+zig build test-gpu                       # 5 tests, needs a Vulkan device
 zig build gpu-demo                       # renders on the GPU, diffs against the reference
+zig build window                         # opens a window and renders into it
 ```
 
 ![a window's worth of interface, rendered by the software rasteriser](docs/demo.png)
@@ -157,8 +158,48 @@ module it produces cannot be used in a graphics pipeline at all. Worth
 establishing rather than assuming, because sharing one source with
 `src/raster.zig` would have removed the duplication described above.
 
-**Not there yet: a window.** Everything renders offscreen and is read back.
-A Wayland surface and a swapchain are the next piece.
+## The window
+
+`zig build window` opens a Wayland window and renders the same interface into
+it through a swapchain, at the display's refresh rate with no sleep anywhere in
+the loop — FIFO present is the pacing. Move the pointer and the row under it
+highlights; resize and the layout recomputes.
+
+The highlight is the thesis made visible: hovering changes `Paint`, so it
+cannot do layout work, and the program counts how often it does. One run of
+`./zig-out/bin/window_demo --sweep`, which drives a synthetic pointer down the
+list for 180 frames so that the counters are a measurement rather than a
+person moving a mouse:
+
+```
+180 frames
+  frames that did any layout work   0 (0.0%)
+  frames that rebuilt the scene     25 (13.9%)
+  mean CPU per frame                1081 ns
+  mean CPU on the 155 frames that changed nothing   462 ns
+```
+
+The pointer moves on every one of those frames. Layout work happens on none of
+them, and the scene is rebuilt only when the highlighted row actually changes.
+
+**Which moved the bottleneck somewhere else.** On an idle frame the most
+expensive thing left is *hit testing*: 73 ns on a 1641-element tree against
+1.3 ns for the layout flush and 3.8 ns for the scene check. A pointer move
+costs about fifty times the entire layout system. Hit testing is a tree walk
+with no dirty tracking of its own, and making it incremental — the pointer is
+usually still inside the rectangle it was in last frame — is the obvious next
+thing to measure.
+
+`--capture` copies the frame the compositor was actually handed out of the
+swapchain and compares it to the software reference. **Largest channel
+difference: 1**, the same as the offscreen path. That check is not redundant
+with the offscreen one: a swapchain brings its own format, extent and channel
+order, and none of those exist offscreen. This machine's surface offers
+`R8G8B8A8_UNORM`; where only `B8G8R8A8_UNORM` is available the vertex shader
+swaps red and blue on the way in, which is cheaper than doing it per pixel and
+far cheaper than shipping a picture with the channels crossed.
+
+![the frame the compositor was handed](docs/demo-window.png)
 
 ## What it is meant to be
 
