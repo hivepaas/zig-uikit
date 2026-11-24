@@ -1,0 +1,15 @@
+.{
+    .name = .zig_uikit,
+    .version = "0.0.0",
+    .minimum_zig_version = "0.17.0",
+    .fingerprint = 0x2f20b80092a6fe0a,
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "docs",
+        "LICENSE",
+        "README.md",
+    },
+}

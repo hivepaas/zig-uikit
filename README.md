@@ -2,8 +2,33 @@
 
 A declarative GPU UI toolkit for Zig.
 
-> **Status: pre-alpha, nothing to use yet.** The design is being settled by
-> measurement before code is written. Expect the API to change without notice.
+> **Status: pre-alpha.** The layout core exists and is tested; there is no
+> renderer, no text and no widgets. Expect the API to change without notice.
+
+```sh
+zig build test    # 18 tests, no platform dependencies
+```
+
+```zig
+var t = try ui.Tree.init(gpa);
+defer t.deinit();
+
+try t.setStyle(t.root(), .{ .axis = .col, .padding = 8, .gap = 4 });
+const row = try t.appendChild(t.root(), .{ .axis = .row, .height = .{ .fixed = 32 } });
+const label = try t.appendChild(row, .{ .width = .{ .grow = 1 } });
+
+t.layout(.{ .w = 1280, .h = 720 });
+
+// Later. Only what changed is recomputed; an unchanged frame does nothing.
+try t.setStyle(label, .{ .width = .{ .grow = 2 } });
+const cost = t.flush();   // .intrinsic, .position, .fast_path, .slow_path
+```
+
+The tree is **retained and mutated**, not rebuilt per frame. That is the whole
+point: a frame arena reset wholesale cannot reuse last frame's subtrees, which
+is where the saving comes from. A declarative layer belongs on top of this, and
+`setStyle` compares before marking dirty so that re-setting an unchanged style
+every frame costs nothing.
 
 ## What it is meant to be
 
