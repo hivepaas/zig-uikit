@@ -31,6 +31,10 @@ const row_alt = Color.hex(0x33363B);
 const width = 900;
 const height = 560;
 
+/// More rows than the panel can show, so the clip and the culling both have
+/// something to do.
+const row_total = 20;
+
 /// A label placeholder: the bar a mockup uses where text will go.
 fn bar(t: *Tree, parent: Index, w: f32, h: f32, c: Color) !Index {
     const e = try t.appendChild(parent, .{
@@ -46,11 +50,10 @@ fn spacer(t: *Tree, parent: Index) !Index {
     return t.appendChild(parent, .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 1 } });
 }
 
-pub fn main() !void {
-    const gpa = std.heap.smp_allocator;
-
-    var t = try Tree.init(gpa);
-    defer t.deinit();
+/// The interface itself, shared with `gpu_demo.zig` so that the GPU and the
+/// software rasteriser are compared on the same scene rather than on two
+/// things that look alike.
+pub fn buildUi(t: *Tree) !void {
     t.setPaint(t.root(), .{ .background = bg });
     // `align_items` defaults to `.start` here, where CSS defaults it to
     // `stretch`. Every container that should fill its parent across its axis
@@ -76,9 +79,9 @@ pub fn main() !void {
         });
         t.setPaint(dot, .{ .background = Color.hex(rgb), .corner_radius = 6 });
     }
-    _ = try spacer(&t, title);
-    _ = try bar(&t, title, 160, 8, dim);
-    _ = try spacer(&t, title);
+    _ = try spacer(t, title);
+    _ = try bar(t, title, 160, 8, dim);
+    _ = try spacer(t, title);
 
     // --- body ---
     const body = try t.appendChild(t.root(), .{
@@ -120,7 +123,7 @@ pub fn main() !void {
             .background = if (selected) Color.white else dim,
             .corner_radius = 4,
         });
-        _ = try bar(&t, row, 96, 7, if (selected) Color.white else bright);
+        _ = try bar(t, row, 96, 7, if (selected) Color.white else bright);
 
         if (!selected) continue;
 
@@ -149,9 +152,9 @@ pub fn main() !void {
             .corner_radius = 10,
             .layer = ui.layers.popover,
         });
-        _ = try bar(&t, pop, 110, 8, Color.white);
-        _ = try bar(&t, pop, 190, 6, bright);
-        _ = try bar(&t, pop, 160, 6, bright);
+        _ = try bar(t, pop, 110, 8, Color.white);
+        _ = try bar(t, pop, 190, 6, bright);
+        _ = try bar(t, pop, 160, 6, bright);
         const ok = try t.appendChild(pop, .{
             .width = .{ .fixed = 76 },
             .height = .{ .fixed = 24 },
@@ -189,9 +192,9 @@ pub fn main() !void {
             .border_width = 1,
             .corner_radius = 10,
         });
-        _ = try bar(&t, c, 70, 7, bright);
-        _ = try bar(&t, c, 110, 18, Color.white);
-        _ = try bar(&t, c, 90, 6, dim);
+        _ = try bar(t, c, 70, 7, bright);
+        _ = try bar(t, c, 110, 18, Color.white);
+        _ = try bar(t, c, 90, 6, dim);
     }
 
     // --- the scrolling list: more rows than fit, clipped and culled ---
@@ -209,7 +212,6 @@ pub fn main() !void {
         .corner_radius = 10,
         .clip_children = true,
     });
-    const row_total = 20;
     for (0..row_total) |i| {
         const row = try t.appendChild(list, .{
             .axis = .row,
@@ -232,11 +234,21 @@ pub fn main() !void {
             .background = if (i % 3 == 0) accent else dim,
             .corner_radius = 4,
         });
-        _ = try bar(&t, row, 150, 6, bright);
-        _ = try spacer(&t, row);
-        _ = try bar(&t, row, 48, 6, dim);
+        _ = try bar(t, row, 150, 6, bright);
+        _ = try spacer(t, row);
+        _ = try bar(t, row, 48, 6, dim);
     }
 
+}
+
+pub const viewport: ui.Size = .{ .w = width, .h = height };
+
+pub fn main() !void {
+    const gpa = std.heap.smp_allocator;
+
+    var t = try Tree.init(gpa);
+    defer t.deinit();
+    try buildUi(&t);
     t.layout(.{ .w = width, .h = height });
 
     var sc = ui.Scene.init(gpa);

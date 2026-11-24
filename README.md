@@ -10,6 +10,8 @@ A declarative GPU UI toolkit for Zig.
 zig build test                           # 46 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
+zig build test-gpu                       # 4 tests, needs a Vulkan device
+zig build gpu-demo                       # renders on the GPU, diffs against the reference
 ```
 
 ![a window's worth of interface, rendered by the software rasteriser](docs/demo.png)
@@ -103,6 +105,38 @@ going to be found by writing more assertions.
 container that should fill its parent across its axis has to say so. Whether
 that is the right default is still open; it is written down rather than
 discovered later.
+
+## The Vulkan backend
+
+Separate module, separate test step. The library above links nothing and runs
+its tests anywhere; a toolkit whose unit tests need a GPU is a toolkit nobody
+runs the tests of.
+
+The scene's `Quad` is uploaded **with no repacking at all** — it is the
+per-instance vertex attribute layout, and the pipeline's attribute offsets are
+`@offsetOf` on the struct's own fields, asserted at compile time. That is what
+the 48-byte `extern struct` was for.
+
+Working today, on an AMD RADV device and verified by `zig build test-gpu`:
+device and queue selection, offscreen `R8G8B8A8_UNORM` target, dynamic
+rendering, both image layout transitions, image-to-buffer copy and host
+readback. A clear comes back at 0 of 504 000 pixels wrong.
+
+`UNORM` and not `SRGB` deliberately: the software reference blends eight-bit
+sRGB values directly, which is what every shipping UI toolkit does, and an sRGB
+format would make the GPU blend in linear space so the two disagreed by
+construction. Gamma-correct compositing is one decision to make for both, not a
+difference to discover.
+
+**Not working yet: the pipeline**, because the two shaders have not been
+compiled. `zig build gpu-demo` says so and runs everything else. See
+[src/gpu/shaders/README.md](src/gpu/shaders/README.md), which also records why
+they are GLSL and not Zig — Zig 0.17's SPIR-V backend decorates builtins
+correctly but emits no `Location` decoration for user-declared interface
+variables, so the module it produces cannot be used in a graphics pipeline at
+all. That was worth establishing rather than assuming, because sharing one
+source between the shader and `src/raster.zig` would have removed the only real
+risk in this part of the design.
 
 ## What it is meant to be
 
