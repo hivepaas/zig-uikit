@@ -9,12 +9,12 @@ A declarative GPU UI toolkit for Zig.
 > There are no widgets. Expect the API to change without notice.
 
 ```sh
-zig build test                           # 100 tests, no platform dependencies
+zig build test                           # 101 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
-zig build test-text                      # 14 tests, needs a font installed
+zig build test-text                      # 15 tests, needs a font installed
 zig build test-input                     # 7 tests, needs xkbcommon and a layout
-zig build test-gpu                       # Vulkan: 7 tests; Metal: 10 tests
+zig build test-gpu                       # Vulkan: 7 tests; Metal: 11 tests
 zig build gpu-demo                       # renders on the GPU, diffs against the reference
 zig build window                         # opens a window and renders into it
 ```
@@ -149,7 +149,7 @@ discovered later.
 
 ## Text
 
-`zig build test-text` — 14 tests, and they need a font installed, which is why
+`zig build test-text` — 15 tests, and they need a font installed, which is why
 they are not in `zig build test`.
 
 **HarfBuzz is in the first slice of text, not a later one.** The tempting
@@ -420,12 +420,12 @@ and the textured branch transcribed into `quad.metal` against
 same interface on both backends, and on an Apple M1 Pro:
 
 ```
-631 quads, 37860 bytes uploaded with no repacking
-589 of those quads are glyphs, from a 512x512 atlas
+610 quads, 36600 bytes uploaded with no repacking
+569 of those quads are glyphs, from a 512x512 atlas
 
 GPU vs software reference, 504000 pixels:
   largest channel difference   1
-of which 37803 pixels are covered by a glyph:
+of which 36389 pixels are covered by a glyph:
   largest channel difference   1
   glyph pixels differing by > 1 0
 ```
@@ -433,21 +433,49 @@ of which 37803 pixels are covered by a glyph:
 `test-gpu` carries the same bit-exactness test as Vulkan's — a diagonal atlas,
 so transposed or off-by-one texel addressing cannot pass — and it passes.
 
-The macOS *window* still draws the grey bars, for the reason below: it is a
-Retina window, and a glyph cannot be scaled.
-
 Getting the text stack to build on a Mac at all found a fault in `build.zig`.
 It asks `pkg-config` where FreeType and HarfBuzz keep their headers, but
 `runAllowFail` does not search `PATH` for the program it runs, so the question
 had never once been asked: the Linux fallback paths answered it everywhere,
 correctly on Debian by coincidence. The program is now resolved first.
 
-One thing the Retina path already settles, though. `Quad.scaled` now asserts
-that the quad is not textured, because **a glyph cannot be scaled**: its atlas
-rectangle is a fixed number of texels and one destination pixel reads one
-texel, so doubling the destination would leave half the glyph outside its own
-range. The answer on a 2× display is to shape at the device pixel size — a
-13-point label is a 26-pixel font, not a 13-pixel one drawn twice as large.
+### Text on a Retina display
+
+**A glyph cannot be scaled**: its atlas rectangle is a fixed number of texels
+and one destination pixel reads one texel, so doubling the destination would
+leave half the glyph outside its own range — and a bitmap stretched to cover
+it would be blurry anyway. So a 2× display gets a font shaped at the device
+size: a 13-point label is a 26-pixel font, hinted and rasterised at 26 pixels,
+not a 13-pixel one drawn twice as large.
+
+`text.Library.openScaled(gpa, family, 13, 2)` opens exactly that, and its runs
+come back in **layout units**: every offset, size and advance is divided by
+the scale, while the texel coordinates stay in the atlas's own pixels. Layout
+therefore sees the same 13-point label on any display, and only the bitmaps
+differ. The test for it opens `sans` at 26 pixels beside `sans` at 13 points
+on a 2× display and finds the same glyphs, the same atlas bytes, and every
+measurement halved.
+
+The other half is the grid. The scene builder snaps a glyph to whole pixels
+so that pixel and texel line up, and on a 2× display a whole pixel is half a
+point, so `Scene.setPixelScale(2)` makes it snap to halves. Nothing else
+changes: the Metal vertex shader already scaled every quad to device pixels,
+and a glyph quad that is `texels / 2` points wide on a half-point boundary
+scales to whole pixels at its texel size. `Quad.scaled` checks exactly that
+and asserts on anything else, so the reference cannot quietly draw a glyph
+the GPU would discard.
+
+The macOS window now has text, against the reference drawn at the same scale:
+
+```
+presented frame vs software reference, 1800x1120 pixels at scale 2, 569 glyphs:
+  largest channel difference   1
+  pixels differing by > 1      0
+```
+
+Snapping to the device grid instead of the layout grid costs nothing that can
+be measured: a full rebuild of the bench's 7 344-glyph scene is 38.5 µs before
+and after.
 
 ### What text does not do yet
 
@@ -798,18 +826,24 @@ The window is Retina, which Wayland's was not: the tree is laid out in
 every length in the quad so the distance field is evaluated in pixels.
 `--capture` compares the presented 1800x1120 frame against the reference drawn
 at the same scale: **largest channel difference 1**, and still 1 after the
-window is resized.
+window is resized. That was measured before the window had text; with text it
+is still 1, because the text is shaped for the scale rather than scaled (see
+"Text on a Retina display").
 
 ![the frame the window server was handed, at two pixels per point](docs/demo-window-macos.png)
 
 `./zig-out/bin/window_demo --sweep` built with `-Doptimize=ReleaseFast`:
 
 ```
-180 frames in 1.51 s (119.4 per second; pacing is the display's, there is no sleep)
+180 frames in 1.50 s (119.9 per second; pacing is the display's, there is no sleep)
   frames that did any layout work   0 (0.0%)
-  frames that rebuilt the scene     25 (13.9%)
-  mean CPU on the 155 frames that changed nothing   1306 ns
+  frames that rebuilt the scene     10 (5.6%)
+  mean CPU on the 170 frames that changed nothing   1141 ns
 ```
+
+That is with 569 glyphs in the scene; over eight runs the unchanged frame was
+1.1-1.5 us, the same as before the window had any text, because a frame
+where nothing changed does not look at a glyph.
 
 Pacing is the 120 Hz display's: `nextDrawable` blocks when every drawable is
 queued, which is FIFO present by another name. The layout counter is the same
@@ -846,9 +880,9 @@ yet.
 
 ### Not done on macOS
 
-- Text in the window. The renderer draws glyphs exactly; what is missing is
-  shaping at the device pixel size, so that a Retina window gets glyphs
-  rasterised for two pixels per point rather than none.
+- A window moved to a display with a different scale reopens its fonts and
+  rebuilds its tree; that path is written and has not been exercised, because
+  this Mac has one display.
 - Live resize. While the user drags a window edge AppKit runs its own event
   loop inside `sendEvent:`, and this loop does not draw until it returns.
   Untested; rendering from the resize callback or a display link is the fix.

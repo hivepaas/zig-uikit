@@ -288,6 +288,67 @@ test "an opaque glyph is bit-exact, not merely close" {
     }
 }
 
+test "at 2x a glyph shaped for the device lands one texel per device pixel" {
+    // The diagonal again, now as a scene built for a Retina display: four
+    // texels are two points, and the glyph sits on a half point. The vertex
+    // shader scales the quad to whole device pixels and the fragment shader
+    // reads one texel each, so the result is bit-exact against the reference
+    // drawn from `Quad.scaled` -- the path the macOS window takes.
+    var gpu = try openGpu();
+    defer gpu.deinit();
+
+    var pixels: [16]u8 = @splat(0);
+    for (0..4) |i| pixels[i * 4 + i] = 255;
+    const atlas: ui.AtlasView = .{ .pixels = &pixels, .w = 4, .h = 4 };
+
+    const w = 12;
+    const h = 12;
+    const clear = ui.Color.hex(0x101010);
+    const fg = ui.Color.hex(0xE0C040);
+
+    var scene = ui.Scene.init(testing.allocator);
+    defer scene.deinit();
+    try scene.quads.append(testing.allocator, .{
+        .x = 1.5,
+        .y = 1,
+        .w = 2,
+        .h = 2,
+        .background = fg.pack(),
+        .border_color = 0,
+        .border_width = 0,
+        .corner_radius = 0,
+        .cx = 0,
+        .cy = 0,
+        .cw = w / 2,
+        .ch = h / 2,
+        .u0 = 0,
+        .v0 = 0,
+        .u1 = 4,
+        .v1 = 4,
+        .flags = .{ .textured = true },
+    });
+
+    var fb = try ui.Framebuffer.init(testing.allocator, w, h);
+    defer fb.deinit();
+    fb.clear(clear);
+    for (scene.items()) |q| ui.raster.drawQuad(&fb, q.scaled(2), atlas);
+
+    var target = try mtl.Target.init(&gpu, w, h);
+    defer target.deinit();
+    var renderer = try mtl.Renderer.initDefault(&gpu);
+    defer renderer.deinit();
+    try renderer.setAtlas(atlas);
+    try renderer.renderScaled(&target, &scene, clear, 2);
+
+    const got = target.pixels();
+    try testing.expectEqualSlices(u8, fb.px, got);
+    for (0..4) |i| {
+        const on = (2 + i) * w + (3 + i);
+        try testing.expectEqual(fg.r, got[on * 4 + 0]);
+        try testing.expectEqual(fg.r, fb.px[on * 4 + 0]);
+    }
+}
+
 test "the atlas can be replaced at a different size" {
     var gpu = try openGpu();
     defer gpu.deinit();

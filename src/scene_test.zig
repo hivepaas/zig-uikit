@@ -673,6 +673,65 @@ test "glyph quads follow their element's box, in its clip and its layer" {
     try testing.expectEqual(t.bounds(box).x + 2, q[1].x);
 }
 
+test "on a 2x display a glyph snaps to the device grid and scales exactly" {
+    // A glyph shaped for two pixels per unit: 3x1 texels, so 1.5 x 0.5 units,
+    // at a quarter-unit offset that no grid snaps to by itself.
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    // Padding a fraction of a unit wide puts the label off every grid.
+    const wrap = try t.appendChild(t.root(), .{ .padding = 10.3 });
+    const box = try t.appendChild(wrap, .{
+        .width = .{ .fixed = 20 },
+        .height = .{ .fixed = 4 },
+    });
+    const glyphs = [_]ui.Glyph{.{
+        .dx = 0.25,
+        .dy = 1,
+        .w = 1.5,
+        .h = 0.5,
+        .u0 = 0,
+        .v0 = 0,
+        .u1 = 3,
+        .v1 = 1,
+        .cluster = 0,
+        .pen_x = 0,
+    }};
+    try t.setText(box, .{ .glyphs = &glyphs, .width = 2, .ascent = 1.5, .descent = 0.5 });
+    t.setPaint(box, .{ .text_color = Color.white });
+    t.layout(.{ .w = 100, .h = 40 });
+    const origin = t.bounds(box).x;
+
+    var sc = Scene.init(testing.allocator);
+    defer sc.deinit();
+    _ = try sc.build(&t);
+    // One unit per pixel: whole units.
+    try testing.expectEqual(@round(origin + 0.25), sc.items()[0].x);
+
+    // Changing the scale changes nothing in the tree, and must still rebuild.
+    sc.setPixelScale(2);
+    const st = try sc.build(&t);
+    try testing.expect(st.rebuilt);
+    const g = sc.items()[0];
+    try testing.expectEqual(@round((origin + 0.25) * 2) / 2, g.x);
+
+    const d = g.scaled(2);
+    try testing.expectEqual(@round((origin + 0.25) * 2), d.x);
+    try testing.expectEqual(@as(f32, 3), d.w);
+    try testing.expectEqual(@as(f32, 1), d.h);
+
+    // And drawn at that scale, each texel is one device pixel.
+    const pixels = [_]u8{ 255, 0, 255 };
+    var fb = try Framebuffer.init(testing.allocator, 200, 80);
+    defer fb.deinit();
+    fb.clear(Color.black);
+    ui.raster.drawQuad(&fb, d, .{ .pixels = &pixels, .w = 3, .h = 1 });
+    const x0: u32 = @intFromFloat(d.x);
+    const y0: u32 = @intFromFloat(d.y);
+    try testing.expectEqual(@as(u8, 0), fb.at(x0 - 1, y0).r);
+    for (pixels, 0..) |cov, i| try testing.expectEqual(cov, fb.at(x0 + @as(u32, @intCast(i)), y0).r);
+    try testing.expectEqual(@as(u8, 0), fb.at(x0 + 3, y0).r);
+}
+
 test "a glyph samples exactly one texel per pixel" {
     // A 4x1 atlas with four distinct coverages, drawn as one 4x1 glyph at an
     // integral position. Each destination pixel must read its own texel: this

@@ -121,8 +121,12 @@ fragment float4 quad_fragment(Varyings in [[stage_in]],
         // rectangle -- the arithmetic `drawGlyph` in `src/raster.zig` does,
         // which is why the two agree exactly on text.
         //
-        // At a scale other than one this is wrong, and `Quad.scaled` asserts
-        // so: a glyph rasterised for one pixel per unit cannot cover two.
+        // At a scale other than one this holds only because the glyph was
+        // shaped for that scale: its quad is `texels / scale` units wide and
+        // snapped to the device grid, so `in.rect` -- already scaled above --
+        // is whole device pixels at the atlas rectangle's size. A glyph
+        // rasterised for one pixel per unit would cover half its quad and
+        // be discarded from the rest; `Quad.scaled` asserts against that.
         int2 t = int2(floor(p - in.rect.xy));
         if (t.x < 0 || t.y < 0 || t.x >= in.uv.z - in.uv.x || t.y >= in.uv.w - in.uv.y) discard_fragment();
         float cov = atlas.read(uint2(int2(in.uv.x, in.uv.y) + t)).r;

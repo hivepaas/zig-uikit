@@ -11,6 +11,12 @@
 //! scale factor. The tree is laid out in points and drawn at two pixels per
 //! point on a Retina display, so `--capture` compares the presented frame with
 //! the reference drawn at the same scale, not at one.
+//!
+//! Text follows the scale rather than being scaled: the fonts are opened for
+//! the window's backing scale (`Fonts.initScaled`), so a 13-point label is
+//! shaped and rasterised as a 26-pixel font and laid out as a 13-point one,
+//! and the scene snaps glyphs to the device grid. A window dragged to a
+//! display with a different scale reopens its fonts and rebuilds its tree.
 
 const std = @import("std");
 const ui = @import("zig-uikit");
@@ -23,7 +29,7 @@ const hover_tint = ui.Color.hex(0x3D4450);
 
 /// Compares the frame the window server was actually handed against the
 /// software reference, and writes it out.
-fn checkPresentedFrame(gpa: std.mem.Allocator, swapchain: *mtl.Swapchain, scene: *const ui.Scene) !void {
+fn checkPresentedFrame(gpa: std.mem.Allocator, swapchain: *mtl.Swapchain, scene: *const ui.Scene, atlas: ui.AtlasView) !void {
     const w = swapchain.extent.width;
     const h = swapchain.extent.height;
 
@@ -33,10 +39,14 @@ fn checkPresentedFrame(gpa: std.mem.Allocator, swapchain: *mtl.Swapchain, scene:
     var reference = try ui.Framebuffer.init(gpa, w, h);
     defer reference.deinit();
     reference.clear(bg);
-    // No atlas: the Metal backend has none yet, so this demo builds its
-    // interface with no text in it (see `demo.buildUi`) and there are no
-    // textured quads in the scene for the reference to need one for.
-    for (scene.items()) |q| ui.raster.drawQuad(&reference, q.scaled(swapchain.scale), null);
+    // The same scene scaled the way the vertex shader scales it. `scaled`
+    // checks that every glyph already sits on the device grid at its texel
+    // size, which is what shaping at the device size guarantees.
+    var glyphs: usize = 0;
+    for (scene.items()) |q| {
+        if (q.flags.textured) glyphs += 1;
+        ui.raster.drawQuad(&reference, q.scaled(swapchain.scale), atlas);
+    }
 
     var worst: u32 = 0;
     var over1: usize = 0;
@@ -56,13 +66,13 @@ fn checkPresentedFrame(gpa: std.mem.Allocator, swapchain: *mtl.Swapchain, scene:
     var fb: ui.Framebuffer = .{ .gpa = gpa, .w = w, .h = h, .px = rgba };
     try fb.writePng(threaded.io(), "docs/demo-window-macos.png");
     std.debug.print(
-        \\presented frame vs software reference, {d}x{d} pixels at scale {d}:
+        \\presented frame vs software reference, {d}x{d} pixels at scale {d}, {d} glyphs:
         \\  largest channel difference   {d}
         \\  pixels differing by > 1      {d}
         \\wrote docs/demo-window-macos.png
         \\
         \\
-    , .{ w, h, swapchain.scale, worst, over1 });
+    , .{ w, h, swapchain.scale, glyphs, worst, over1 });
 }
 
 /// `clock_gettime(MONOTONIC)` on macOS is only microsecond-resolution, which
@@ -105,13 +115,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var renderer = try mtl.Renderer.initDefault(&gpu);
     defer renderer.deinit();
 
+    var fonts = try demo.Fonts.initScaled(gpa, win.scale);
+    defer fonts.deinit();
+    var fonts_scale = win.scale;
+
     var t = try ui.Tree.init(gpa);
     defer t.deinit();
-    try demo.buildUi(&t, null);
+    try demo.buildUi(&t, &fonts);
     t.layout(viewport(win));
+    // Once, after the tree is built: nothing in the loop adds text, so nothing
+    // in the loop touches the atlas, except a change of display below.
+    try renderer.setAtlas(fonts.atlas.view());
 
     var scene = ui.Scene.init(gpa);
     defer scene.deinit();
+    scene.setPixelScale(win.scale);
 
     std.debug.print(
         \\{s}
@@ -155,6 +173,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 if (e == mtl.Error.SurfaceHasNoArea) continue;
                 return e;
             };
+            if (win.scale != fonts_scale) {
+                // A different display. The runs in the tree were shaped for
+                // the old one and their bitmaps are the wrong size, so the
+                // fonts, the atlas and the text all go. The tree is rebuilt
+                // rather than re-shaped label by label because the demo keeps
+                // no record of which string each label holds.
+                fonts.deinit();
+                fonts = try demo.Fonts.initScaled(gpa, win.scale);
+                fonts_scale = win.scale;
+                t.deinit();
+                t = try ui.Tree.init(gpa);
+                try demo.buildUi(&t, &fonts);
+                try renderer.setAtlas(fonts.atlas.view());
+                scene.setPixelScale(win.scale);
+            }
             t.layout(viewport(win));
             relayouts += 1;
             // The highlighted element may no longer be under the pointer, and
@@ -209,7 +242,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
 
         if (capture and frames == 9) {
-            try checkPresentedFrame(gpa, &swapchain, &scene);
+            try checkPresentedFrame(gpa, &swapchain, &scene, fonts.atlas.view());
             capture = false;
             if (sweep == 0) break;
         }

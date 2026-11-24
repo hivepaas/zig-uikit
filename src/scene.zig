@@ -136,17 +136,24 @@ pub const Quad = extern struct {
     /// this is for the software reference, so a Retina frame can be checked
     /// against the same scene the window laid out.
     ///
-    /// **A textured quad cannot be scaled**, and this asserts rather than
-    /// pretending otherwise. Its atlas rectangle is a fixed number of texels,
-    /// and the whole basis of how a glyph is sampled is that one destination
-    /// pixel reads one texel; doubling the destination and not the source
-    /// would leave half the glyph outside its own texel range and discarded.
-    /// The answer on a scaled display is to shape at the device pixel size --
-    /// a 13-point label on a 2x display is a 26-pixel font, not a 13-pixel one
-    /// drawn twice as large -- so a scene built for such a display has no
-    /// textured quad in layout units for this to be asked about.
+    /// **A glyph cannot be scaled**: its atlas rectangle is a fixed number of
+    /// texels, and the whole basis of how a glyph is sampled is that one
+    /// destination pixel reads one texel. Doubling the destination and not the
+    /// source would leave half the glyph outside its own texel range and
+    /// discarded. The answer on a scaled display is to shape at the device
+    /// pixel size -- a 13-point label on a 2x display is a 26-pixel font, not a
+    /// 13-pixel one drawn twice as large -- and a glyph shaped that way is
+    /// already `w * s` texels wide and snapped to the device grid. So a
+    /// textured quad is accepted exactly when scaling it lands it on whole
+    /// pixels at its texel size, and anything else is the bug this describes.
     pub fn scaled(self: Quad, s: f32) Quad {
-        std.debug.assert(!self.flags.textured);
+        if (self.flags.textured) {
+            const tol = 1e-3;
+            std.debug.assert(@abs(self.w * s - @as(f32, @floatFromInt(self.u1 - self.u0))) < tol);
+            std.debug.assert(@abs(self.h * s - @as(f32, @floatFromInt(self.v1 - self.v0))) < tol);
+            std.debug.assert(@abs(self.x * s - @round(self.x * s)) < tol);
+            std.debug.assert(@abs(self.y * s - @round(self.y * s)) < tol);
+        }
         var q = self;
         q.x *= s;
         q.y *= s;
@@ -158,6 +165,13 @@ pub const Quad = extern struct {
         q.cy *= s;
         q.cw *= s;
         q.ch *= s;
+        if (q.flags.textured) {
+            // Exact again after the asserts above allowed for rounding error.
+            q.x = @round(q.x);
+            q.y = @round(q.y);
+            q.w = @floatFromInt(q.u1 - q.u0);
+            q.h = @floatFromInt(q.v1 - q.v0);
+        }
         return q;
     }
 };
@@ -228,6 +242,14 @@ pub const Scene = struct {
     built_revision: u64 = 0,
     stats: Stats = .{},
 
+    /// Device pixels per layout unit, which is the grid glyph quads are snapped
+    /// to. Box quads do not care -- their edges are antialiased by the distance
+    /// field at any position -- but a glyph's bitmap was rasterised for whole
+    /// device pixels, so its quad has to land on them. Set it with
+    /// `setPixelScale`, which also forces the next build, and give the scene
+    /// text shaped for the same scale (`text.Library.openScaled`).
+    pixel_scale: f32 = 1,
+
     pub fn init(gpa: Allocator) Scene {
         return .{ .gpa = gpa };
     }
@@ -240,6 +262,15 @@ pub const Scene = struct {
         self.sorted_quads.deinit(self.gpa);
         self.sorted_owners.deinit(self.gpa);
         self.* = undefined;
+    }
+
+    pub fn setPixelScale(self: *Scene, s: f32) void {
+        std.debug.assert(s > 0);
+        if (s == self.pixel_scale) return;
+        self.pixel_scale = s;
+        // The tree has not changed, so its revision would let the next build
+        // return the quads snapped to the old grid. Revisions start at 1.
+        self.built_revision = 0;
     }
 
     pub fn items(self: *const Scene) []const Quad {
@@ -361,6 +392,7 @@ pub const Scene = struct {
                 // other overflow: it shows unless an ancestor clips it.
                 if (e.text.glyphs.len > 0) {
                     const fg = e.paint.text_color.pack();
+                    const ps = self.pixel_scale;
                     const ox = e.bounds.x + e.style.padding;
                     const oy = e.bounds.y + e.style.padding;
                     for (e.text.glyphs) |g| {
@@ -381,8 +413,11 @@ pub const Scene = struct {
                             // layout put it and makes it blurry. Every toolkit
                             // that does not do subpixel positioning makes the
                             // same trade.
-                            .x = @round(ox + g.dx),
-                            .y = @round(oy + g.dy),
+                            //
+                            // The grid is the device's, not the layout's: on a
+                            // 2x display a glyph may sit on a half point.
+                            .x = @round((ox + g.dx) * ps) / ps,
+                            .y = @round((oy + g.dy) * ps) / ps,
                             .w = g.w,
                             .h = g.h,
                             .background = fg,

@@ -84,6 +84,31 @@ pub const Library = struct {
     /// family that does not exist silently gives a different one -- that is
     /// fontconfig's entire purpose and not something to defeat here.
     pub fn open(self: *Library, gpa: Allocator, family: [:0]const u8, px: u16) Error!Font {
+        return self.openScaled(gpa, family, px, 1);
+    }
+
+    /// Opens a font for a display with `scale` pixels per layout unit: `size`
+    /// is in layout units, the face is rasterised at `size * scale` device
+    /// pixels, and every number a shaped run carries comes back in layout
+    /// units again.
+    ///
+    /// This is the answer `Quad.scaled` points at. A 13-point label on a 2x
+    /// display is a 26-pixel font, hinted and rasterised at 26 pixels, not a
+    /// 13-pixel bitmap stretched over twice the area -- which could not be
+    /// sampled one texel per pixel and would be blurry if it could. Layout
+    /// still sees a 13-point label, so a tree laid out for one display does not
+    /// change shape on another; only the bitmaps differ.
+    ///
+    /// Positions in the run are whole device pixels divided by `scale`, so they
+    /// are exact in binary for a scale of 2 but not, say, 1.5. The scene
+    /// builder therefore snaps to the device grid itself (`Scene.pixel_scale`)
+    /// rather than trusting the division to round-trip.
+    pub fn openScaled(self: *Library, gpa: Allocator, family: [:0]const u8, size: u16, scale: f32) Error!Font {
+        std.debug.assert(scale > 0);
+        const px_f = @round(@as(f32, @floatFromInt(size)) * scale);
+        if (px_f < 1 or px_f > std.math.maxInt(u16)) return Error.BadSize;
+        const px: u16 = @intFromFloat(px_f);
+
         const pat = c.FcNameParse(family.ptr) orelse return Error.NoSuchFont;
         defer c.FcPatternDestroy(pat);
         _ = c.FcConfigSubstitute(null, pat, c.FcMatchPattern);
@@ -122,6 +147,7 @@ pub const Library = struct {
             .hb = hb,
             .buf = c.hb_buffer_create() orelse return Error.OutOfMemory,
             .px = px,
+            .scale = scale,
             .path = owned_path,
             .ascent = f26dot6(m.ascender),
             .descent = -f26dot6(m.descender),
@@ -147,9 +173,14 @@ pub const Font = struct {
     /// Reused across calls. A HarfBuzz buffer holds the scratch arrays shaping
     /// needs, and recreating it per string would allocate on every keystroke.
     buf: *c.hb_buffer_t,
+    /// The size the face is rasterised at, in device pixels.
     px: u16,
+    /// Device pixels per layout unit; 1 unless opened with `openScaled`.
+    scale: f32 = 1,
     path: []u8,
 
+    /// These three are in device pixels, like everything FreeType and HarfBuzz
+    /// report. `height()` and the runs `shape` returns are in layout units.
     ascent: f32,
     descent: f32,
     /// The font's own preferred line spacing. Not used by a single-line run,
@@ -181,8 +212,9 @@ pub const Font = struct {
         self.* = undefined;
     }
 
+    /// Ascent plus descent, in layout units.
     pub fn height(self: *const Font) f32 {
-        return self.ascent + self.descent;
+        return (self.ascent + self.descent) / self.scale;
     }
 
     /// Shapes one line of UTF-8 and rasterises whatever is not already cached.
@@ -246,11 +278,26 @@ pub const Font = struct {
             pen_y -= f26dot6(pos.y_advance);
         }
 
+        // Everything above is device pixels. The run leaves in layout units,
+        // texel coordinates aside: those address the atlas, which is pixels by
+        // definition, and the scene builder relies on `w * scale` recovering
+        // the texel extent.
+        if (self.scale != 1) {
+            const inv = 1 / self.scale;
+            for (self.scratch.items) |*g| {
+                g.dx *= inv;
+                g.dy *= inv;
+                g.w *= inv;
+                g.h *= inv;
+                g.pen_x *= inv;
+            }
+        }
+
         return .{
             .glyphs = self.scratch.items,
-            .width = pen_x,
-            .ascent = self.ascent,
-            .descent = self.descent,
+            .width = pen_x / self.scale,
+            .ascent = self.ascent / self.scale,
+            .descent = self.descent / self.scale,
         };
     }
 
@@ -389,6 +436,46 @@ test "shaping produces glyphs, an advance, and an atlas that fills up" {
         try testing.expectEqual(@as(f32, @floatFromInt(g.v1 - g.v0)), g.h);
     }
     try testing.expect(atlas.used > 0);
+}
+
+test "a font opened for a 2x display is the device-size font, measured in layout units" {
+    var lib = try Library.init();
+    defer lib.deinit();
+    var device = try lib.open(testing.allocator, "sans", 26);
+    defer device.deinit();
+    var scaled = try lib.openScaled(testing.allocator, "sans", 13, 2);
+    defer scaled.deinit();
+    try testing.expectEqual(@as(u16, 26), scaled.px);
+    try testing.expectEqual(device.height() / 2, scaled.height());
+
+    var a1 = try Atlas.init(testing.allocator, 512, 512);
+    defer a1.deinit();
+    var a2 = try Atlas.init(testing.allocator, 512, 512);
+    defer a2.deinit();
+
+    const s = "tiếng Việt";
+    // Two fonts, two scratch buffers, so both runs stay valid together.
+    const want = try device.shape(&a1, s);
+    const got = try scaled.shape(&a2, s);
+    try testing.expectEqual(want.glyphs.len, got.glyphs.len);
+    try testing.expectEqual(want.width / 2, got.width);
+    try testing.expectEqual(want.ascent / 2, got.ascent);
+    try testing.expectEqual(want.descent / 2, got.descent);
+    for (want.glyphs, got.glyphs) |w, g| {
+        // The same bitmap, hinted at 26 pixels, in the same atlas place...
+        try testing.expectEqual(w.u0, g.u0);
+        try testing.expectEqual(w.v0, g.v0);
+        try testing.expectEqual(w.u1, g.u1);
+        try testing.expectEqual(w.v1, g.v1);
+        try testing.expectEqual(w.cluster, g.cluster);
+        // ...at half the distance, so that layout sees a 13-point label.
+        try testing.expectEqual(w.dx / 2, g.dx);
+        try testing.expectEqual(w.dy / 2, g.dy);
+        try testing.expectEqual(w.w / 2, g.w);
+        try testing.expectEqual(w.h / 2, g.h);
+        try testing.expectEqual(w.pen_x / 2, g.pen_x);
+    }
+    try testing.expectEqualSlices(u8, a1.pixels, a2.pixels);
 }
 
 test "clusters are byte offsets into the string that was shaped" {

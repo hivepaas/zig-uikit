@@ -106,13 +106,21 @@ pub const Fonts = struct {
     atlas: text.Atlas,
 
     pub fn init(gpa: std.mem.Allocator) !Fonts {
+        return initScaled(gpa, 1);
+    }
+
+    /// The same three fonts for a display with `scale` pixels per point: the
+    /// sizes stay 13, 13 and 22 points and the bitmaps are rasterised at the
+    /// device size, so the atlas grows with the square of the scale.
+    pub fn initScaled(gpa: std.mem.Allocator, scale: f32) !Fonts {
         var lib = try text.Library.init();
+        const side: u16 = @intFromFloat(512 * @ceil(scale));
         return .{
             .lib = lib,
-            .ui = try lib.open(gpa, "sans", 13),
-            .strong = try lib.open(gpa, "sans:bold", 13),
-            .big = try lib.open(gpa, "sans:bold", 22),
-            .atlas = try text.Atlas.init(gpa, 512, 512),
+            .ui = try lib.openScaled(gpa, "sans", 13, scale),
+            .strong = try lib.openScaled(gpa, "sans:bold", 13, scale),
+            .big = try lib.openScaled(gpa, "sans:bold", 22, scale),
+            .atlas = try text.Atlas.init(gpa, side, side),
         };
     }
 
@@ -134,9 +142,9 @@ pub const Fonts = struct {
 /// alive on a row that overflows; see `Style.flex_shrink`.
 ///
 /// With no fonts, it draws the grey bar a design tool uses where text will go.
-/// That path exists for the Metal backend, which has no glyph atlas yet: a
-/// textured quad there would be drawn by the rounded-rectangle branch of its
-/// shader, which is a picture of a bug rather than a picture of missing text.
+/// Both backends draw text now, so nothing in the repository asks for that;
+/// it stays because `buildUi(t, null)` is the interface with no font
+/// dependency at all, which is a useful thing to be able to lay out.
 fn label(t: *Tree, parent: Index, f: ?*text.Font, atlas: ?*text.Atlas, s: []const u8, c: Color) !Index {
     if (f == null or atlas == null) {
         const w = @as(f32, @floatFromInt(std.unicode.utf8CountCodepoints(s) catch s.len)) * 6;
