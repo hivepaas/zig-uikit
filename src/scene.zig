@@ -85,6 +85,25 @@ pub const Quad = extern struct {
     pub fn clipRect(self: Quad) Rect {
         return .{ .x = self.cx, .y = self.cy, .w = self.cw, .h = self.ch };
     }
+
+    /// The quad with every length multiplied by `s`: what a renderer draws for
+    /// a display with `s` pixels per layout unit. Renderers do this on the GPU;
+    /// this is for the software reference, so a Retina frame can be checked
+    /// against the same scene the window laid out.
+    pub fn scaled(self: Quad, s: f32) Quad {
+        var q = self;
+        q.x *= s;
+        q.y *= s;
+        q.w *= s;
+        q.h *= s;
+        q.border_width *= s;
+        q.corner_radius *= s;
+        q.cx *= s;
+        q.cy *= s;
+        q.cw *= s;
+        q.ch *= s;
+        return q;
+    }
 };
 
 comptime {

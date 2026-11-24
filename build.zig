@@ -46,6 +46,26 @@ pub fn build(b: *std.Build) void {
     const run_bench = b.addRunArtifact(bench);
     b.step("bench", "Measure scene build and raster cost").dependOn(&run_bench.step);
 
+    // The platform layer. One set of step names, and the backend behind them
+    // follows the target: Vulkan and Wayland on Linux, Metal and AppKit on
+    // macOS. `zig build window` means the same thing on both.
+    switch (target.result.os.tag) {
+        .macos => addMacos(b, target, optimize, mod),
+        else => addLinux(b, target, optimize, mod),
+    }
+
+    const tests = b.addTest(.{ .root_module = mod });
+    const run_tests = b.addRunArtifact(tests);
+    b.step("test", "Run the layout tests").dependOn(&run_tests.step);
+    b.getInstallStep().dependOn(&run_tests.step);
+}
+
+fn addLinux(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    mod: *std.Build.Module,
+) void {
     // --- the Vulkan backend ---
     //
     // A separate module on purpose. The library above has no platform
@@ -139,16 +159,108 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zig-uikit", .module = mod },
-                .{ .name = "zig-uikit-vulkan", .module = gpu_mod },
+                .{ .name = "gpu", .module = gpu_mod },
             },
         }),
     });
     const run_gpu_demo = b.addRunArtifact(gpu_demo);
     b.step("gpu-demo", "Render the demo on the GPU and diff it against the software reference")
         .dependOn(&run_gpu_demo.step);
+}
 
-    const tests = b.addTest(.{ .root_module = mod });
-    const run_tests = b.addRunArtifact(tests);
-    b.step("test", "Run the layout tests").dependOn(&run_tests.step);
-    b.getInstallStep().dependOn(&run_tests.step);
+/// Metal and AppKit, both reached through the Objective-C runtime: there is no
+/// translate-c step, because Zig cannot read Objective-C headers, and no
+/// shader compiler, because the Metal source is compiled at run time. Building
+/// for macOS needs the SDK's frameworks and nothing else.
+fn addMacos(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    mod: *std.Build.Module,
+) void {
+    const objc_mod = b.addModule("zig-uikit-objc", .{
+        .root_source_file = b.path("src/platform/objc.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    objc_mod.linkSystemLibrary("objc", .{ .use_pkg_config = .no });
+    objc_mod.linkFramework("Foundation", .{});
+
+    const metal_mod = b.addModule("zig-uikit-metal", .{
+        .root_source_file = b.path("src/gpu/metal.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{
+            .{ .name = "zig-uikit", .module = mod },
+            .{ .name = "objc", .module = objc_mod },
+        },
+    });
+    metal_mod.linkFramework("Metal", .{});
+    metal_mod.linkFramework("QuartzCore", .{});
+    metal_mod.linkFramework("CoreGraphics", .{});
+
+    // The window knows nothing about Metal beyond creating the layer it will
+    // be drawn into, as the Wayland window knows nothing about Vulkan beyond
+    // handing over a surface.
+    const appkit_mod = b.addModule("zig-uikit-macos", .{
+        .root_source_file = b.path("src/platform/macos.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "objc", .module = objc_mod }},
+    });
+    appkit_mod.linkFramework("AppKit", .{});
+    appkit_mod.linkFramework("QuartzCore", .{});
+
+    const window_demo = b.addExecutable(.{
+        .name = "window_demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/window_demo_macos.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zig-uikit", .module = mod },
+                .{ .name = "zig-uikit-metal", .module = metal_mod },
+                .{ .name = "zig-uikit-macos", .module = appkit_mod },
+            },
+        }),
+    });
+    b.installArtifact(window_demo);
+    const run_window_demo = b.addRunArtifact(window_demo);
+    b.step("window", "Open a window and render the demo on the GPU").dependOn(&run_window_demo.step);
+
+    const gpu_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu/metal_test.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zig-uikit", .module = mod },
+                .{ .name = "objc", .module = objc_mod },
+            },
+        }),
+    });
+    gpu_tests.root_module.linkFramework("Metal", .{});
+    gpu_tests.root_module.linkFramework("QuartzCore", .{});
+    gpu_tests.root_module.linkFramework("CoreGraphics", .{});
+    const run_gpu_tests = b.addRunArtifact(gpu_tests);
+    b.step("test-gpu", "Run the tests that need a Metal device").dependOn(&run_gpu_tests.step);
+
+    const gpu_demo = b.addExecutable(.{
+        .name = "gpu_demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/gpu_demo.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zig-uikit", .module = mod },
+                .{ .name = "gpu", .module = metal_mod },
+            },
+        }),
+    });
+    const run_gpu_demo = b.addRunArtifact(gpu_demo);
+    b.step("gpu-demo", "Render the demo on the GPU and diff it against the software reference")
+        .dependOn(&run_gpu_demo.step);
 }

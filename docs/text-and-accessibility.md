@@ -226,7 +226,10 @@ on Windows.
 
 - **macOS.** `NSTextInputClient` and `NSAccessibility` are unexamined. Zig has no
   Objective-C support, so both require runtime class registration through
-  `objc_msgSend` — a different order of effort from the C APIs above.
+  `objc_msgSend` — a different order of effort from the C APIs above. That
+  mechanism now exists in `src/platform/objc.zig` and runs: the macOS window's
+  delegate is a class defined at run time. The protocols themselves are the
+  next spikes.
 - **X11.** XIM or ibus over DBus, a separate problem of similar size to spike B.
 - **Provider lifetimes** (§5), the largest gap.
 - **Text layout** (§7), which everything in §1 and §7 ultimately depends on.

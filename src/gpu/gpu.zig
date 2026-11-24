@@ -3,6 +3,10 @@
 const vulkan = @import("vulkan.zig");
 const swapchain = @import("swapchain.zig");
 
+/// Written into `docs/` file names by `tools/gpu_demo.zig`, which is shared
+/// with the Metal backend.
+pub const backend_name = "vulkan";
+
 pub const Error = vulkan.Error;
 pub const Gpu = vulkan.Gpu;
 pub const Target = vulkan.Target;

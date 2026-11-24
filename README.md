@@ -3,17 +3,21 @@
 A declarative GPU UI toolkit for Zig.
 
 > **Status: pre-alpha.** The layout core, the scene layer, a Vulkan renderer
-> and a Wayland window exist and are tested. There is no text and there are no
-> widgets. Expect the API to change without notice.
+> with a Wayland window, and a Metal renderer with a macOS window exist and are
+> tested. There is no text and there are no widgets. Expect the API to change
+> without notice.
 
 ```sh
 zig build test                           # 46 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
-zig build test-gpu                       # 5 tests, needs a Vulkan device
+zig build test-gpu                       # Vulkan: 5 tests; Metal: 8 tests
 zig build gpu-demo                       # renders on the GPU, diffs against the reference
 zig build window                         # opens a window and renders into it
 ```
+
+The last three follow the target: Vulkan and Wayland on Linux, Metal and
+AppKit on macOS.
 
 ![a window's worth of interface, rendered by the software rasteriser](docs/demo.png)
 
@@ -224,6 +228,98 @@ swaps red and blue on the way in, which is cheaper than doing it per pixel and
 far cheaper than shipping a picture with the channels crossed.
 
 ![the frame the compositor was handed](docs/demo-window.png)
+
+## macOS
+
+Metal and AppKit, both reached through the Objective-C runtime: Zig cannot read
+Objective-C headers, so every call is `objc_msgSend` cast to the method's C
+signature, in [src/platform/objc.zig](src/platform/objc.zig). The window
+delegate is a class **defined at run time** with Zig functions as its methods,
+which is the mechanism `NSTextInputClient` and `NSAccessibility` will need; it
+is done first where it is two methods long.
+
+Metal rather than MoltenVK: MoltenVK would have reused the Vulkan backend
+unchanged, at the price of a dependency not on a stock Mac and a translation
+layer in front of the only GPU API Apple supports. The `CAMetalLayer` Metal
+presents into is also the layer tier C composes native views beside, so it had
+to be understood directly either way.
+
+The Metal backend exposes the same offscreen surface as the Vulkan one, so
+`tools/gpu_demo.zig` is one program for both. On an Apple M1 Pro:
+
+```
+GPU vs software reference, 504000 pixels:
+  largest channel difference   1
+  mean channel difference      0.0008
+  pixels differing by > 1      0 (0.000%)
+```
+
+The same figures as RADV, to four decimal places. The shader is a third
+transcription of the distance field, in Metal Shading Language, and **fast math
+is turned off** for it: Metal enables it by default, and it licenses the
+compiler to disagree with IEEE 754 in exactly the way a reference comparison
+exists to catch.
+
+The window is Retina, which Wayland's was not: the tree is laid out in
+**points**, the drawables are two pixels per point, and the vertex shader scales
+every length in the quad so the distance field is evaluated in pixels.
+`--capture` compares the presented 1800x1120 frame against the reference drawn
+at the same scale: **largest channel difference 1**, and still 1 after the
+window is resized.
+
+![the frame the window server was handed, at two pixels per point](docs/demo-window-macos.png)
+
+`./zig-out/bin/window_demo --sweep` built with `-Doptimize=ReleaseFast`:
+
+```
+180 frames in 1.51 s (119.4 per second; pacing is the display's, there is no sleep)
+  frames that did any layout work   0 (0.0%)
+  frames that rebuilt the scene     25 (13.9%)
+  mean CPU on the 155 frames that changed nothing   1306 ns
+```
+
+Pacing is the 120 Hz display's: `nextDrawable` blocks when every drawable is
+queued, which is FIFO present by another name. The layout counter is the same
+zero as on Linux.
+
+### Three things the Mac measured that were not expected
+
+**The idle frame is cold cache, not work.** 1.3 us is five times the Linux
+figure, so it was taken apart. Not the clock: macOS's `clock_gettime(MONOTONIC)`
+turned out to have microsecond resolution, which is why the demos use
+`CLOCK_UPTIME_RAW`. Not the scheduler: the thread is already at
+user-interactive QoS. Running the same hit test, flush and scene build a
+*second* time inside the same frame costs **130-153 ns**, against 1 500-2 000 ns
+for the first pass. About 90% of the idle frame is the caches and branch
+predictors the event pump and the Metal calls left behind. The toolkit's own
+work is the 130 ns.
+
+**Channel order is a name, not a reordering.** A `CAMetalLayer` offers
+`BGRA8Unorm` and no eight-bit RGBA format, so every Mac meets the case the
+Vulkan backend handles by swapping red and blue in the shader. Doing the same
+here makes the presented frame differ from the reference by **208 of 255 on
+98.5% of its pixels**: a format names channels, and the shader's red lands in
+the red channel wherever the format stores it. Only the copy out to RGBA swaps.
+
+**Not needing a shader compiler moves the cost to start-up.** The Metal source
+is compiled by `newLibraryWithSource:` at run time, because the build should
+need nothing beyond the SDK, and in Xcode 26 the Metal compiler is a separate
+download. A cold compile is **43-47 ms** (238 ms the first time the compiler
+service itself starts); once the system's shader cache has it, **0.6 ms**.
+Shipping a precompiled `.metallib` is the fix when it matters, and is not done
+yet.
+
+### Not done on macOS
+
+- Live resize. While the user drags a window edge AppKit runs its own event
+  loop inside `sendEvent:`, and this loop does not draw until it returns.
+  Untested; rendering from the resize callback or a display link is the fix.
+- `NSTextInputClient` and `NSAccessibility` — the spikes Linux and Windows have.
+- Intel Macs. The `objc_msgSend_stret` path for large struct returns compiles
+  and has never run.
+- `tools/window_demo_macos.zig` duplicates the loop in `window_demo.zig`. They
+  should become one program over a platform interface once there is a third
+  platform to tell what that interface is.
 
 ## What it is meant to be
 

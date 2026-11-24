@@ -38,7 +38,13 @@ const cells_per_row = 3;
 
 const viewport: ui.Size = .{ .w = 1600, .h = 1000 };
 
+// macOS's `clock_gettime(MONOTONIC)` has microsecond resolution, too coarse
+// for figures in nanoseconds; `CLOCK_UPTIME_RAW` through the `_nsec_np` variant
+// is `mach_absolute_time` in nanoseconds.
+extern "c" fn clock_gettime_nsec_np(clock: std.c.clockid_t) u64;
+
 fn nowNs() u64 {
+    if (builtin.os.tag == .macos) return clock_gettime_nsec_np(.UPTIME_RAW);
     var ts: std.os.linux.timespec = undefined;
     _ = std.os.linux.clock_gettime(.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * 1_000_000_000 + @as(u64, @intCast(ts.nsec));

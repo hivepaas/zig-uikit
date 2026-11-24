@@ -1,5 +1,10 @@
-//! Renders the demo interface twice -- once through the Vulkan backend and
-//! once through the software reference rasteriser -- and compares every pixel.
+//! Renders the demo interface twice -- once through the GPU backend and once
+//! through the software reference rasteriser -- and compares every pixel.
+//!
+//! The backend is whichever one the target has, Vulkan or Metal, imported as
+//! `gpu`. They expose the same offscreen surface for exactly this reason: one
+//! comparison program, not one per backend that could quietly stop checking
+//! the same thing.
 //!
 //! This is the test that the GPU shader and `src/raster.zig` have not drifted.
 //! They are two implementations of one signed distance field, written in two
@@ -19,7 +24,11 @@
 
 const std = @import("std");
 const ui = @import("zig-uikit");
-const vk = @import("zig-uikit-vulkan");
+const vk = @import("gpu");
+
+/// The Vulkan run writes the file names the README quotes; any other backend
+/// writes beside them rather than over them.
+const suffix = if (std.mem.eql(u8, vk.backend_name, "vulkan")) "" else "-" ++ vk.backend_name;
 const demo = @import("demo.zig");
 
 const width = 900;
@@ -50,7 +59,7 @@ pub fn main() !void {
     // --- the GPU ---
     var gpu = vk.Gpu.init(gpa, .{}) catch |e| {
         var buf: [128]u8 = undefined;
-        std.debug.print("no usable Vulkan device: {s} ({s})\n", .{ @errorName(e), vk.lastErrorMessage(&buf) });
+        std.debug.print("no usable {s} device: {s} ({s})\n", .{ vk.backend_name, @errorName(e), vk.lastErrorMessage(&buf) });
         return e;
     };
     defer gpu.deinit();
@@ -70,6 +79,13 @@ pub fn main() !void {
         return e;
     };
     defer renderer.deinit();
+    // Metal compiles its shader at run time; say what that costs, since it is
+    // the price of the build needing no shader compiler.
+    if (@hasField(vk.Renderer, "compile_ns")) {
+        std.debug.print("shader compiled at start-up in {d:.1} ms\n\n", .{
+            @as(f64, @floatFromInt(renderer.compile_ns)) / 1e6,
+        });
+    }
     try renderer.render(&target, &scene, bg);
 
     // --- compare ---
@@ -116,9 +132,9 @@ pub fn main() !void {
         over8, 100 * @as(f64, @floatFromInt(over8)) / @as(f64, @floatFromInt(total)),
     });
 
-    try writePng(gpa, io, gpu_px, "docs/demo-gpu.png");
-    try writePng(gpa, io, diff, "docs/demo-diff.png");
-    std.debug.print("wrote docs/demo-gpu.png and docs/demo-diff.png\n", .{});
+    try writePng(gpa, io, gpu_px, "docs/demo-gpu" ++ suffix ++ ".png");
+    try writePng(gpa, io, diff, "docs/demo-diff" ++ suffix ++ ".png");
+    std.debug.print("wrote docs/demo-gpu{s}.png and docs/demo-diff{s}.png\n", .{ suffix, suffix });
 }
 
 fn writePng(gpa: std.mem.Allocator, io: std.Io, rgba: []const u8, path: []const u8) !void {
