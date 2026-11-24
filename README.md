@@ -59,8 +59,14 @@ with the premise of this project, that repo is where to start.
   there is one widget set and not two, and the three tiers "native" actually
   decomposes into.
 
-Tier A of that note is load-bearing, so it is being tested before any widget
-code exists:
+- [Text and accessibility: constraints from four working spikes](docs/text-and-accessibility.md)
+  — the specification the spikes produced. Eight numbered requirements, each one
+  measured rather than read out of a protocol document, plus what they do not
+  settle.
+
+Tier A of that note is load-bearing, so it was tested before any widget code
+exists. Four spikes implement it twice over, on Linux and Windows, far enough
+that a screen reader reads the tree and an input method composes text:
 
 - [spikes/ime-wayland](spikes/ime-wayland/) — `zwp_text_input_v3`. Vietnamese
   Telex composes correctly and byte-exactly; `delete_surrounding_text` is still
