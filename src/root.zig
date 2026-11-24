@@ -44,6 +44,7 @@ pub const Style = style.Style;
 pub const Sizing = style.Sizing;
 pub const Justify = style.Justify;
 pub const AlignItems = style.AlignItems;
+pub const Position = style.Position;
 
 pub const Color = paint.Color;
 pub const Paint = paint.Paint;

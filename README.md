@@ -144,6 +144,47 @@ first overflowing child painted straight over the border meant to contain it.
 CSS clips to the padding box. Both now have regression tests, but neither was
 going to be found by writing more assertions.
 
+### Out of flow
+
+`position: .absolute` takes an element out of its parent's flow and places it
+at `left`/`top` from the parent's content origin. It contributes nothing to its
+parent's content size and nothing to its siblings' arithmetic, and they
+contribute nothing to it.
+
+It exists because the alternative was being written over and over. A caret, a
+selection highlight, a preedit underline and a popover were each **four layout
+elements** — a zero-width anchor, a spacer whose *width* was the x coordinate,
+a column, and a spacer whose *height* was the y — with a comment at every site
+naming the feature that was missing. Five such sites, and the demo was 201
+layout elements for 71 things a person would name. It is 172 now.
+
+And it changes what a caret costs, which matters because a caret moves on
+every keystroke. Measured on the same 1 649-element tree, both shapes built
+side by side so the comparison is a ratio and not two sessions:
+
+| moving a caret by one pixel | | |
+| --- | --- | --- |
+| a spacer's width | 71.7 ns | 8.0 units of layout work |
+| an out-of-flow element | **22.8 ns** | **2.0 units** |
+
+A spacer's width is a size change, so it climbs: the anchor's content size
+changes, then the row's, and the row re-runs. An out-of-flow element cannot
+change anything above it, so `flushElement` recomputes it, places it, and
+stops — which is the one special case the feature adds to the layout engine.
+
+Two deliberate differences from CSS. The offsets are relative to the **parent**
+and not to a "nearest positioned ancestor": that rule is for documents, where
+the thing you position against is often far up the tree, and here the parent is
+the thing the overlay belongs to. And `grow` out of flow means "fill what is
+left after the offset" rather than "take a share of the free space", because
+there are no siblings to share with — a backdrop behind a popover wants exactly
+that.
+
+One thing a caller has to know: an out-of-flow child is **not** centred by its
+parent's `align_items`, so whatever places it says where it goes. The demo's
+overlays compute their vertical offset from the field's content height for
+that reason, and a test pins it.
+
 ### A known divergence from CSS
 
 `align_items` defaults to `start` here, where CSS defaults it to `stretch`. Every
@@ -344,11 +385,12 @@ The demo draws a selection and a caret from those functions, and the first
 render of it was wrong in a way worth keeping here. The highlight has to be a
 preceding sibling of the label — the scene builder paints a box, then its
 glyphs, then its children, so there is no way to put a rectangle behind an
-element's *own* text — and the anchor holding it was given zero height. Under
+element's *own* text — and back when an overlay was a stack of four layout
+elements, the anchor holding it was given zero height. Under
 `align_items: .center` a zero-height element is centred as a point, so its
 children hung down from the middle of the row instead of sitting behind the
-text. Giving the anchor the run's height fixed it. That the demo is a picture
-is the only reason it was noticed.
+text. That the demo is a picture is the only reason it was noticed. The whole
+stack is one out-of-flow element now; see "Out of flow".
 
 ### The document, and the trap in designing it Wayland-first
 
@@ -634,11 +676,9 @@ three scripted keystrokes in: a space, an em dash and a space, typed into a
 field that started out holding `Gõ vào đây: tiếng Việt`. Both the typed frame
 and the untouched one were captured out of the swapchain and diffed against the
 software rasteriser: **largest channel difference 1**, including the em dash
-that had just been rasterised into the atlas. The caret
-is a one-pixel box moved by changing a spacer's width, which is the
-absolute-positioning workaround showing up for the fourth time; it means every
-caret move is a frame that did layout work, and the counters say so rather than
-hiding it.
+that had just been rasterised into the atlas. The caret is a one-pixel
+out-of-flow box; moving it costs one element's worth of layout work and does
+not touch the line it sits over.
 
 ### What the keyboard does not do yet
 
@@ -1256,12 +1296,12 @@ parent, children, index, stable id — in core, with no platform in it, and
 `NSAccessibilityElement`s defined at run time.
 
 It is **a separate tree from layout**, by registration rather than by
-derivation. The demo's caret is three layout elements and a row of cards has
-a container whose only job is a gap; a screen reader walking layout would
-announce all of them. So the builder registers the elements a person would
+derivation. A row of cards has a container whose only job is a gap, and a
+field has a caret and a selection highlight that are boxes and not things; a
+screen reader walking layout would announce all of them. So the builder registers the elements a person would
 name — labels as static text, cards as groups, the button, the typeable field
 as a text field backed by its `Document` — and a node's parent is its nearest
-registered layout ancestor. The demo has 201 layout elements and 71
+registered layout ancestor. The demo has 172 layout elements and 71
 accessible nodes. Bounds are not stored: a node names its element and
 reads layout when asked, so a relayout cannot leave it describing where things
 were. Ids are slots and are never reused.

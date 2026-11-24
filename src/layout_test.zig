@@ -86,8 +86,6 @@ test "an overflowing child does not enlarge its line" {
     try testing.expectEqual(@as(f32, 28), t.bounds(row).h);
 }
 
-
-
 test "a column stacks children and sums their heights" {
     var t = try Tree.init(testing.allocator);
     defer t.deinit();
@@ -395,7 +393,7 @@ test "randomised: incremental always matches full" {
     while (seed < 24) : (seed += 1) {
         var prng = std.Random.DefaultPrng.init(seed);
         const r = prng.random();
-        const topo: topologies = @enumFromInt(seed % 4);
+        const topo: topologies = @fromBackingInt(@intCast(seed % 4));
 
         var t = try Tree.init(testing.allocator);
         defer t.deinit();
@@ -436,8 +434,8 @@ test "randomised: incremental always matches full" {
                 .flex_shrink = if (r.uintLessThan(u32, 3) == 0) 0 else 1,
                 .padding = @floatFromInt(r.uintLessThan(u32, 5)),
                 .gap = @floatFromInt(r.uintLessThan(u32, 4)),
-                .justify = @enumFromInt(r.uintLessThan(u8, 4)),
-                .align_items = @enumFromInt(r.uintLessThan(u8, 5)),
+                .justify = @fromBackingInt(@intCast(r.uintLessThan(u8, 4))),
+                .align_items = @fromBackingInt(@intCast(r.uintLessThan(u8, 5))),
             };
             const el = try t.appendChild(parent, s);
             if (leafish) try leaves.append(testing.allocator, el);
@@ -577,4 +575,288 @@ fn randomJustify(rnd: std.Random) ui.Justify {
         2 => .end,
         else => .space_between,
     };
+}
+
+// ------------------------------------------------------- out-of-flow children
+//
+// `position: .absolute` exists to delete a trick, and these pin both halves of
+// it: that an out-of-flow child is placed where it says and that it is
+// invisible to everything else. The second half is the one that is easy to
+// half-implement -- a popover that quietly enlarges the toolbar it hangs off
+// is no better than the zero-width anchor it replaces.
+
+test "an out-of-flow child does not change its parent's content size" {
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    try t.setStyle(t.root(), .{ .axis = .row, .padding = 10 });
+
+    const row = try t.appendChild(t.root(), .{ .axis = .row, .gap = 4, .padding = 6 });
+    _ = try t.appendChild(row, .{ .width = .{ .fixed = 20 }, .height = .{ .fixed = 20 } });
+    _ = try t.appendChild(row, .{ .width = .{ .fixed = 30 }, .height = .{ .fixed = 20 } });
+    t.layout(viewport);
+    const before = t.bounds(row);
+
+    // Much larger than the row, and out of flow.
+    _ = try t.appendChild(row, .{
+        .position = .absolute,
+        .left = 4,
+        .top = 2,
+        .width = .{ .fixed = 400 },
+        .height = .{ .fixed = 300 },
+    });
+    t.layout(viewport);
+
+    try testing.expectEqual(before.w, t.bounds(row).w);
+    try testing.expectEqual(before.h, t.bounds(row).h);
+}
+
+test "an out-of-flow child is placed from the parent's content origin" {
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    const panel = try t.appendChild(t.root(), .{
+        .axis = .col,
+        .padding = 8,
+        .width = .{ .fixed = 200 },
+        .height = .{ .fixed = 100 },
+    });
+    const box = try t.appendChild(panel, .{
+        .position = .absolute,
+        .left = 30,
+        .top = 5,
+        .width = .{ .fixed = 12 },
+        .height = .{ .fixed = 3 },
+    });
+    t.layout(viewport);
+
+    const p = t.bounds(panel);
+    const b = t.bounds(box);
+    // Content origin, so the parent's padding counts once and the offsets are
+    // measured from inside it.
+    try testing.expectEqual(p.x + 8 + 30, b.x);
+    try testing.expectEqual(p.y + 8 + 5, b.y);
+    try testing.expectEqual(@as(f32, 12), b.w);
+    try testing.expectEqual(@as(f32, 3), b.h);
+}
+
+test "flow siblings are laid out as if it were not there" {
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+
+    // The same row twice, once with an out-of-flow child in the middle of the
+    // sibling list and once without, and every flow child must land in the
+    // same place.
+    const plain = try t.appendChild(t.root(), .{ .axis = .row, .gap = 5 });
+    const a1 = try t.appendChild(plain, .{ .width = .{ .fixed = 10 }, .height = .{ .fixed = 10 } });
+    const b1 = try t.appendChild(plain, .{ .width = .{ .fixed = 10 }, .height = .{ .fixed = 10 } });
+
+    const mixed = try t.appendChild(t.root(), .{ .axis = .row, .gap = 5 });
+    const a2 = try t.appendChild(mixed, .{ .width = .{ .fixed = 10 }, .height = .{ .fixed = 10 } });
+    _ = try t.appendChild(mixed, .{
+        .position = .absolute,
+        .left = 100,
+        .width = .{ .fixed = 50 },
+        .height = .{ .fixed = 50 },
+    });
+    const b2 = try t.appendChild(mixed, .{ .width = .{ .fixed = 10 }, .height = .{ .fixed = 10 } });
+    t.layout(viewport);
+
+    try testing.expectEqual(t.bounds(a1).x - t.bounds(plain).x, t.bounds(a2).x - t.bounds(mixed).x);
+    try testing.expectEqual(t.bounds(b1).x - t.bounds(plain).x, t.bounds(b2).x - t.bounds(mixed).x);
+}
+
+test "out of flow, grow fills what is left after the offset" {
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    const panel = try t.appendChild(t.root(), .{
+        .padding = 4,
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 60 },
+    });
+    const fill = try t.appendChild(panel, .{
+        .position = .absolute,
+        .left = 20,
+        .top = 10,
+        .width = .{ .grow = 1 },
+        .height = .{ .grow = 1 },
+    });
+    t.layout(viewport);
+
+    // The content box is 92x52; from (20, 10) that leaves 72x42.
+    try testing.expectEqual(@as(f32, 72), t.bounds(fill).w);
+    try testing.expectEqual(@as(f32, 42), t.bounds(fill).h);
+}
+
+test "an out-of-flow child is not centred by its parent's alignment" {
+    // Worth pinning because it is a difference callers have to know about: a
+    // row that centres its children does not centre this one, and whatever
+    // places it has to say where it goes. That is what "out of flow" means,
+    // and the demo's overlays compute the offset for exactly this reason.
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    const row = try t.appendChild(t.root(), .{
+        .axis = .row,
+        .align_items = .center,
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 40 },
+    });
+    const box = try t.appendChild(row, .{
+        .position = .absolute,
+        .width = .{ .fixed = 10 },
+        .height = .{ .fixed = 10 },
+    });
+    t.layout(viewport);
+    try testing.expectEqual(t.bounds(row).y, t.bounds(box).y);
+}
+
+test "moving an out-of-flow child costs one element and no sibling moves" {
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    const field = try t.appendChild(t.root(), .{
+        .axis = .row,
+        .padding = 8,
+        .gap = 4,
+        .width = .{ .fixed = 300 },
+        .height = .{ .fixed = 34 },
+    });
+    const caret = try t.appendChild(field, .{
+        .position = .absolute,
+        .left = 0,
+        .width = .{ .fixed = 1 },
+        .height = .{ .fixed = 18 },
+    });
+    const label = try t.appendChild(field, .{ .width = .{ .fixed = 120 }, .height = .{ .fixed = 18 } });
+    t.layout(viewport);
+
+    const label_was = t.bounds(label);
+    const field_was = t.bounds(field);
+
+    var s = t.style(caret);
+    s.left = 77;
+    try t.setStyle(caret, s);
+    const stats = t.flush();
+
+    try testing.expectEqual(field_was.x + 8 + 77, t.bounds(caret).x);
+    // Nothing else moved, and nothing was laid out the slow way.
+    try testing.expect(Rect.eql(label_was, t.bounds(label)));
+    try testing.expect(Rect.eql(field_was, t.bounds(field)));
+    try testing.expectEqual(@as(u32, 0), stats.slow_path);
+    try testing.expectEqual(@as(u32, 0), stats.full_layouts);
+    // One element recomputed, one placed. A spacer standing in for the same x
+    // coordinate was a size change that climbed to the row and re-ran it.
+    try testing.expect(stats.total() <= 3);
+
+    try expectIncrementalMatchesFull(&t);
+}
+
+test "a subtree under an out-of-flow element moves with it" {
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    const panel = try t.appendChild(t.root(), .{
+        .width = .{ .fixed = 200 },
+        .height = .{ .fixed = 200 },
+    });
+    const popover = try t.appendChild(panel, .{
+        .axis = .col,
+        .position = .absolute,
+        .left = 10,
+        .top = 10,
+        .padding = 6,
+        .width = .{ .fixed = 80 },
+        .height = .{ .fixed = 50 },
+    });
+    const inside = try t.appendChild(popover, .{ .width = .{ .fixed = 20 }, .height = .{ .fixed = 20 } });
+    t.layout(viewport);
+    const inside_was = t.bounds(inside);
+
+    var s = t.style(popover);
+    s.left = 60;
+    s.top = 40;
+    try t.setStyle(popover, s);
+    _ = t.flush();
+
+    try testing.expectEqual(inside_was.x + 50, t.bounds(inside).x);
+    try testing.expectEqual(inside_was.y + 30, t.bounds(inside).y);
+    try expectIncrementalMatchesFull(&t);
+}
+
+test "a container whose only children are out of flow still sizes from its own rules" {
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    const content = try t.appendChild(t.root(), .{ .width = .{ .fixed = 50 }, .height = .{ .fixed = 50 } });
+    _ = content;
+    const only_abs = try t.appendChild(t.root(), .{ .padding = 3 });
+    const box = try t.appendChild(only_abs, .{
+        .position = .absolute,
+        .left = 1,
+        .top = 2,
+        .width = .{ .fixed = 9 },
+        .height = .{ .fixed = 9 },
+    });
+    t.layout(viewport);
+
+    // Content-sized with no flow children, so it is just its padding.
+    try testing.expectEqual(@as(f32, 6), t.bounds(only_abs).w);
+    try testing.expectEqual(@as(f32, 6), t.bounds(only_abs).h);
+    // And the out-of-flow child is still placed, overflowing it.
+    try testing.expectEqual(t.bounds(only_abs).x + 3 + 1, t.bounds(box).x);
+}
+
+test "an out-of-flow child is clamped by its own min and max" {
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    const panel = try t.appendChild(t.root(), .{
+        .padding = 2,
+        .width = .{ .fixed = 200 },
+        .height = .{ .fixed = 200 },
+    });
+    const box = try t.appendChild(panel, .{
+        .position = .absolute,
+        .width = .{ .grow = 1 },
+        .height = .{ .fixed = 5 },
+        .max_width = 40,
+        .min_height = 20,
+    });
+    t.layout(viewport);
+    try testing.expectEqual(@as(f32, 40), t.bounds(box).w);
+    try testing.expectEqual(@as(f32, 20), t.bounds(box).h);
+}
+
+test "incremental and full agree with out-of-flow children in the tree" {
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    try t.setStyle(t.root(), .{ .axis = .col, .padding = 7, .gap = 3, .align_items = .stretch });
+
+    var rows: [6]Index = undefined;
+    for (&rows, 0..) |*r, i| {
+        r.* = try t.appendChild(t.root(), .{
+            .axis = .row,
+            .height = .{ .fixed = 20 + @as(f32, @floatFromInt(i)) },
+            .gap = 2,
+            .padding = 1,
+            .flex_shrink = 0,
+        });
+        _ = try t.appendChild(r.*, .{
+            .position = .absolute,
+            .left = @floatFromInt(i * 3),
+            .top = 1,
+            .width = .{ .fixed = 2 },
+            .height = .{ .fixed = 4 },
+        });
+        _ = try t.appendChild(r.*, .{ .width = .{ .grow = 1 }, .height = .{ .fixed = 10 } });
+        _ = try t.appendChild(r.*, .{ .width = .{ .fixed = 15 }, .height = .{ .fixed = 10 } });
+    }
+    t.layout(viewport);
+
+    // A mix of changes: an out-of-flow move, a flow size change, and both in
+    // one flush.
+    var s0 = t.style(t.firstChild(rows[1]));
+    s0.left = 44;
+    try t.setStyle(t.firstChild(rows[1]), s0);
+
+    var s1 = t.style(rows[3]);
+    s1.height = .{ .fixed = 31 };
+    try t.setStyle(rows[3], s1);
+    _ = t.flush();
+
+    try expectIncrementalMatchesFull(&t);
 }

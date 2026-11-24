@@ -248,9 +248,9 @@ fn label(t: *Tree, parent: Index, f: ?*text.Font, atlas: ?*text.Atlas, s: []cons
 fn textField(t: *Tree, parent: Index) !Index {
     const field = try t.appendChild(parent, .{
         .axis = .row,
-        .height = .{ .fixed = 34 },
+        .height = .{ .fixed = field_height },
         .flex_shrink = 0,
-        .padding = 8,
+        .padding = field_padding,
         .align_items = .center,
     });
     t.setPaint(field, .{
@@ -262,87 +262,54 @@ fn textField(t: *Tree, parent: Index) !Index {
     return field;
 }
 
-/// A box at `(x, y)` in the coordinates of the run that the label after it
-/// will hold, taking no space on the row.
-///
-/// The anchor is given the run's full height rather than zero. Under
-/// `align_items: .center` a zero-height element is centred as a *point*, so
-/// its children hang down from the middle of the row instead of lining up with
-/// the text -- which is what the first version of this did, and what the
-/// rendered image showed.
-fn overlay(t: *Tree, field: Index, x: f32, y: f32, w: f32, h: f32, run_h: f32, c: Color) !void {
-    _ = try overlayParts(t, field, x, y, w, h, run_h, c);
-}
+/// The height of a text field's content box: everything the overlays below
+/// measure from.
+const field_padding = 8;
+const field_height = 34;
+const field_inner_h = field_height - field_padding * 2;
 
-/// The pieces of an overlay whose geometry can be changed afterwards.
+/// A box at `(x, y)` in the coordinates of the run the field's label holds.
 ///
-/// Three elements and not one, because the position is expressed as a spacer's
-/// width. That is the cost of having no absolute positioning: moving a caret
-/// is a style change on a layout element, so it dirties layout. It is honest
-/// about the missing feature rather than hiding it, and the counters in
-/// `window_demo.zig` show what it costs -- every caret move is a frame that
-/// did layout work.
-pub const Overlay = struct {
-    gap: Index,
-    column: Index,
-    box: Index,
-};
-
-fn overlayParts(
-    t: *Tree,
-    field: Index,
-    x: f32,
-    y: f32,
-    w: f32,
-    h: f32,
-    run_h: f32,
-    c: Color,
-) !Overlay {
-    const anchor = try t.appendChild(field, .{
-        .axis = .row,
-        .width = .{ .fixed = 0 },
-        .height = .{ .fixed = run_h },
-        .flex_shrink = 0,
-    });
-    const gap = try t.appendChild(anchor, .{
-        .width = .{ .fixed = x },
-        .height = .{ .fixed = 1 },
-        .flex_shrink = 0,
-    });
-    const column = try t.appendChild(anchor, .{
-        .axis = .col,
-        .width = .{ .fixed = w },
-        .flex_shrink = 0,
-    });
-    _ = try t.appendChild(column, .{
-        .width = .{ .fixed = 1 },
-        .height = .{ .fixed = y },
-        .flex_shrink = 0,
-    });
-    const box = try t.appendChild(column, .{
-        .width = .{ .fixed = w },
+/// **One element.** It used to be four -- a zero-width anchor, a spacer whose
+/// width was `x`, a column, and a spacer whose height was `y` -- with a
+/// comment at every site naming the missing feature. `position: .absolute` is
+/// that feature, and this is what it deleted.
+///
+/// The vertical offset is computed rather than inherited, because an
+/// out-of-flow element is not centred by its parent's `align_items`. That is
+/// the one thing a caller has to know, and it is the price of the element not
+/// being pushed around by its siblings either.
+fn overlay(t: *Tree, field: Index, x: f32, y: f32, w: f32, h: f32, run_h: f32, c: Color) !Overlay {
+    const box = try t.appendChild(field, .{
+        .position = .absolute,
+        .left = @max(0, x),
+        .top = @max(0, (field_inner_h - run_h) / 2) + y,
+        .width = .{ .fixed = @max(0, w) },
         .height = .{ .fixed = h },
-        .flex_shrink = 0,
     });
     t.setPaint(box, .{ .background = c, .corner_radius = if (h > 4) 2 else 0 });
-    return .{ .gap = gap, .column = column, .box = box };
+    return .{ .box = box };
 }
+
+/// An overlay whose geometry can be changed afterwards.
+pub const Overlay = struct {
+    box: Index,
+};
 
 /// Moves an overlay to `x` and resizes it to `w`, both in run coordinates.
 ///
 /// A width of zero leaves nothing visible: the scene builder culls a
 /// zero-width quad, so an empty selection needs no special case here.
+///
+/// One `setStyle` on one out-of-flow element, so the flush that follows
+/// recomputes that element and places it, and touches nothing else. Moving the
+/// spacer that used to stand for `x` was a size change that climbed to the row
+/// and re-ran it.
 pub fn moveOverlay(t: *Tree, o: Overlay, x: f32, w: f32) !void {
-    var gs = t.style(o.gap);
-    gs.width = .{ .fixed = @max(0, x) };
-    try t.setStyle(o.gap, gs);
-    // The column and the box both carry the width: the column is what reserves
-    // the space on the row, the box is what is painted.
-    for ([_]Index{ o.column, o.box }) |el| {
-        var es = t.style(el);
-        es.width = .{ .fixed = @max(0, w) };
-        try t.setStyle(el, es);
-    }
+    var st = t.style(o.box);
+    st.left = @max(0, x);
+    st.width = .{ .fixed = @max(0, w) };
+    try t.setStyle(o.box, st);
 }
 
 fn spacer(t: *Tree, parent: Index) !Index {
@@ -443,20 +410,15 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
 
         if (!selected) continue;
 
-        // A zero-width anchor: it takes no space on the row's main axis, so
-        // the popover hanging off it does not push the row's contents around.
-        // This is what an absolute-positioning primitive will replace; the
-        // layout engine has none yet, and faking one with a real element is
-        // closer to honest than adding a half-designed one.
-        const anchor = try t.appendChild(row, .{
+        // Out of flow, so it neither pushes the row's contents around nor is
+        // pushed by them. This used to be a zero-width anchor with the popover
+        // hanging off it, and the comment here used to say what feature was
+        // missing.
+        const pop = try t.appendChild(row, .{
             .axis = .col,
-            .width = .{ .fixed = 0 },
-            .flex_shrink = 0,
-        });
-        const pop = try t.appendChild(anchor, .{
-            .axis = .col,
-            // Sized by its text now, where it used to be a fixed 230x116
-            // chosen to look right around placeholder bars.
+            .position = .absolute,
+            // Sized by its text, where it used to be a fixed 230x116 chosen to
+            // look right around placeholder bars.
             .flex_shrink = 0,
             .padding = 12,
             .gap = 8,
@@ -556,8 +518,8 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
             // the element's run after the fact.
             const run = try f.shape(atlas.?, field_text);
             const r = run.rangeRect(sel_start, sel_end);
-            try overlay(t, field, r.x, 0, r.w, r.h, run.height(), Color.hex(0x2F4B8F));
-            try overlay(t, field, r.x + r.w, 0, 1, r.h, run.height(), Color.white);
+            _ = try overlay(t, field, r.x, 0, r.w, r.h, run.height(), Color.hex(0x2F4B8F));
+            _ = try overlay(t, field, r.x + r.w, 0, 1, r.h, run.height(), Color.white);
         }
         _ = try label(t, field, ui_font, atlas, field_text, bright);
     }
@@ -588,8 +550,8 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
             // Underlined, not highlighted: §2 says provisional text is drawn
             // differently and is part of the laid-out text, which is exactly
             // what a byte range over one run buys.
-            try overlay(t, field, r.x, run.ascent + 2, r.w, 1, run.height(), accent);
-            try overlay(t, field, r.x + r.w, 0, 1, r.h, run.height(), Color.white);
+            _ = try overlay(t, field, r.x, run.ascent + 2, r.w, 1, run.height(), accent);
+            _ = try overlay(t, field, r.x + r.w, 0, 1, r.h, run.height(), Color.white);
         }
         _ = try label(t, field, ui_font, atlas, shown.text, bright);
     }
@@ -613,10 +575,10 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
         if (ui_font) |f| {
             const run = try f.shape(atlas.?, editable_initial);
             const h = run.height();
-            const sel = try overlayParts(t, field, 0, 0, 0, h, h, selection_color);
+            const sel = try overlay(t, field, 0, 0, 0, h, h, selection_color);
             // The same place and thickness as the composition row above.
-            const under = try overlayParts(t, field, 0, run.ascent + 2, 0, 1, h, accent);
-            const caret = try overlayParts(t, field, run.width, 0, 1, h, h, caret_color);
+            const under = try overlay(t, field, 0, run.ascent + 2, 0, 1, h, accent);
+            const caret = try overlay(t, field, run.width, 0, 1, h, h, caret_color);
             // Named by the label above it, as a form would be; its value is
             // the document, attached by the window that owns the document.
             editable_node = try register(t, field, .{

@@ -23,13 +23,40 @@ pub const Sizing = union(enum) {
     grow: f32,
 
     pub fn eql(a: Sizing, b: Sizing) bool {
-        if (@intFromEnum(a) != @intFromEnum(b)) return false;
+        if (@backingInt(a) != @backingInt(b)) return false;
         return switch (a) {
             .fixed => |v| v == b.fixed,
             .content => true,
             .grow => |v| v == b.grow,
         };
     }
+};
+
+/// Whether an element takes part in its parent's flow.
+///
+/// `absolute` exists because the alternative was being written over and over
+/// in the demo: a caret, a selection highlight and a popover were each three
+/// or four layout elements -- a zero-width anchor, a spacer whose width was
+/// the x coordinate, and a column whose first child's height was the y -- with
+/// a comment at every site saying what feature was missing. Five such sites,
+/// and 201 layout elements for 71 things a person would name.
+///
+/// It also changes what a caret costs. An out-of-flow element cannot change
+/// its siblings' sizes or its parent's content size, so moving one is a
+/// recompute of that element and nothing else; moving a spacer was a size
+/// change that climbed the tree.
+pub const Position = enum(u8) {
+    /// Laid out among its siblings. The default.
+    flow,
+    /// Taken out of flow and placed at `left`/`top` from the parent's content
+    /// origin. It does not affect its siblings, and they do not affect it.
+    ///
+    /// Deliberately **relative to the parent**, not to a "nearest positioned
+    /// ancestor" as in CSS. That rule exists for documents, where the thing
+    /// you want to position against is often far up the tree; here the parent
+    /// is the thing an overlay belongs to, and the walk it would need is a
+    /// cost on every placement for a case nothing has yet asked for.
+    absolute,
 };
 
 pub const Justify = enum(u8) {
@@ -89,6 +116,12 @@ pub const Style = struct {
     justify: Justify = .start,
     align_items: AlignItems = .start,
 
+    position: Position = .flow,
+    /// Only with `position: .absolute`: the offset from the parent's content
+    /// origin. Ignored in flow, where the parent decides.
+    left: f32 = 0,
+    top: f32 = 0,
+
     /// True when nothing that affects layout differs.
     pub fn eql(a: Style, b: Style) bool {
         return a.axis == b.axis and
@@ -99,6 +132,7 @@ pub const Style = struct {
             a.flex_shrink == b.flex_shrink and
             a.padding == b.padding and a.gap == b.gap and
             a.wrap == b.wrap and
-            a.justify == b.justify and a.align_items == b.align_items;
+            a.justify == b.justify and a.align_items == b.align_items and
+            a.position == b.position and a.left == b.left and a.top == b.top;
     }
 };

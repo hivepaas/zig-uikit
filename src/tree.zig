@@ -700,6 +700,7 @@ pub const Tree = struct {
             var c = e.first_child;
             while (c != none) : (c = self.els.items[c].next_sibling) {
                 const ch = &self.els.items[c];
+                if (ch.style.position == .absolute) continue;
                 const main_mode = switch (e.axis) {
                     .row => ch.w_mode,
                     .col => ch.h_mode,
@@ -796,6 +797,11 @@ pub const Tree = struct {
         var first_bl: f32 = 0;
         var c = e.first_child;
         while (c != none) : (c = self.els.items[c].next_sibling) {
+            // Out of flow: it contributes nothing to its parent's content
+            // size, which is the property the whole feature rests on. A
+            // popover that enlarged the toolbar it hangs off would be no
+            // better than the anchor-and-spacer trick it replaces.
+            if (self.els.items[c].style.position == .absolute) continue;
             main_sz += self.hypoMain(c, e.axis);
             cross = @max(cross, self.hypoCross(c, e.axis));
             deepest_bl = @max(deepest_bl, self.els.items[c].baseline);
@@ -972,6 +978,42 @@ pub const Tree = struct {
     /// Full flexbox layout of one element's children: materialise the items,
     /// break them into lines, resolve flexible lengths per line, then apply
     /// justify-content and align-items. Returns true if any child moved.
+    /// Puts one out-of-flow child where its offsets say, sized against its
+    /// parent's content box.
+    ///
+    /// `grow` means "fill what is left after the offset" rather than "take a
+    /// share of the free space", because out of flow there are no siblings to
+    /// share with. Saying so is better than rejecting it: a backdrop behind a
+    /// popover wants exactly that.
+    fn placeAbsolute(self: *Tree, parent: Index, child: Index) void {
+        const p = &self.els.items[parent];
+        const pad = p.style.padding;
+        const inner_x = p.bounds.x + pad;
+        const inner_y = p.bounds.y + pad;
+        const inner_w = @max(0, p.bounds.w - pad * 2);
+        const inner_h = @max(0, p.bounds.h - pad * 2);
+
+        const ch = &self.els.items[child];
+        const left = ch.style.left;
+        const top = ch.style.top;
+        const w = switch (ch.w_mode) {
+            .fixed => ch.fixed_w,
+            .grow => @max(0, inner_w - left),
+            .content => ch.intrinsic_w,
+        };
+        const h = switch (ch.h_mode) {
+            .fixed => ch.fixed_h,
+            .grow => @max(0, inner_h - top),
+            .content => ch.intrinsic_h,
+        };
+        ch.bounds = .{
+            .x = inner_x + left,
+            .y = inner_y + top,
+            .w = clampF(w, ch.style.min_width, ch.style.max_width),
+            .h = clampF(h, ch.style.min_height, ch.style.max_height),
+        };
+    }
+
     fn positionChildren(self: *Tree, idx: Index) bool {
         const e = &self.els.items[idx];
         if (e.first_child == none) return false;
@@ -992,12 +1034,32 @@ pub const Tree = struct {
         };
 
         var k: usize = 0;
+        var any_abs = false;
         var c = e.first_child;
         while (c != none) : (c = self.els.items[c].next_sibling) {
+            if (self.els.items[c].style.position == .absolute) {
+                any_abs = true;
+                continue;
+            }
             self.kids[k] = c;
             k += 1;
         }
         var work: u32 = @intCast(k);
+
+        // Placed from the parent's content box alone, so they neither see nor
+        // are seen by the flex arithmetic below.
+        if (any_abs) {
+            var a = e.first_child;
+            while (a != none) : (a = self.els.items[a].next_sibling) {
+                if (self.els.items[a].style.position != .absolute) continue;
+                self.placeAbsolute(idx, a);
+                work += 1;
+            }
+        }
+        if (k == 0) {
+            self.stats.position += work;
+            return any_abs;
+        }
 
         // --- line breaking ---
         var n_lines: usize = 0;
@@ -1224,6 +1286,10 @@ pub const Tree = struct {
         var c = start_child;
         while (c != none) : (c = self.els.items[c].next_sibling) {
             const ch = &self.els.items[c];
+            // The parent is not moving here -- only its flow children are
+            // being re-run -- so an out-of-flow child is already where it
+            // belongs and takes no part in the cursor.
+            if (ch.style.position == .absolute) continue;
             const main_sz = self.hypoMain(c, e.axis);
             var cross_sz = self.hypoCross(c, e.axis);
             // Cross alignment must be applied here too. Omitting it and writing
@@ -1301,6 +1367,21 @@ pub const Tree = struct {
     /// stopped.
     fn flushElement(self: *Tree, el: Index) void {
         _ = self.recomputeIntrinsic(el);
+
+        // **The reason `position: .absolute` is worth having at all.** An
+        // out-of-flow element cannot change a sibling's size or its parent's
+        // content size, so there is nothing to carry upwards: moving a caret
+        // is a recompute of one element and a walk of its own subtree, where
+        // moving the spacer that used to stand for its x coordinate was a size
+        // change that climbed the tree and re-ran a row.
+        const e = &self.els.items[el];
+        if (e.parent != none and e.style.position == .absolute) {
+            self.placeAbsolute(e.parent, el);
+            if (e.first_child != none) self.repositionSubtree(el);
+            self.stats.fast_path += 1;
+            self.stats.position += 1;
+            return;
+        }
 
         var child_on_path = el;
         var node = self.els.items[el].parent;

@@ -397,5 +397,93 @@ pub fn main() !void {
         for (0..iters) |_| ui.raster.drawScene(&fb, &sc, null);
         report("drawScene, whole viewport", nowNs() - t0, iters, "a GPU does this in the compositor's budget");
     }
+    std.debug.print("\noverlays\n", .{});
+    // --- moving an overlay: out of flow against the trick it replaced ---
+    //
+    // A caret moves on every keystroke, so what it costs is a real number and
+    // not a curiosity. Both shapes are built here, side by side on the same
+    // tree, because the interesting figure is the ratio and that is the only
+    // way to measure it once the old shape has been deleted from the demo.
+    {
+        const field = try b.t.appendChild(b.t.root(), .{
+            .axis = .row,
+            .padding = 8,
+            .width = .{ .fixed = 400 },
+            .height = .{ .fixed = 34 },
+            .flex_shrink = 0,
+        });
+        // The old shape: an anchor taking no space on the row, a spacer whose
+        // WIDTH is the x coordinate, a column, and the box.
+        const anchor = try b.t.appendChild(field, .{
+            .axis = .row,
+            .width = .{ .fixed = 0 },
+            .height = .{ .fixed = 18 },
+            .flex_shrink = 0,
+        });
+        const spacer = try b.t.appendChild(anchor, .{
+            .width = .{ .fixed = 0 },
+            .height = .{ .fixed = 1 },
+            .flex_shrink = 0,
+        });
+        const column = try b.t.appendChild(anchor, .{
+            .axis = .col,
+            .width = .{ .fixed = 1 },
+            .flex_shrink = 0,
+        });
+        _ = try b.t.appendChild(column, .{
+            .width = .{ .fixed = 1 },
+            .height = .{ .fixed = 18 },
+            .flex_shrink = 0,
+        });
+        // The new shape: one element, out of flow.
+        const caret = try b.t.appendChild(field, .{
+            .position = .absolute,
+            .left = 0,
+            .top = 0,
+            .width = .{ .fixed = 1 },
+            .height = .{ .fixed = 18 },
+        });
+        _ = try b.t.appendChild(field, .{ .width = .{ .fixed = 200 }, .height = .{ .fixed = 18 } });
+        b.t.layout(viewport);
+
+        const iters = 200_000;
+        {
+            var x: f32 = 40;
+            var work: u64 = 0;
+            const t0 = nowNs();
+            for (0..iters) |_| {
+                x = if (x == 40) 41 else 40;
+                try b.t.setStyle(spacer, .{
+                    .width = .{ .fixed = x },
+                    .height = .{ .fixed = 1 },
+                    .flex_shrink = 0,
+                });
+                work += b.t.flush().total();
+            }
+            const dt = nowNs() - t0;
+            report("move a caret: spacer width", dt, iters, "");
+            std.debug.print("      {d:.1} units of layout work per move\n", .{
+                @as(f64, @floatFromInt(work)) / @as(f64, @floatFromInt(iters)),
+            });
+        }
+        {
+            var x: f32 = 40;
+            var work: u64 = 0;
+            const t0 = nowNs();
+            for (0..iters) |_| {
+                x = if (x == 40) 41 else 40;
+                var st = b.t.style(caret);
+                st.left = x;
+                try b.t.setStyle(caret, st);
+                work += b.t.flush().total();
+            }
+            const dt = nowNs() - t0;
+            report("move a caret: out of flow", dt, iters, "");
+            std.debug.print("      {d:.1} units of layout work per move\n", .{
+                @as(f64, @floatFromInt(work)) / @as(f64, @floatFromInt(iters)),
+            });
+        }
+    }
+
     std.debug.print("\n", .{});
 }
