@@ -483,6 +483,33 @@ pub const Renderer = struct {
     atlas_w: u32 = 0,
     atlas_h: u32 = 0,
 
+    /// Two staging buffers, persistently mapped, alternating.
+    ///
+    /// **Two because one frame is in flight.** A single buffer would be
+    /// overwritten by the next `setAtlas` while the GPU might still be reading
+    /// it for the copy recorded in the frame already submitted. Alternating is
+    /// enough with one frame in flight: the slot being written was last read
+    /// by a frame that the fence at the top of `drawAndPresent` has already
+    /// waited for.
+    ///
+    /// The alternative -- what this replaced -- was creating a staging buffer,
+    /// submitting a copy and waiting on a fence, per atlas change. That cost
+    /// 1.4-2.5 ms, almost all of it the queue round trip behind a swapchain
+    /// presenting at 60 Hz, and it happened the first time anyone typed a
+    /// character the font had not rasterised yet.
+    atlas_staging: [2]c.VkBuffer = .{ null, null },
+    atlas_staging_memory: [2]c.VkDeviceMemory = .{ null, null },
+    atlas_staging_ptr: [2]?[*]u8 = .{ null, null },
+    atlas_staging_cap: usize = 0,
+    /// Which slot holds a staged upload that has not been recorded yet.
+    atlas_slot: u1 = 0,
+    /// Whether that slot holds one.
+    atlas_pending: bool = false,
+    /// Atlas copies folded into a frame's own command buffer. Reported rather
+    /// than guessed at: the point of the change is that this number says how
+    /// many uploads happened and none of them stalled.
+    atlas_uploads: u32 = 0,
+
     set_layout: c.VkDescriptorSetLayout = null,
     desc_pool: c.VkDescriptorPool = null,
     desc_set: c.VkDescriptorSet = null,
@@ -629,6 +656,7 @@ pub const Renderer = struct {
         }
         if (self.instances != null) c.vkDestroyBuffer(d, self.instances, null);
         self.destroyAtlasImage();
+        self.destroyAtlasStaging();
         if (self.atlas_sampler != null) c.vkDestroySampler(d, self.atlas_sampler, null);
         if (self.desc_pool != null) c.vkDestroyDescriptorPool(d, self.desc_pool, null);
         if (self.set_layout != null) c.vkDestroyDescriptorSetLayout(d, self.set_layout, null);
@@ -805,7 +833,94 @@ pub const Renderer = struct {
             c.vkUpdateDescriptorSets(d, 1, &write, 0, null);
         }
 
-        try self.uploadAtlas(atlas);
+        try self.stageAtlas(atlas);
+    }
+
+    /// Copies the atlas into a staging buffer and marks it for upload.
+    ///
+    /// Nothing is submitted. The copy is recorded into whichever command
+    /// buffer draws next, by `recordPass`, so it costs a buffer-to-image copy
+    /// inside a frame that was being submitted anyway instead of a queue
+    /// submission and a fence wait of its own.
+    fn stageAtlas(self: *Renderer, atlas: ui.AtlasView) Error!void {
+        const size = @as(usize, atlas.w) * atlas.h;
+        try self.ensureAtlasStaging(size);
+        const dst = self.atlas_staging_ptr[self.atlas_slot].?;
+        @memcpy(dst[0..size], atlas.pixels[0..size]);
+        self.atlas_pending = true;
+    }
+
+    fn ensureAtlasStaging(self: *Renderer, size: usize) Error!void {
+        if (size <= self.atlas_staging_cap) return;
+        const d = self.gpu.device;
+        // Growing happens when the atlas itself grows, which is rare and
+        // already a `vkDeviceWaitIdle` in `setAtlas` above; doing it here too
+        // keeps this function correct on its own.
+        if (self.atlas_staging_cap > 0) _ = c.vkDeviceWaitIdle(d);
+        self.destroyAtlasStaging();
+
+        var cap: usize = 64 * 1024;
+        while (cap < size) cap *= 2;
+        for (0..2) |i| {
+            const bci: c.VkBufferCreateInfo = .{
+                .sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+                .size = cap,
+                .usage = c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
+            };
+            try check("vkCreateBuffer", c.vkCreateBuffer(d, &bci, null, &self.atlas_staging[i]));
+            var req: c.VkMemoryRequirements = undefined;
+            c.vkGetBufferMemoryRequirements(d, self.atlas_staging[i], &req);
+            const mai: c.VkMemoryAllocateInfo = .{
+                .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                .allocationSize = req.size,
+                .memoryTypeIndex = try self.gpu.memoryType(
+                    req.memoryTypeBits,
+                    c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
+                ),
+            };
+            try check("vkAllocateMemory", c.vkAllocateMemory(d, &mai, null, &self.atlas_staging_memory[i]));
+            try check("vkBindBufferMemory", c.vkBindBufferMemory(d, self.atlas_staging[i], self.atlas_staging_memory[i], 0));
+            var ptr: ?*anyopaque = null;
+            try check("vkMapMemory", c.vkMapMemory(d, self.atlas_staging_memory[i], 0, cap, 0, &ptr));
+            self.atlas_staging_ptr[i] = @ptrCast(ptr.?);
+        }
+        self.atlas_staging_cap = cap;
+    }
+
+    fn destroyAtlasStaging(self: *Renderer) void {
+        const d = self.gpu.device;
+        for (0..2) |i| {
+            if (self.atlas_staging_memory[i] != null) {
+                c.vkUnmapMemory(d, self.atlas_staging_memory[i]);
+                c.vkFreeMemory(d, self.atlas_staging_memory[i], null);
+            }
+            if (self.atlas_staging[i] != null) c.vkDestroyBuffer(d, self.atlas_staging[i], null);
+            self.atlas_staging[i] = null;
+            self.atlas_staging_memory[i] = null;
+            self.atlas_staging_ptr[i] = null;
+        }
+        self.atlas_staging_cap = 0;
+    }
+
+    /// Records a staged atlas upload, if there is one.
+    ///
+    /// Called from `recordPass`, which both the swapchain and the offscreen
+    /// path go through, so neither has to remember. It is before
+    /// `vkCmdBeginRendering` because a copy cannot be inside a render pass.
+    fn recordAtlasIfPending(self: *Renderer, cb: c.VkCommandBuffer) void {
+        if (!self.atlas_pending) return;
+        recordAtlasUpload(.{
+            .image = self.atlas_image,
+            .staging = self.atlas_staging[self.atlas_slot],
+            .w = self.atlas_w,
+            .h = self.atlas_h,
+        }, cb);
+        self.atlas_pending = false;
+        // The next stage goes to the other buffer, so it cannot overwrite the
+        // one this frame is about to read.
+        self.atlas_slot = ~self.atlas_slot;
+        self.atlas_uploads += 1;
     }
 
     const AtlasUpload = struct {
@@ -814,49 +929,6 @@ pub const Renderer = struct {
         w: u32,
         h: u32,
     };
-
-    fn uploadAtlas(self: *Renderer, atlas: ui.AtlasView) Error!void {
-        const d = self.gpu.device;
-        const size: c.VkDeviceSize = @as(u64, atlas.w) * atlas.h;
-
-        var staging: c.VkBuffer = null;
-        var memory: c.VkDeviceMemory = null;
-        const bci: c.VkBufferCreateInfo = .{
-            .sType = c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
-            .size = size,
-            .usage = c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-            .sharingMode = c.VK_SHARING_MODE_EXCLUSIVE,
-        };
-        try check("vkCreateBuffer", c.vkCreateBuffer(d, &bci, null, &staging));
-        defer c.vkDestroyBuffer(d, staging, null);
-
-        var req: c.VkMemoryRequirements = undefined;
-        c.vkGetBufferMemoryRequirements(d, staging, &req);
-        const mai: c.VkMemoryAllocateInfo = .{
-            .sType = c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
-            .allocationSize = req.size,
-            .memoryTypeIndex = try self.gpu.memoryType(
-                req.memoryTypeBits,
-                c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
-            ),
-        };
-        try check("vkAllocateMemory", c.vkAllocateMemory(d, &mai, null, &memory));
-        defer c.vkFreeMemory(d, memory, null);
-        try check("vkBindBufferMemory", c.vkBindBufferMemory(d, staging, memory, 0));
-
-        var ptr: ?*anyopaque = null;
-        try check("vkMapMemory", c.vkMapMemory(d, memory, 0, size, 0, &ptr));
-        const dst: [*]u8 = @ptrCast(ptr.?);
-        @memcpy(dst[0..@intCast(size)], atlas.pixels[0..@intCast(size)]);
-        c.vkUnmapMemory(d, memory);
-
-        try self.gpu.oneShot(AtlasUpload, .{
-            .image = self.atlas_image,
-            .staging = staging,
-            .w = atlas.w,
-            .h = atlas.h,
-        }, recordAtlasUpload);
-    }
 
     fn recordAtlasUpload(u: AtlasUpload, cb: c.VkCommandBuffer) void {
         // `UNDEFINED` as the source layout discards whatever was in the image,
@@ -981,6 +1053,7 @@ pub const Renderer = struct {
     /// Records a whole frame: the transition in, the clear, the draw, and the
     /// transition out. Shared by the offscreen path and the swapchain path.
     pub fn recordPass(self: *Renderer, cb: c.VkCommandBuffer, pass: Pass, count: u32, clear: Color) void {
+        self.recordAtlasIfPending(cb);
         transition(
             cb,
             pass.image,

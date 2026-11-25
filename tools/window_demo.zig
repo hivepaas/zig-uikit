@@ -483,14 +483,14 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // different fix, and folding the two into one number would have
             // hidden which of them to work on.
             //
-            // It costs 1.7-2.1 ms, and measuring where that goes changed the
-            // answer: staging the whole 256 KB image is 11-80 us, and the rest
-            // is `vkQueueSubmit` plus a fence wait, serialised behind a
-            // swapchain presenting at 60 Hz. So uploading only the new glyph's
-            // rectangle -- the obvious fix -- would save nothing. What this
-            // wants is the transfer recorded into the frame's own command
-            // buffer instead of a synchronous round trip through the queue,
-            // which is a swapchain change and not a text one.
+            // It used to cost 1.7-2.5 ms, and measuring where that went
+            // changed the answer: staging the whole 256 KB image was 11-80 us
+            // and the rest was `vkQueueSubmit` plus a fence wait, serialised
+            // behind a swapchain presenting at 60 Hz. So uploading only the
+            // new glyph's rectangle -- the obvious fix -- would have saved
+            // nothing. `setAtlas` now stages and returns, and the copy is
+            // recorded into the frame that was being submitted anyway, so
+            // what is left here is the memcpy: 16-25 us.
             if (fonts.atlas.generation != atlas_gen) {
                 const up0 = nowNs();
                 try renderer.setAtlas(fonts.atlas.view());

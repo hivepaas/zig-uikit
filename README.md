@@ -15,7 +15,7 @@ zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
 zig build test-text                      # 15 tests, needs a font installed
 zig build test-input                     # 14 tests, needs xkbcommon and a layout
-zig build test-gpu                       # Vulkan: 7 tests; Metal: 11 tests
+zig build test-gpu                       # Vulkan: 8 tests; Metal: 11 tests
 zig build gpu-demo                       # renders on the GPU, diffs against the reference
 zig build window                         # opens a window and renders into it
 ```
@@ -651,23 +651,45 @@ each one cost. ReleaseFast, on an AMD Ryzen 9 9950X with RADV:
 
 | | cost |
 | --- | --- |
-| one keystroke: shape, move the caret, install the run | **15-27 us** mean, 57-64 us worst |
+| one keystroke: shape, move the caret, install the run | **19 us** mean, 58-63 us worst |
 | of which the shaping, measured hot immediately after | 2.9-3.2 us |
-| a frame that changed nothing | **306 ns** |
-| re-upload the atlas after a never-seen character | **1.7-2.1 ms** |
+| a frame that changed nothing | **272-289 ns** |
+| worst CPU in any one frame | **105-123 us** |
+| stage the atlas after a never-seen character | **16-25 us** |
 
-The last row is the one to fix, and measuring it decided *how*. The obvious
-guess — 256 KB is too much to push for one new glyph, so upload only the
-glyph's rectangle — is wrong. Staging the whole image costs 11-80 us; the other
-1.8-4.9 ms is `vkQueueSubmit` plus a fence wait, serialised behind a swapchain
-presenting at 60 Hz. A partial upload would save nothing. The fix is to record
-the transfer into the frame's own command buffer instead of taking a
-synchronous round trip through the queue, and it is a swapchain change rather
-than a text one.
+The atlas gained a `generation` counter so that last row happens only when it
+has to: typing a character the font has already rasterised changes no texels
+and stages nothing. Across 28 scripted keystrokes, three.
 
-The atlas gained a `generation` counter so this happens only when it has to:
-typing a character the font has already rasterised changes no texels and
-uploads nothing. Across 28 scripted keystrokes, two uploads.
+### Uploading the atlas without stopping the frame
+
+That row used to read **1.7-2.5 ms**, and it was the worst number in this
+project: a keystroke that happened to be the first of its character stalled for
+longer than a frame, and the worst CPU in any one frame was 2.2-3.0 ms because
+of it.
+
+**Measuring it decided how to fix it, and the obvious guess was wrong.** 256 KB
+does look like too much to push for one new glyph — but staging the whole image
+was only 11-80 us. The other 1.8-4.9 ms was `vkQueueSubmit` plus a fence wait,
+serialised behind a swapchain presenting at 60 Hz. A partial upload would have
+saved nothing at all.
+
+So `setAtlas` now stages and returns, and the copy is recorded into the command
+buffer of whichever frame draws next — by `recordPass`, which both the
+swapchain path and the offscreen path go through, so neither has to remember.
+The frame was being submitted anyway.
+
+It stages into **two buffers, alternating**, because one frame is in flight. A
+single buffer would be overwritten by the next `setAtlas` while the GPU might
+still be reading it for a copy already submitted; alternating is enough,
+because the slot being written was last read by a frame the fence at the top of
+`drawAndPresent` has already waited for. `zig build test-gpu` changes the atlas
+twice in a row and checks that both land, which a single buffer would fail.
+
+| | before | after |
+| --- | --- | --- |
+| stage and upload an atlas | 1.7-2.5 ms | **16-25 us** |
+| worst CPU in any one frame | 2.2-3.0 ms | **105-123 us** |
 
 ![the editable field three keystrokes in: "Gõ vào đây: tiếng Việt — " with the caret after it](docs/demo-typing.png)
 
@@ -989,10 +1011,9 @@ one: a one-texel transparent atlas exists from `Renderer.init` so the fragment
 shader's descriptor is valid before any text does. The alternative — two
 pipelines, one with a sampler and one without — would mean switching pipeline
 mid-frame to save a descriptor write that happens when glyphs are added, not
-per frame. `setAtlas` uploads the whole atlas rather than a dirty rectangle, for
-the same reason: 256 KB when the shaper finds a character nobody has typed
-before is not on the frame path, and a second incremental system guarding it
-would be maintaining bugs for nothing.
+per frame. `setAtlas` uploads the whole atlas rather than a dirty rectangle,
+and measuring is what decided that: the volume was never the cost. See
+"Uploading the atlas without stopping the frame".
 
 The compiled SPIR-V is committed and embedded in the binary, so building the
 toolkit needs no shader compiler; only changing a shader does.

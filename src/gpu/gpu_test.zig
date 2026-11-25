@@ -268,3 +268,77 @@ test "the atlas can be replaced at a different size" {
     try renderer.setAtlas(.{ .pixels = &small, .w = 8, .h = 8 });
     try testing.expectEqual(before, renderer.atlas_image);
 }
+
+test "an atlas changed between frames reaches the shader" {
+    var gpu = try openGpu();
+    defer gpu.deinit();
+
+    // The upload is no longer a submit of its own: `setAtlas` stages into one
+    // of two buffers and the copy is recorded into whichever command buffer
+    // draws next. So the thing worth testing is that two changes in a row
+    // each land -- a single staging buffer would let the second memcpy
+    // overwrite what the first frame was still reading.
+    const w = 8;
+    const h = 8;
+    const clear = ui.Color.hex(0x000000);
+    const fg = ui.Color.hex(0xFFFFFF);
+
+    var scene = ui.Scene.init(testing.allocator);
+    defer scene.deinit();
+    try scene.quads.append(testing.allocator, .{
+        .x = 0,
+        .y = 0,
+        .w = 4,
+        .h = 4,
+        .background = fg.pack(),
+        .border_color = 0,
+        .border_width = 0,
+        .corner_radius = 0,
+        .cx = 0,
+        .cy = 0,
+        .cw = w,
+        .ch = h,
+        .u0 = 0,
+        .v0 = 0,
+        .u1 = 4,
+        .v1 = 4,
+        .flags = .{ .textured = true },
+    });
+
+    var target = try vk.Target.init(&gpu, w, h);
+    defer target.deinit();
+    var renderer = try vk.Renderer.initDefault(&gpu);
+    defer renderer.deinit();
+
+    // Two atlases of the same size, so nothing is recreated and the only
+    // thing that can carry the difference is the staged copy.
+    var first: [16]u8 = @splat(0);
+    first[0] = 255;
+    var second: [16]u8 = @splat(0);
+    second[5] = 255; // (1,1)
+
+    const uploads_before = renderer.atlas_uploads;
+    try renderer.setAtlas(.{ .pixels = &first, .w = 4, .h = 4 });
+    try renderer.render(&target, &scene, clear);
+    {
+        const px = target.pixels();
+        try testing.expectEqual(fg.r, px[0]);
+        try testing.expectEqual(clear.r, px[(1 * w + 1) * 4]);
+    }
+
+    try renderer.setAtlas(.{ .pixels = &second, .w = 4, .h = 4 });
+    try renderer.render(&target, &scene, clear);
+    {
+        const px = target.pixels();
+        try testing.expectEqual(clear.r, px[0]);
+        try testing.expectEqual(fg.r, px[(1 * w + 1) * 4]);
+    }
+
+    // Two changes, two copies folded into two frames.
+    try testing.expectEqual(uploads_before + 2, renderer.atlas_uploads);
+
+    // And a frame with nothing staged records no copy at all, which is what
+    // keeps an unchanged frame free.
+    try renderer.render(&target, &scene, clear);
+    try testing.expectEqual(uploads_before + 2, renderer.atlas_uploads);
+}
