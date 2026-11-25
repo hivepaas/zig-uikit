@@ -1365,6 +1365,55 @@ equivalent, so the application menu gained an Edit menu with that one item.
 Cut, Copy and Paste need the pasteboard and are left out rather than added
 inert.
 
+### Live resize
+
+While the user drags a window's edge, AppKit runs its own event loop inside
+`sendEvent:` and does not return until the button comes up. A program that
+draws after `pump` therefore draws nothing for the whole drag, and the window
+shows its last frame stretched to each new size. Measured, with the corner
+dragged 240 by 140 points in 30 steps:
+
+```
+./zig-out/bin/window_demo --resize --no-live
+live resize: 900x560 -> 1140x700 points in 691 ms
+  live resizes 1, size changes during them 30, frames drawn during them 0
+```
+
+AppKit does call the view's `setFrameSize:` at every step, so that is where
+the window calls back (`Window.setLiveFrame`), with the new size already in
+`width`, `height` and `scale`. The demo's callback does what its main loop
+does on a resize — new drawables, a full layout, a scene, a present — with
+the main loop's state reached by pointer, since the loop is suspended
+underneath the call and its locals are where it left them. For the drag only,
+the layer presents with the Core Animation transaction, and the swapchain
+then commits, waits until the work is scheduled and presents on the calling
+thread, which is Apple's documented sequence for keeping a frame and the
+window's new size on screen together. In a release build:
+
+```
+./zig-out/bin/window_demo --resize
+live resize: 900x560 -> 1140x700 points in 703 ms
+  live resizes 1, size changes during them 29, frames drawn during them 29
+  frame 15 of the drag, 2040x1260 pixels, against the reference at that size: largest difference 1, 0 pixels over 1
+  drawing a frame inside the drag: mean 1583 us, worst 6101 us
+```
+
+A frame for every step, the drag no slower, and the frame captured halfway
+through the drag is the software reference at that size, not a stretched
+copy of an older one.
+
+**A drag made inside the process does not resize the window.** The first
+version of `--resize` posted mouse events to the application's own queue and
+pressed on the corner, at three positions on and around it: zero live
+resizes. The window server runs the drag, so the test posts Core Graphics
+events where a mouse would — which moves the user's pointer for under a
+second, and puts it back — from a thread, so that the main loop is pumping
+when the press arrives, as it would be for a person.
+
+Whether the transaction removes the wobble a drawn edge can show during a
+resize is something a person sees and a capture does not; the capture shows
+the frame is right, not when it reached the screen.
+
 ### The pointer in the field
 
 What a click does is decided in core, like what a key does: `editing.press`
@@ -1531,9 +1580,10 @@ clients.
 - A window moved to a display with a different scale reopens its fonts and
   rebuilds its tree; that path is written and has not been exercised, because
   this Mac has one display.
-- Live resize. While the user drags a window edge AppKit runs its own event
-  loop inside `sendEvent:`, and this loop does not draw until it returns.
-  Untested; rendering from the resize callback or a display link is the fix.
+- Animation during a live resize. Frames are drawn when the size changes;
+  something that moves on its own would stop while the edge is held still.
+  A display link on the tracking run loop mode is the fix when there is
+  something that animates.
 - VoiceOver itself. `ax_probe` uses the API VoiceOver uses and checks what it
   reads; nobody has listened to it yet, which is the test spikes C and D
   passed with Orca and Narrator.

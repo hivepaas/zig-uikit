@@ -137,11 +137,21 @@ pub fn send(comptime Ret: type, target: anytype, comptime selector: [:0]const u8
 
 /// `[super selector]` from inside a method of `cls`: the superclass's
 /// implementation, run on `target`. What a `dealloc` override has to end with.
-pub fn sendSuper(comptime Ret: type, target: id, cls: Class, comptime selector: [:0]const u8) Ret {
+pub fn sendSuper(comptime Ret: type, target: id, cls: Class, comptime selector: [:0]const u8, args: anytype) Ret {
     const Super = extern struct { receiver: id, super_class: Class };
     var sup: Super = .{ .receiver = target, .super_class = class_getSuperclass(cls).? };
-    const f: *const fn (*Super, SEL) callconv(.c) Ret = @ptrCast(&objc_msgSendSuper);
-    return f(&sup, sel(selector));
+    const info = @typeInfo(@TypeOf(args)).@"struct";
+    const params = comptime blk: {
+        var p: [info.field_types.len + 2]type = undefined;
+        p[0] = *Super;
+        p[1] = SEL;
+        for (info.field_types, 2..) |T, i| p[i] = T;
+        break :blk p;
+    };
+    const attrs: [params.len]std.lang.Type.Fn.ParamAttributes = @splat(.{});
+    const F = @Fn(&params, &attrs, Ret, .{ .@"callconv" = .c });
+    const f: *const F = @ptrCast(&objc_msgSendSuper);
+    return @call(.auto, f, .{ &sup, sel(selector) } ++ args);
 }
 
 /// `[[cls alloc] init]`: a +1 reference the caller owns and must `release`.

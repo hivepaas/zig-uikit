@@ -54,6 +54,89 @@ const hover_tint = ui.Color.hex(0x3D4450);
 
 /// Compares the frame the window server was actually handed against the
 /// software reference, and writes it out.
+const Diff = struct { worst: u32, over1: usize, glyphs: usize };
+
+/// The presented frame `rgba` against the software reference drawn from the
+/// same scene at the swapchain's scale.
+fn diffAgainstReference(gpa: std.mem.Allocator, swapchain: *const mtl.Swapchain, scene: *const ui.Scene, atlas: ui.AtlasView, rgba: []const u8) !Diff {
+    const w = swapchain.extent.width;
+    const h = swapchain.extent.height;
+    var reference = try ui.Framebuffer.init(gpa, w, h);
+    defer reference.deinit();
+    reference.clear(bg);
+    // The same scene scaled the way the vertex shader scales it. `scaled`
+    // checks that every glyph already sits on the device grid at its texel
+    // size, which is what shaping at the device size guarantees.
+    var glyphs: usize = 0;
+    for (scene.items()) |q| {
+        if (q.flags.textured) glyphs += 1;
+        ui.raster.drawQuad(&reference, q.scaled(swapchain.scale), atlas);
+    }
+    var worst: u32 = 0;
+    var over1: usize = 0;
+    for (0..@as(usize, w) * h) |i| {
+        var px_worst: u32 = 0;
+        for (0..3) |ch| {
+            const a = rgba[i * 4 + ch];
+            const b = reference.px[i * 4 + ch];
+            const dd: u32 = if (a > b) a - b else b - a;
+            px_worst = @max(px_worst, dd);
+        }
+        worst = @max(worst, px_worst);
+        if (px_worst > 1) over1 += 1;
+    }
+    return .{ .worst = worst, .over1 = over1, .glyphs = glyphs };
+}
+
+/// Everything a frame drawn from inside AppKit's resize loop needs: the main
+/// loop's state, by pointer, because the main loop is suspended underneath
+/// the call and its locals are exactly where it left them.
+const Live = struct {
+    gpa: std.mem.Allocator,
+    swapchain: *mtl.Swapchain,
+    renderer: *mtl.Renderer,
+    t: *ui.Tree,
+    scene: *ui.Scene,
+    fonts: *demo.Fonts,
+    /// Which step of the drag to capture and compare, 0 for none.
+    capture_step: u32 = 0,
+    captured: ?Diff = null,
+    captured_size: [2]u32 = .{ 0, 0 },
+    ns_total: u64 = 0,
+    ns_worst: u64 = 0,
+    timed: u32 = 0,
+};
+
+/// A frame at the window's new size, drawn from `setFrameSize:` while the
+/// user drags. The same work the main loop does on a resize -- new
+/// drawables, a full layout, a scene -- and nothing else: no hover, no
+/// keyboard, nothing that needs the event queue AppKit is holding.
+fn liveDraw(ctx: ?*anyopaque, win: *mac.Window) void {
+    const l: *Live = @ptrCast(@alignCast(ctx.?));
+    const capture = win.live.steps == l.capture_step;
+    const t0 = nowNs();
+    // Timed to the present, and not on the frame that is captured, whose
+    // read-back and comparison are the test's cost, not the drag's.
+    defer if (!capture) {
+        const spent = nowNs() - t0;
+        l.ns_total += spent;
+        l.ns_worst = @max(l.ns_worst, spent);
+        l.timed += 1;
+    };
+    l.swapchain.recreate(win.pixelWidth(), win.pixelHeight(), win.scale) catch return;
+    l.t.layout(viewport(win));
+    _ = l.t.flush();
+    _ = l.scene.build(l.t) catch return;
+    if (capture) l.swapchain.capture_request = true;
+    const presented = l.swapchain.drawAndPresent(l.renderer, l.scene, bg) catch return;
+    if (capture and presented and !l.swapchain.capture_request) {
+        const rgba = l.swapchain.captureRgba(l.gpa) catch return;
+        defer l.gpa.free(rgba);
+        l.captured = diffAgainstReference(l.gpa, l.swapchain, l.scene, l.fonts.atlas.view(), rgba) catch null;
+        l.captured_size = .{ l.swapchain.extent.width, l.swapchain.extent.height };
+    }
+}
+
 fn checkPresentedFrame(
     gpa: std.mem.Allocator,
     swapchain: *mtl.Swapchain,
@@ -70,32 +153,10 @@ fn checkPresentedFrame(
 
     const rgba = try swapchain.captureRgba(gpa);
     defer gpa.free(rgba);
-
-    var reference = try ui.Framebuffer.init(gpa, w, h);
-    defer reference.deinit();
-    reference.clear(bg);
-    // The same scene scaled the way the vertex shader scales it. `scaled`
-    // checks that every glyph already sits on the device grid at its texel
-    // size, which is what shaping at the device size guarantees.
-    var glyphs: usize = 0;
-    for (scene.items()) |q| {
-        if (q.flags.textured) glyphs += 1;
-        ui.raster.drawQuad(&reference, q.scaled(swapchain.scale), atlas);
-    }
-
-    var worst: u32 = 0;
-    var over1: usize = 0;
-    for (0..@as(usize, w) * h) |i| {
-        var px_worst: u32 = 0;
-        for (0..3) |ch| {
-            const a = rgba[i * 4 + ch];
-            const b = reference.px[i * 4 + ch];
-            const d: u32 = if (a > b) a - b else b - a;
-            px_worst = @max(px_worst, d);
-        }
-        worst = @max(worst, px_worst);
-        if (px_worst > 1) over1 += 1;
-    }
+    const d = try diffAgainstReference(gpa, swapchain, scene, atlas, rgba);
+    const worst = d.worst;
+    const over1 = d.over1;
+    const glyphs = d.glyphs;
 
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
@@ -234,6 +295,56 @@ fn telexScript(gpa: std.mem.Allocator) ![]Stroke {
 
 /// The input method's caret rectangle callback: where a byte range of the
 /// editable field is, which the window converts to screen coordinates.
+// `--resize` drags the window's corner with the real pointer. Events made
+// inside the process do not start a live resize -- measured: three positions
+// on and around the corner, zero resizes -- because the window server handles
+// the drag, so the test has to post events where a mouse would. That moves
+// the user's pointer for half a second; it is put back afterwards.
+const CGPoint = extern struct { x: f64, y: f64 };
+extern "CoreGraphics" fn CGEventCreateMouseEvent(source: ?*anyopaque, kind: u32, p: CGPoint, button: u32) ?*anyopaque;
+extern "CoreGraphics" fn CGEventCreate(source: ?*anyopaque) ?*anyopaque;
+extern "CoreGraphics" fn CGEventGetLocation(ev: *anyopaque) CGPoint;
+extern "CoreGraphics" fn CGEventPost(tap: u32, ev: *anyopaque) void;
+extern "CoreGraphics" fn CGWarpMouseCursorPosition(p: CGPoint) i32;
+extern "CoreFoundation" fn CFRelease(obj: *anyopaque) void;
+
+const Drag = struct { from: CGPoint, dx: f64, dy: f64, steps: u32 };
+
+fn postMouse(kind: u32, p: CGPoint) void {
+    const ev = CGEventCreateMouseEvent(null, kind, p, 0) orelse return;
+    defer CFRelease(ev);
+    CGEventPost(0, ev); // kCGHIDEventTap
+}
+
+/// On its own thread, so the main loop keeps pumping and AppKit can enter
+/// its resize loop when the press arrives -- as it would for a person.
+fn dragThread(d: Drag) void {
+    const was = blk: {
+        const e = CGEventCreate(null) orelse break :blk d.from;
+        defer CFRelease(e);
+        break :blk CGEventGetLocation(e);
+    };
+    const pause = 16 * std.time.ns_per_ms;
+    postMouse(5, d.from); // moved, so the press is not a jump
+    sleepNs(pause * 4);
+    postMouse(1, d.from); // left down
+    sleepNs(pause * 2);
+    var i: u32 = 1;
+    while (i <= d.steps) : (i += 1) {
+        const f = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(d.steps));
+        postMouse(6, .{ .x = d.from.x + d.dx * f, .y = d.from.y + d.dy * f }); // dragged
+        sleepNs(pause);
+    }
+    postMouse(2, .{ .x = d.from.x + d.dx, .y = d.from.y + d.dy }); // up
+    sleepNs(pause * 2);
+    _ = CGWarpMouseCursorPosition(was);
+}
+
+fn sleepNs(ns: u64) void {
+    var ts: std.c.timespec = .{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
+    _ = std.c.nanosleep(&ts, &ts);
+}
+
 fn hitTest(ctx: ?*anyopaque, doc: *const ui.Document, p: ui.Point, clamp: bool) ?ui.editing.Hit {
     const t: *const ui.Tree = @ptrCast(@alignCast(ctx.?));
     return demo.editableHit(t, doc.len(), p, clamp);
@@ -347,6 +458,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var telex = false;
     var ax_test = false;
     var click_test = false;
+    var resize_test = false;
+    var live_off = false;
+    var resize_thread: ?std.Thread = null;
+    var resize_reported = false;
+    var resize_w0: u32 = 0;
+    var resize_h0: u32 = 0;
+    var resize_t0: u64 = 0;
     var args = std.process.Args.Iterator.init(init.args);
     _ = args.next();
     while (args.next()) |a| {
@@ -356,6 +474,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (std.mem.eql(u8, a, "--telex")) telex = true;
         if (std.mem.eql(u8, a, "--ax")) ax_test = true;
         if (std.mem.eql(u8, a, "--click")) click_test = true;
+        if (std.mem.eql(u8, a, "--resize")) resize_test = true;
+        // Measures the window without its live-resize drawing: the baseline.
+        if (std.mem.eql(u8, a, "--no-live")) live_off = true;
     }
     // The capture of a composition in progress needs the swapchain to be
     // capturable.
@@ -368,7 +489,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer gpu.deinit();
 
     var swapchain = try mtl.Swapchain.init(&gpu, win.layer, win.pixelWidth(), win.pixelHeight(), win.scale, .{
-        .capturable = capture,
+        .capturable = capture or resize_test,
     });
     defer swapchain.deinit();
 
@@ -455,6 +576,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var caret_visible = true;
     var capture_pending = false;
     var ax_typed: usize = 0;
+    var live: Live = .{
+        .gpa = gpa,
+        .swapchain = &swapchain,
+        .renderer = &renderer,
+        .t = &t,
+        .scene = &scene,
+        .fonts = &fonts,
+        .capture_step = if (resize_test) 15 else 0,
+    };
+    if (!live_off) win.setLiveFrame(.{ .ctx = &live, .draw = liveDraw });
+    defer win.setLiveFrame(null);
     var click_arena: std.heap.ArenaAllocator = .init(gpa);
     defer click_arena.deinit();
     var click_steps: []ClickStep = &.{};
@@ -612,6 +744,44 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 if (click_wrong > 0) return error.ClickScriptDiverged;
                 break;
             }
+        }
+        // `--resize`: the window's corner dragged 240 by 140 points in 30
+        // steps, through AppKit's own resize loop. `sendResizeDrag` returns
+        // only when the drag is over -- the frame loop is stopped for all of
+        // it, which is the point.
+        if (resize_test and frames == 20) {
+            const sf = win.screenFrame();
+            // The bottom-right corner, in Core Graphics' top-left coordinates,
+            // one point inside.
+            const corner: CGPoint = .{
+                .x = sf.frame.origin.x + sf.frame.size.width - 1,
+                .y = sf.main_height - sf.frame.origin.y - 1,
+            };
+            resize_w0 = win.width;
+            resize_h0 = win.height;
+            resize_t0 = nowNs();
+            resize_thread = try std.Thread.spawn(.{}, dragThread, .{Drag{ .from = corner, .dx = 240, .dy = 140, .steps = 30 }});
+        }
+        if (resize_thread != null and frames > 20 and !win.live.active and win.live.resizes > 0 and !resize_reported) {
+            resize_reported = true;
+            const spent = nowNs() - resize_t0;
+            const w0 = resize_w0;
+            const h0 = resize_h0;
+            defer if (live.captured) |d| std.debug.print(
+                "  frame {d} of the drag, {d}x{d} pixels, against the reference at that size: largest difference {d}, {d} pixels over 1\n  drawing a frame inside the drag: mean {d} us, worst {d} us\n",
+                .{ live.capture_step, live.captured_size[0], live.captured_size[1], d.worst, d.over1, live.ns_total / @max(1, live.timed) / 1000, live.ns_worst / 1000 },
+            );
+            std.debug.print(
+                \\live resize: {d}x{d} -> {d}x{d} points in {d:.0} ms
+                \\  live resizes {d}, size changes during them {d}, frames drawn during them {d}
+                \\
+            , .{ w0, h0, win.width, win.height, @as(f64, @floatFromInt(spent)) / 1e6, win.live.resizes, win.live.steps, win.live.frames });
+        }
+        if (resize_test and (resize_reported or frames > 600) and frames > 40) {
+            if (resize_thread) |th| th.join();
+            resize_thread = null;
+            if (!resize_reported) std.debug.print("live resize: none happened\n", .{});
+            break;
         }
         while (win.access_presses.pop()) |n| {
             std.debug.print("pressed through accessibility: \"{s}\"\n", .{if (at.get(n)) |node| node.name else "?"});

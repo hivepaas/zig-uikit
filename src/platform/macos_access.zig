@@ -330,7 +330,7 @@ fn dealloc(self: id, _: objc.SEL) callconv(.c) void {
     if (stateOf(self)) |st| gpa.destroy(st);
     elements_freed += 1;
     objc.setState(self, element_class.?, null);
-    objc.sendSuper(void, self, element_class.?, "dealloc");
+    objc.sendSuper(void, self, element_class.?, "dealloc", .{});
 }
 
 fn isElement(_: id, _: objc.SEL) callconv(.c) objc.BOOL {

@@ -61,6 +61,21 @@ extern "CoreGraphics" fn CGEventCreateKeyboardEvent(source: ?*anyopaque, key: u1
 extern "CoreGraphics" fn CGEventSetFlags(ev: *anyopaque, flags: u64) void;
 extern "CoreFoundation" fn CFRelease(obj: *anyopaque) void;
 
+pub const LiveFrame = struct {
+    ctx: ?*anyopaque,
+    draw: *const fn (ctx: ?*anyopaque, w: *Window) void,
+};
+
+pub const LiveStats = struct {
+    /// Whether a live resize is in progress right now.
+    active: bool = false,
+    resizes: u32 = 0,
+    /// Size changes AppKit made during live resizes, and frames drawn for
+    /// them by `Window.live_frame`.
+    steps: u32 = 0,
+    frames: u32 = 0,
+};
+
 pub const Window = struct {
     gpa: Allocator,
 
@@ -108,6 +123,11 @@ pub const Window = struct {
 
     /// The press being dragged, if a mouse button is down in the text target.
     gesture: ?ui.editing.Gesture = null,
+
+    /// Called to draw a frame while the user drags the window's edge. See
+    /// `setLiveFrame`.
+    live_frame: ?LiveFrame = null,
+    live: LiveStats = .{},
 
     /// The accessibility tree this window describes, if any. See
     /// `setAccessTarget` and `macos_access.zig`.
@@ -420,6 +440,32 @@ pub const Window = struct {
         }
     }
 
+    /// Sets the function that draws a frame during a live resize, or clears
+    /// it with null.
+    ///
+    /// While the user drags the window's edge, AppKit runs its own event loop
+    /// inside `sendEvent:` and does not return until the button is released,
+    /// so a loop that draws after `pump` draws nothing for the whole drag:
+    /// the window shows the last frame, stretched. AppKit does call the
+    /// view's `setFrameSize:` at every step of the drag, and that is where
+    /// this is called from, with `width`, `height` and `scale` already
+    /// updated and `resized` set. It should lay out and present at the new
+    /// size; the main loop sees `resized` afterwards and may relayout again,
+    /// which is idempotent.
+    pub fn setLiveFrame(self: *Window, f: ?LiveFrame) void {
+        self.live_frame = f;
+    }
+
+    /// The window's frame on screen, in Cocoa screen coordinates (origin at
+    /// the bottom-left of the main display), and that display's height, for
+    /// converting to the top-left coordinates Core Graphics events use.
+    pub fn screenFrame(self: *const Window) struct { frame: objc.CGRect, main_height: f64 } {
+        const frame = send(objc.CGRect, self.window, "frame", .{});
+        const screens = send(id, objc.class("NSScreen") catch unreachable, "screens", .{});
+        const main = send(id, screens, "objectAtIndex:", .{@as(objc.NSUInteger, 0)});
+        return .{ .frame = frame, .main_height = send(objc.CGRect, main, "frame", .{}).size.height };
+    }
+
     pub const MouseKind = enum { down, dragged, up };
 
     /// A left-button event at a point in layout units, delivered through
@@ -671,6 +717,9 @@ fn viewClass() Error!objc.Class {
         try b.method("keyDown:", &keyDown, "v@:@");
         try b.method("selectAll:", &selectAll, "v@:@");
         try b.method("mouseDown:", &mouseDown, "v@:@");
+        try b.method("setFrameSize:", &setFrameSize, "v@:{CGSize=dd}");
+        try b.method("viewWillStartLiveResize", &willStartLiveResize, "v@:");
+        try b.method("viewDidEndLiveResize", &didEndLiveResize, "v@:");
         try b.method("mouseDragged:", &mouseDragged, "v@:@");
         try b.method("mouseUp:", &mouseUp, "v@:@");
 
@@ -855,6 +904,39 @@ fn axFocused(self: id, _: objc.SEL) callconv(.c) ?id {
 fn axHitTest(self: id, _: objc.SEL, p: objc.CGPoint) callconv(.c) ?id {
     const w = stateOf(self) orelse return self;
     return ax.viewHitTest(w, self, p);
+}
+
+fn setFrameSize(self: id, _: objc.SEL, size: objc.CGSize) callconv(.c) void {
+    objc.sendSuper(void, self, view_class.?, "setFrameSize:", .{size});
+    const w = stateOf(self) orelse return;
+    if (!w.live.active) return;
+    w.live.steps += 1;
+    w.width = @intFromFloat(@max(size.width, 0));
+    w.height = @intFromFloat(@max(size.height, 0));
+    w.scale = @floatCast(send(objc.CGFloat, w.window, "backingScaleFactor", .{}));
+    w.resized = true;
+    if (w.live_frame) |lf| {
+        lf.draw(lf.ctx, w);
+        w.live.frames += 1;
+    }
+}
+
+fn willStartLiveResize(self: id, _: objc.SEL) callconv(.c) void {
+    objc.sendSuper(void, self, view_class.?, "viewWillStartLiveResize", .{});
+    const w = stateOf(self) orelse return;
+    w.live.active = true;
+    w.live.resizes += 1;
+    // For the drag only: each present is then part of the Core Animation
+    // transaction that moves the window's edge, so the new frame and the new
+    // size appear together. Out of a resize it would cost latency for nothing.
+    send(void, w.layer, "setPresentsWithTransaction:", .{objc.YES});
+}
+
+fn didEndLiveResize(self: id, _: objc.SEL) callconv(.c) void {
+    objc.sendSuper(void, self, view_class.?, "viewDidEndLiveResize", .{});
+    const w = stateOf(self) orelse return;
+    w.live.active = false;
+    send(void, w.layer, "setPresentsWithTransaction:", .{objc.NO});
 }
 
 /// Where an event's location is in the text, through the target's hit test.

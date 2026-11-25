@@ -666,8 +666,19 @@ pub const Swapchain = struct {
             try copyOut(cb, texture, self.capture_buf.?, tw, th);
         }
 
-        send(void, cb, "presentDrawable:", .{drawable});
+        // A layer that presents with the transaction -- which the macOS
+        // window turns on for the length of a live resize -- must not be
+        // given its drawable through the command buffer: the present has to
+        // happen on this thread, inside the transaction, once the GPU work
+        // is scheduled. That is Apple's documented sequence, and it is what
+        // keeps a frame and the window's new size on screen together.
+        const transactional = objc.truthy(send(objc.BOOL, self.layer, "presentsWithTransaction", .{}));
+        if (!transactional) send(void, cb, "presentDrawable:", .{drawable});
         send(void, cb, "commit", .{});
+        if (transactional) {
+            send(void, cb, "waitUntilScheduled", .{});
+            send(void, drawable, "present", .{});
+        }
         up.slot.in_flight = objc.retain(cb);
 
         if (capturing) {
