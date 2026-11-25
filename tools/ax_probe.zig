@@ -40,6 +40,7 @@ extern "ApplicationServices" fn AXUIElementCreateApplication(pid: c_int) AXUIEle
 extern "ApplicationServices" fn AXUIElementCopyAttributeValue(el: AXUIElementRef, attr: CFStringRef, out: *?CFTypeRef) i32;
 extern "ApplicationServices" fn AXUIElementCopyParameterizedAttributeValue(el: AXUIElementRef, attr: CFStringRef, param: CFTypeRef, out: *?CFTypeRef) i32;
 extern "ApplicationServices" fn AXUIElementCopyElementAtPosition(app: AXUIElementRef, x: f32, y: f32, out: *?AXUIElementRef) i32;
+extern "ApplicationServices" fn AXUIElementSetAttributeValue(el: AXUIElementRef, attr: CFStringRef, value: CFTypeRef) i32;
 extern "ApplicationServices" fn AXUIElementPerformAction(el: AXUIElementRef, action: CFStringRef) i32;
 extern "ApplicationServices" fn AXUIElementSetMessagingTimeout(el: AXUIElementRef, seconds: f32) i32;
 extern "ApplicationServices" fn AXValueCreate(t: u32, ptr: *const anyopaque) ?CFTypeRef;
@@ -228,6 +229,19 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var b2: [64]u8 = undefined;
     const sub = str(paramAttr(field, "AXStringForRange", range_v), &b2) orelse "";
     check(std.mem.eql(u8, sub, "tiếng"), "AXStringForRange(12, 5) is \"{s}\"", .{sub});
+    // VoiceOver moving the caret: the one attribute the field lets a client
+    // set. Selected, read back, and put back, so the typing below still
+    // appends rather than replacing.
+    queries += 1;
+    const set_err = AXUIElementSetAttributeValue(field, cf("AXSelectedTextRange"), range_v);
+    var b6: [64]u8 = undefined;
+    const selected = str(attr(field, "AXSelectedText"), &b6) orelse "";
+    check(set_err == 0 and std.mem.eql(u8, selected, "tiếng"), "setting AXSelectedTextRange(12, 5) selects \"{s}\"", .{selected});
+    const end_range: CFRange = .{ .location = 18, .length = 0 };
+    const end_v = AXValueCreate(kAXValueCFRangeType, &end_range).?;
+    defer CFRelease(end_v);
+    queries += 1;
+    _ = AXUIElementSetAttributeValue(field, cf("AXSelectedTextRange"), end_v);
     const field_frame = frameOf(field);
     const word = axValue(CGRect, paramAttr(field, "AXBoundsForRange", range_v), kAXValueCGRectType);
     check(word != null and field_frame != null and

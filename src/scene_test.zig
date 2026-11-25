@@ -901,6 +901,13 @@ test "clicking rounds to the nearer side of the glyph" {
     // Past the end is the end, and the end is a byte count the run does not
     // itself know -- there is no string here.
     try testing.expectEqual(@as(usize, 3), run.byteAt(100, 3));
+
+    // The character under the pointer is not rounded: the right half of the
+    // first glyph is still the first glyph. A double-click selects by this.
+    try testing.expectEqual(@as(usize, 0), run.clusterAt(9, 3));
+    try testing.expectEqual(@as(usize, 1), run.clusterAt(11, 3));
+    try testing.expectEqual(@as(usize, 0), run.clusterAt(-5, 3));
+    try testing.expectEqual(@as(usize, 3), run.clusterAt(100, 3));
 }
 
 test "a click round-trips through the caret it produces" {

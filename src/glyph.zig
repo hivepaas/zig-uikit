@@ -148,6 +148,21 @@ pub const TextRun = struct {
         return self.width;
     }
 
+    /// The byte offset of the character *under* `x`: not rounded to an edge
+    /// like `byteAt`. A double-click selects the word under the pointer, and
+    /// rounding would turn a click on the right half of a word's last letter
+    /// into the boundary after it -- and select the space that follows.
+    /// Before the first glyph, the first; past the end, `len`.
+    pub fn clusterAt(self: TextRun, x: f32, len: usize) usize {
+        if (self.glyphs.len == 0) return 0;
+        if (x < self.glyphs[0].pen_x) return self.glyphs[0].cluster;
+        for (self.glyphs, 0..) |g, i| {
+            const next_x = if (i + 1 < self.glyphs.len) self.glyphs[i + 1].pen_x else self.width;
+            if (x < next_x) return g.cluster;
+        }
+        return len;
+    }
+
     /// The byte offset a caret should move to for a click at `x`.
     ///
     /// Rounds to the nearer edge of whichever glyph `x` falls in, because a

@@ -10,7 +10,7 @@ A declarative GPU UI toolkit for Zig.
 > There are no widgets. Expect the API to change without notice.
 
 ```sh
-zig build test                           # 144 tests, no platform dependencies
+zig build test                           # 165 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
 zig build test-text                      # 15 tests, needs a font installed
@@ -1308,6 +1308,47 @@ equivalent, so the application menu gained an Edit menu with that one item.
 Cut, Copy and Paste need the pasteboard and are left out rather than added
 inert.
 
+### The pointer in the field
+
+What a click does is decided in core, like what a key does: `editing.press`
+and `editing.drag` take a position in the text and a click count, and carry the
+rules every desktop text field shares — one click places the caret, Shift-click
+extends from the anchor, two clicks select a word, three select the line (all
+of it, with no line breaker), and a drag that began with two clicks extends a
+whole word at a time and keeps the word it started on. Eight tests, no pointer.
+The Mac view adds `mouseDown:`/`mouseDragged:`, offering each event to the
+input method first, which is where a click inside a composition belongs; if
+the input method declines, the composition is committed before the caret
+moves, which is what `canEditNow` would otherwise refuse.
+
+A position in the text is **two numbers, and the first version used one.**
+`TextRun.byteAt` rounds to the nearer caret boundary, which is right for a
+click; a double-click on the right half of a word's last letter then rounds to
+the boundary *after* the word, and selects the space. `--click` found it on the
+first run. So a hit is `Hit{ caret, char }`, with `TextRun.clusterAt` giving the
+character under the pointer, unrounded, and the word gestures use that.
+
+`--click` sends real mouse events at positions read from the layout — found by
+substring, so the script follows the text rather than pixels:
+
+```
+  a double-click selects the word: "vào" -- ok
+  Shift-click extends it: "vào đây" -- ok
+  a click places the caret: "" -- ok
+  a drag selects: "Gõ vào đây:" -- ok
+  a double-click dragged back extends by words: "Gõ vào đây" -- ok
+  a drag past the end of the field: "vào đây: tiếng " -- ok
+  a triple-click selects it all: "Gõ vào đây: tiếng " -- ok
+  a click outside the field changes nothing: "Gõ vào đây: tiếng " -- ok
+8 gestures, 0 wrong; 11 presses reached the field, 0 the input method
+```
+
+The same hit test answers `characterIndexForPoint:`, which an input method
+asks when the user clicks into its marked text, and VoiceOver can now move the
+caret: `setAccessibilitySelectedTextRange:` is the one write the accessibility
+tree accepts, going to the window's document through the same refusal as every
+other caret move. `ax_probe` sets the range to `tiếng` and reads it back.
+
 ### Accessibility on macOS
 
 `src/access.zig` is the internal accessibility tree that
@@ -1344,13 +1385,14 @@ text field "Gõ vào đây: tiếng "
   AXFocusedUIElement is the text field -- ok
   the element at the button's centre is the button -- ok
   AXPress on the button -- ok
+  setting AXSelectedTextRange(12, 5) selects "tiếng" -- ok
 listening while the demo types...
   8 AXValueChanged, 8 AXSelectedTextChanged
   one value change per character of "xin chào" -- ok
   AXValue afterwards is "Gõ vào đây: tiếng xin chào" -- ok
   AXUIElementDestroyed for the removed button, 1 of them -- ok
   asking the removed button its role is error -25202 -- ok
-473 queries in all, 0 wrong
+476 queries in all, 0 wrong
 ```
 
 And what the demo counted coming in, for those 473 queries:
@@ -1438,17 +1480,18 @@ clients.
 - VoiceOver itself. `ax_probe` uses the API VoiceOver uses and checks what it
   reads; nobody has listened to it yet, which is the test spikes C and D
   passed with Orca and Narrator.
-- Editing through accessibility: `AXValue` and `AXSelectedTextRange` are read
-  only, so VoiceOver cannot set the caret. The tree is also flat where the
+- Editing text through accessibility: `AXValue` is read only, so VoiceOver
+  can move the caret but not replace the text. The tree is also flat where the
   interface is not — the list's rows are static text, not list items.
-- The accessibility tree on Linux and Windows. It is in core and shaped for
-  both (§3), and only the Mac reads it.
+- The accessibility tree on Windows. It is in core and shaped for UIA too
+  (§3); the Mac and AT-SPI on Linux read it.
 - An input method that uses marked text. Apple's Simple Telex does not, and
   the other Vietnamese input methods are not enabled on this Mac; the marked
   path is covered by `zig build test` and not by a live input method. Japanese
   or Chinese input would exercise it, and the candidate window would then be
   the first real test of `firstRectForCharacterRange:`.
-- Clicking in the field. `characterIndexForPoint:` answers `NSNotFound`.
+- An I-beam cursor over the field, and clicks anywhere but the field: there
+  is no focus model to give them to.
 - The process is not an application bundle, and the input method logs
   `getApplicationProperty: called with invalid property` once per key because
   of it. Harmless, and gone once there is an `Info.plist`.

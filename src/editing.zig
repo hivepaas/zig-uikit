@@ -344,6 +344,113 @@ pub fn nextWord(s: []const u8, b: usize) usize {
     return i;
 }
 
+// ------------------------------------------------------------------ pointer
+//
+// What a click does to a field, in core like the keystrokes above, so that it
+// is the same on every platform and tested with no pointer at all. The
+// platform layer turns a click into a byte offset -- `TextRun.byteAt` -- and a
+// click count; everything after that is here.
+//
+// The rules are the ones every desktop text field shares: one click places
+// the caret, Shift-click extends the selection from its anchor, two clicks
+// select a word, three select the line -- all of it, with no line breaker --
+// and a drag that began with two clicks extends a word at a time, keeping the
+// whole of the word it started on.
+
+/// Where a pointer is in a field's text, in two senses: the caret boundary
+/// nearest to it, which a click moves the caret to (`TextRun.byteAt`), and
+/// the character under it, which a double-click selects the word of
+/// (`TextRun.clusterAt`). They differ exactly where it matters -- on the right
+/// half of a word's last letter the nearest boundary is after the word.
+pub const Hit = struct {
+    caret: usize,
+    char: usize,
+};
+
+/// What a drag extends by.
+pub const Granularity = enum { char, word, all };
+
+/// A press in progress: what a drag keeps extending from. Returned by `press`
+/// and passed back to `drag`, so the gesture's state lives with the caller
+/// that owns the pointer, not in the document.
+pub const Gesture = struct {
+    granularity: Granularity = .char,
+    /// For `.word`: the word the press landed on, which stays selected
+    /// whichever way the drag goes.
+    origin: Range = .{},
+};
+
+/// A button press at `at`, the `count`th in a row.
+///
+/// Refused with `error.Locked` during a composition, as every caret move is:
+/// a click in the middle of provisional text is the input method's to handle,
+/// and the platform layer offers it there first and commits the composition
+/// if the input method declines.
+pub fn press(doc: *Document, at: Hit, count: u32, extend: bool) Error!struct { result: Result, gesture: Gesture } {
+    if (!doc.canEditNow()) return Error.Locked;
+    const s = doc.text();
+    const b = offsets.alignToChar(s, @min(at.caret, s.len));
+    const anchor_was = doc.anchor;
+    const focus_was = doc.focus;
+    var g: Gesture = .{};
+    switch (count) {
+        0, 1 => if (extend) try doc.setSelection(doc.anchor, b) else try doc.setCaret(b),
+        2 => {
+            g = .{ .granularity = .word, .origin = wordAt(s, at.char) };
+            try doc.setSelection(g.origin.start, g.origin.end);
+        },
+        else => {
+            g = .{ .granularity = .all, .origin = .{ .start = 0, .end = s.len } };
+            try doc.setSelection(0, s.len);
+        },
+    }
+    return .{
+        .result = .{ .handled = true, .moved = doc.anchor != anchor_was or doc.focus != focus_was },
+        .gesture = g,
+    };
+}
+
+/// The pointer moved to `at` with the button held.
+pub fn drag(doc: *Document, g: Gesture, at: Hit) Error!Result {
+    if (!doc.canEditNow()) return Error.Locked;
+    const s = doc.text();
+    const b = offsets.alignToChar(s, @min(at.caret, s.len));
+    const anchor_was = doc.anchor;
+    const focus_was = doc.focus;
+    switch (g.granularity) {
+        .char => try doc.setSelection(doc.anchor, b),
+        .word => {
+            const w = wordAt(s, at.char);
+            if (at.char < g.origin.start) {
+                try doc.setSelection(g.origin.end, w.start);
+            } else {
+                try doc.setSelection(g.origin.start, @max(w.end, g.origin.end));
+            }
+        },
+        .all => {},
+    }
+    return .{ .handled = true, .moved = doc.anchor != anchor_was or doc.focus != focus_was };
+}
+
+/// The run of same-class characters containing the one at `b` -- a word, a
+/// run of punctuation, or a run of spaces -- which is what a double-click
+/// selects. At the end of the text, the run before it.
+pub fn wordAt(s: []const u8, b: usize) Range {
+    if (s.len == 0) return .{};
+    const i = if (b >= s.len) offsets.prevChar(s, s.len) else offsets.alignToChar(s, b);
+    // `b` is the character under the pointer (`Hit.char`), not a boundary.
+    const class = classAt(s, i);
+    var start = i;
+    while (start > 0) {
+        const p = offsets.prevChar(s, start);
+        if (classAt(s, p) != class) break;
+        start = p;
+    }
+    var end = offsets.nextChar(s, i);
+    while (end < s.len and classAt(s, end) == class) end = offsets.nextChar(s, end);
+    return .{ .start = start, .end = end };
+}
+
 // ---------------------------------------------------------------------- tests
 
 const testing = std.testing;
@@ -574,4 +681,94 @@ test "the document never gains a control byte from a keystroke" {
     try testing.expectEqualStrings("", d.text());
     try testing.expect(!isInsertable("a\nb"));
     try testing.expect(isInsertable("tiếng Việt"));
+}
+
+/// A pointer exactly on byte `b`: the caret boundary and the character after
+/// it agree, which is the case away from a glyph's right half.
+fn hit(b: usize) Hit {
+    return .{ .caret = b, .char = b };
+}
+
+test "one click places the caret, Shift-click extends from the anchor" {
+    var d = try docWith("Gõ vào đây: tiếng");
+    defer d.deinit();
+    const vao = std.mem.indexOf(u8, d.text(), "vào").?;
+    _ = try press(&d, hit(vao), 1, false);
+    try testing.expectEqual(vao, d.focus);
+    try testing.expect(d.selection().isEmpty());
+    _ = try press(&d, hit(d.len()), 1, true);
+    try testing.expectEqualStrings("vào đây: tiếng", d.text()[d.selection().start..d.selection().end]);
+    try testing.expectEqual(vao, d.anchor);
+}
+
+test "a click in the middle of a character lands on its start" {
+    var d = try docWith("ế");
+    defer d.deinit();
+    _ = try press(&d, hit(1), 1, false);
+    try testing.expectEqual(@as(usize, 0), d.focus);
+}
+
+test "a double-click selects the Vietnamese syllable, not a third of it" {
+    var d = try docWith("Gõ vào đây: tiếng");
+    defer d.deinit();
+    // Inside `ế`, which is three bytes and not ASCII: an alphanumeric test
+    // would stop the word there.
+    const at = std.mem.indexOf(u8, d.text(), "ế").? + 1;
+    _ = try press(&d, hit(at), 2, false);
+    const sel = d.selection();
+    try testing.expectEqualStrings("tiếng", d.text()[sel.start..sel.end]);
+    // On the colon: the punctuation run, not a word.
+    _ = try press(&d, hit(std.mem.indexOf(u8, d.text(), ":").?), 2, false);
+    try testing.expectEqualStrings(":", d.text()[d.selection().start..d.selection().end]);
+    // Past the end: the last word.
+    _ = try press(&d, hit(d.len()), 2, false);
+    try testing.expectEqualStrings("tiếng", d.text()[d.selection().start..d.selection().end]);
+}
+
+test "a drag after a double-click extends a word at a time, both ways" {
+    var d = try docWith("một hai ba bốn");
+    defer d.deinit();
+    const s = d.text();
+    const hai = std.mem.indexOf(u8, s, "hai").?;
+    const p = try press(&d, hit(hai + 1), 2, false);
+    // Rightwards into the middle of `bốn`: all of it, and all of `hai`.
+    _ = try drag(&d, p.gesture, hit(std.mem.indexOf(u8, s, "ốn").?));
+    try testing.expectEqualStrings("hai ba bốn", s[d.selection().start..d.selection().end]);
+    // Leftwards into `một`: the word dragged back over, still all of `hai`,
+    // and the focus at the far end so Shift+arrows continue from there.
+    _ = try drag(&d, p.gesture, hit(2));
+    try testing.expectEqualStrings("một hai", s[d.selection().start..d.selection().end]);
+    try testing.expectEqual(@as(usize, 0), d.focus);
+}
+
+test "a plain drag selects character by character from the press" {
+    var d = try docWith("tiếng Việt");
+    defer d.deinit();
+    const p = try press(&d, hit(0), 1, false);
+    _ = try drag(&d, p.gesture, hit(std.mem.indexOf(u8, d.text(), " ").?));
+    try testing.expectEqualStrings("tiếng", d.text()[d.selection().start..d.selection().end]);
+}
+
+test "a triple-click selects everything" {
+    var d = try docWith("tiếng Việt");
+    defer d.deinit();
+    _ = try press(&d, hit(3), 3, false);
+    try testing.expectEqual(@as(usize, d.len()), d.selection().len());
+}
+
+test "a click during a composition is refused" {
+    var d = try docWith("vi");
+    defer d.deinit();
+    try d.setComposingRange(.{ .start = 0, .end = 2 });
+    try testing.expectError(Error.Locked, press(&d, hit(0), 1, false));
+}
+
+test "a double-click on the right half of a word's last letter selects that word" {
+    // The nearest caret boundary is after the `g`; the character under the
+    // pointer is the `g`. Selecting by the boundary would select the space.
+    var d = try docWith("tiếng Việt");
+    defer d.deinit();
+    const g = std.mem.indexOf(u8, d.text(), "g").?;
+    _ = try press(&d, .{ .caret = g + 1, .char = g }, 2, false);
+    try testing.expectEqualStrings("tiếng", d.text()[d.selection().start..d.selection().end]);
 }

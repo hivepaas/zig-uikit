@@ -99,6 +99,7 @@ pub const Method = enum {
     line_for_index,
     range_for_line,
     perform_press,
+    set_selected_text_range,
 };
 
 /// The Zig half of one `ZigUIKitAXElement`. Owned by the object and freed in
@@ -302,6 +303,7 @@ fn elementClass() objc.Error!objc.Class {
         try b.method("accessibilityLineForIndex:", &lineForIndex, "q@:q");
         try b.method("accessibilityRangeForLine:", &rangeForLine, R ++ "@:q");
         try b.method("accessibilityPerformPress", &performPress, B ++ "@:");
+        try b.method("setAccessibilitySelectedTextRange:", &setSelectedTextRange, "v@:" ++ R);
         element_class = b.finish();
     } else {
         element_class = try objc.class("ZigUIKitAXElement");
@@ -460,6 +462,20 @@ fn rangeForLine(self: id, _: objc.SEL, line: objc.NSInteger) callconv(.c) ic.Utf
     const d = docOf(self, .range_for_line) orelse return .{ .location = 0, .length = 0 };
     if (line != 0) return .{ .location = ic.not_found, .length = 0 };
     return .{ .location = 0, .length = utf16Len(d.doc.text()) };
+}
+
+/// VoiceOver moving the caret: the one write this tree accepts. It goes to the
+/// document the window's text target edits -- the accessibility tree holds a
+/// read-only view of it -- and through the same refusal as every other caret
+/// move: not during a composition.
+fn setSelectedTextRange(self: id, _: objc.SEL, range: ic.Utf16Range) callconv(.c) void {
+    const r = resolve(self, .set_selected_text_range) orelse return;
+    const d = r.n.doc orelse return;
+    const tt = r.w.text orelse return;
+    if (tt.doc != d or !tt.doc.canEditNow()) return;
+    const b = ic.toBytes(tt.doc.text(), range);
+    tt.doc.setSelection(b.start, b.end) catch return;
+    r.w.text_changed = true;
 }
 
 fn performPress(self: id, _: objc.SEL) callconv(.c) objc.BOOL {

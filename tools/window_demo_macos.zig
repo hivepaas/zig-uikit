@@ -32,6 +32,11 @@
 //!     this program -- decides what they mean, and checks that the document
 //!     ends up holding `tiếng Việt`. It restores the input source it found.
 //!
+//! `--click` drives the field with the mouse the same way: synthesised
+//! `NSEvent`s at positions read from the layout, through AppKit, the input
+//! method (which sees mouse events first) and `editing.press`/`drag`, and
+//! checks what each gesture selected.
+//!
 //! The interface is also described to accessibility clients, through an
 //! `access.Tree` that `demo.buildUi` fills (see `platform/macos_access.zig`).
 //! `--ax` runs for ten seconds, types `xin chào` into the field three seconds
@@ -229,6 +234,101 @@ fn telexScript(gpa: std.mem.Allocator) ![]Stroke {
 
 /// The input method's caret rectangle callback: where a byte range of the
 /// editable field is, which the window converts to screen coordinates.
+fn hitTest(ctx: ?*anyopaque, doc: *const ui.Document, p: ui.Point, clamp: bool) ?ui.editing.Hit {
+    const t: *const ui.Tree = @ptrCast(@alignCast(ctx.?));
+    return demo.editableHit(t, doc.len(), p, clamp);
+}
+
+const MouseEv = struct { p: ui.Point, kind: mac.Window.MouseKind, clicks: u32 = 1, shift: bool = false };
+
+/// One gesture of `--click` and what it must leave selected.
+const ClickStep = struct {
+    what: []const u8,
+    events: []const MouseEv,
+    selected: []const u8,
+    /// For a gesture that leaves a caret: where, as the text after it.
+    caret_before: ?[]const u8 = null,
+};
+
+/// The gestures, at positions read from the laid-out field. Everything is
+/// found by substring in the field's text, so the script follows the text
+/// rather than pixel coordinates that would go stale with a font change.
+fn clickScript(arena: std.mem.Allocator, t: *const ui.Tree, s: []const u8) ![]ClickStep {
+    const R = struct {
+        t: *const ui.Tree,
+        s: []const u8,
+        fn at(self: @This(), needle: []const u8) usize {
+            return std.mem.indexOf(u8, self.s, needle).?;
+        }
+        /// A point inside the character starting at byte `b`, `frac` of the
+        /// way across it.
+        fn in(self: @This(), b: usize, frac: f32) ui.Point {
+            const n = std.unicode.utf8ByteSequenceLength(self.s[b]) catch 1;
+            const r = demo.editableRangeRect(self.t, .{ .start = b, .end = b + n });
+            return .{ .x = r.x + r.w * frac, .y = r.y + r.h / 2 };
+        }
+        /// A point in the right quarter of the character that ends at `e`.
+        fn endOf(self: @This(), e: usize) ui.Point {
+            return self.in(ui.offsets.prevChar(self.s, e), 0.75);
+        }
+    };
+    const q: R = .{ .t = t, .s = s };
+    const vao = q.at("vào");
+    const day_end = q.at("đây") + "đây".len;
+    const tieng = q.at("tiếng");
+    const colon_end = q.at(":") + 1;
+    const field = t.bounds(demo.editable.?.field);
+
+    var steps: std.ArrayList(ClickStep) = .empty;
+    const dbl = try arena.dupe(MouseEv, &.{
+        .{ .p = q.in(vao + 1, 0.5), .kind = .down },
+        .{ .p = q.in(vao + 1, 0.5), .kind = .up },
+        .{ .p = q.in(vao + 1, 0.5), .kind = .down, .clicks = 2 },
+        .{ .p = q.in(vao + 1, 0.5), .kind = .up, .clicks = 2 },
+    });
+    try steps.append(arena, .{ .what = "a double-click selects the word", .events = dbl, .selected = "vào" });
+    try steps.append(arena, .{ .what = "Shift-click extends it", .events = try arena.dupe(MouseEv, &.{
+        .{ .p = q.endOf(day_end), .kind = .down, .shift = true },
+        .{ .p = q.endOf(day_end), .kind = .up, .shift = true },
+    }), .selected = "vào đây" });
+    try steps.append(arena, .{ .what = "a click places the caret", .events = try arena.dupe(MouseEv, &.{
+        .{ .p = q.in(tieng, 0.25), .kind = .down },
+        .{ .p = q.in(tieng, 0.25), .kind = .up },
+    }), .selected = "", .caret_before = "tiếng " });
+    try steps.append(arena, .{ .what = "a drag selects", .events = try arena.dupe(MouseEv, &.{
+        .{ .p = q.in(0, 0.25), .kind = .down },
+        .{ .p = q.in(vao, 0.5), .kind = .dragged },
+        .{ .p = q.endOf(colon_end), .kind = .dragged },
+        .{ .p = q.endOf(colon_end), .kind = .up },
+    }), .selected = "Gõ vào đây:" });
+    const day = q.at("đây") + 1;
+    try steps.append(arena, .{ .what = "a double-click dragged back extends by words", .events = try arena.dupe(MouseEv, &.{
+        .{ .p = q.in(day, 0.5), .kind = .down },
+        .{ .p = q.in(day, 0.5), .kind = .up },
+        .{ .p = q.in(day, 0.5), .kind = .down, .clicks = 2 },
+        .{ .p = q.in(1, 0.5), .kind = .dragged, .clicks = 2 },
+        .{ .p = q.in(1, 0.5), .kind = .up, .clicks = 2 },
+    }), .selected = "Gõ vào đây" });
+    try steps.append(arena, .{ .what = "a drag past the end of the field", .events = try arena.dupe(MouseEv, &.{
+        .{ .p = q.in(vao, 0.25), .kind = .down },
+        .{ .p = .{ .x = field.x + field.w + 80, .y = field.y + field.h / 2 }, .kind = .dragged },
+        .{ .p = .{ .x = field.x + field.w + 80, .y = field.y + field.h / 2 }, .kind = .up },
+    }), .selected = "vào đây: tiếng " });
+    try steps.append(arena, .{ .what = "a triple-click selects it all", .events = try arena.dupe(MouseEv, &.{
+        .{ .p = q.in(vao, 0.5), .kind = .down },
+        .{ .p = q.in(vao, 0.5), .kind = .up },
+        .{ .p = q.in(vao, 0.5), .kind = .down, .clicks = 2 },
+        .{ .p = q.in(vao, 0.5), .kind = .up, .clicks = 2 },
+        .{ .p = q.in(vao, 0.5), .kind = .down, .clicks = 3 },
+        .{ .p = q.in(vao, 0.5), .kind = .up, .clicks = 3 },
+    }), .selected = s });
+    try steps.append(arena, .{ .what = "a click outside the field changes nothing", .events = try arena.dupe(MouseEv, &.{
+        .{ .p = .{ .x = field.x + 10, .y = field.y - 40 }, .kind = .down },
+        .{ .p = .{ .x = field.x + 10, .y = field.y - 40 }, .kind = .up },
+    }), .selected = s });
+    return steps.toOwnedSlice(arena);
+}
+
 fn rangeRect(ctx: ?*anyopaque, r: ui.Range) ui.Rect {
     const t: *const ui.Tree = @ptrCast(@alignCast(ctx.?));
     return demo.editableRangeRect(t, r);
@@ -246,6 +346,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var type_test = false;
     var telex = false;
     var ax_test = false;
+    var click_test = false;
     var args = std.process.Args.Iterator.init(init.args);
     _ = args.next();
     while (args.next()) |a| {
@@ -254,6 +355,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (std.mem.eql(u8, a, "--type")) type_test = true;
         if (std.mem.eql(u8, a, "--telex")) telex = true;
         if (std.mem.eql(u8, a, "--ax")) ax_test = true;
+        if (std.mem.eql(u8, a, "--click")) click_test = true;
     }
     // The capture of a composition in progress needs the swapchain to be
     // capturable.
@@ -305,7 +407,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var shown: std.ArrayList(u8) = .empty;
     defer shown.deinit(gpa);
     _ = try doc.insert(.application, demo.editable_initial);
-    win.setTextTarget(.{ .doc = &doc, .rect = rangeRect, .ctx = &t });
+    win.setTextTarget(.{ .doc = &doc, .rect = rangeRect, .hit = hitTest, .ctx = &t });
     defer win.setTextTarget(null);
     at.setDocument(demo.editable_node, &doc);
     at.setFocus(demo.editable_node);
@@ -353,6 +455,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var caret_visible = true;
     var capture_pending = false;
     var ax_typed: usize = 0;
+    var click_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer click_arena.deinit();
+    var click_steps: []ClickStep = &.{};
+    var click_at: usize = 0;
+    var click_wrong: u32 = 0;
     var ax_removed = false;
     const frame_ns = win.refreshInterval() * 1e9;
     var last_present_ns: u64 = 0;
@@ -438,6 +545,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
 
         const t0 = nowNs();
+        var scripted_frame = false;
 
         // --- the keyboard ---
         //
@@ -447,6 +555,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // the whole Mac text system, input method included.
         if (script_at < script.len and frames % 4 == 0 and frames > 0) {
             const st = script[script_at];
+            scripted_frame = true;
             const k0 = nowNs();
             if (st.chars.len == 0) win.sendKeyCode(st.code, st.mods) else win.sendKey(st.code, st.chars, st.bare, st.mods);
             const k = nowNs() - k0;
@@ -480,6 +589,29 @@ pub fn main(init: std.process.Init.Minimal) !void {
             const h = std.hash.Wyhash.hash(0, doc.text());
             win.accessibilityTextChanged(demo.editable_node, h != text_hash);
             text_hash = h;
+        }
+        // `--click`: one gesture every six frames, from the tenth on, so the
+        // field has been laid out and presented before the first.
+        if (click_test and frames >= 10 and frames % 6 == 0) {
+            if (click_steps.len == 0 and click_at == 0) click_steps = try clickScript(click_arena.allocator(), &t, doc.text());
+            if (click_at < click_steps.len) {
+                const st = click_steps[click_at];
+                scripted_frame = true;
+                for (st.events) |e| win.sendMouse(e.p, e.kind, e.clicks, e.shift);
+                const sel = doc.selection();
+                const got = doc.text()[sel.start..sel.end];
+                var ok = std.mem.eql(u8, got, st.selected);
+                if (st.caret_before) |after| ok = ok and std.mem.eql(u8, doc.text()[doc.focus..], after);
+                if (!ok) click_wrong += 1;
+                std.debug.print("  {s}: \"{s}\" -- {s}\n", .{ st.what, got, if (ok) "ok" else "WRONG" });
+                click_at += 1;
+            } else if (frames > 10 + 6 * (click_steps.len + 2)) {
+                std.debug.print("{d} gestures, {d} wrong; {d} presses reached the field, {d} the input method\n", .{
+                    click_steps.len, click_wrong, win.ime.presses, win.ime.presses_to_input_method,
+                });
+                if (click_wrong > 0) return error.ClickScriptDiverged;
+                break;
+            }
         }
         while (win.access_presses.pop()) |n| {
             std.debug.print("pressed through accessibility: \"{s}\"\n", .{if (at.get(n)) |node| node.name else "?"});
@@ -547,7 +679,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
         frames += 1;
         if (layout.total() > 0) frames_with_layout += 1;
         if (built.rebuilt) frames_with_scene += 1;
-        if (layout.total() == 0 and !built.rebuilt) {
+        // A frame that ran a scripted keystroke or gesture is not idle even
+        // when it changed nothing -- clicking outside the field does not --
+        // because it spent milliseconds in AppKit and the input method.
+        if (layout.total() == 0 and !built.rebuilt and !scripted_frame) {
             idle_frames += 1;
             idle_cpu_ns += cpu;
         }

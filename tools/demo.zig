@@ -168,6 +168,25 @@ pub fn editableRangeRect(t: *const Tree, r: ui.Range) ui.Rect {
     return .{ .x = b.x + pad + rr.x, .y = b.y + pad + rr.y, .w = rr.w, .h = rr.h };
 }
 
+/// Where a point in layout units is in the editable field's text, or null
+/// outside the field; with `clamp`, the nearer end instead.
+/// The other half of `editableRangeRect`, and the platform's whole view of
+/// where a click landed: what the click *does* is `editing.press`.
+///
+/// Offsets are into the shaped run, which is the document's text unless a
+/// Wayland preedit is spliced into it; a click during one is refused before
+/// this matters (`editing.press` returns `error.Locked`).
+pub fn editableHit(t: *const Tree, doc_len: usize, p: ui.Point, clamp: bool) ?ui.editing.Hit {
+    const e = editable orelse return null;
+    const f = t.bounds(e.field);
+    if (!clamp and (p.x < f.x or p.y < f.y or p.x >= f.x + f.w or p.y >= f.y + f.h)) return null;
+    const b = t.bounds(e.label);
+    const pad = t.style(e.label).padding;
+    const run = t.text(e.label);
+    const x = p.x - (b.x + pad);
+    return .{ .caret = run.byteAt(x, doc_len), .char = run.clusterAt(x, doc_len) };
+}
+
 /// More rows than the panel can show, so the clip and the culling both have
 /// something to do.
 const row_total = 20;

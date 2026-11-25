@@ -106,6 +106,9 @@ pub const Window = struct {
     /// What the input method did, counted. The evidence a spike reports.
     ime: ImeStats = .{},
 
+    /// The press being dragged, if a mouse button is down in the text target.
+    gesture: ?ui.editing.Gesture = null,
+
     /// The accessibility tree this window describes, if any. See
     /// `setAccessTarget` and `macos_access.zig`.
     access: ?ax.Target = null,
@@ -126,6 +129,12 @@ pub const Window = struct {
         /// `docs/text-and-accessibility.md` §7, and every spike answered it
         /// with a fixed rectangle. Null answers with the view's corner.
         rect: ?*const fn (ctx: ?*anyopaque, r: ui.Range) ui.Rect = null,
+        /// Where a point in layout units is in the text -- the nearest caret
+        /// boundary and the character under it -- or null when the point is
+        /// outside the field. With `clamp`, a point outside still answers,
+        /// at the nearer end, which is what a drag that leaves the field
+        /// wants. Null disables the pointer.
+        hit: ?*const fn (ctx: ?*anyopaque, doc: *const ui.Document, p: ui.Point, clamp: bool) ?ui.editing.Hit = null,
         ctx: ?*anyopaque = null,
     };
 
@@ -148,6 +157,12 @@ pub const Window = struct {
         refused: u32 = 0,
         rect_queries: u32 = 0,
         substring_queries: u32 = 0,
+        /// Mouse presses that moved the caret or the selection, and the ones
+        /// the input method took instead.
+        presses: u32 = 0,
+        presses_to_input_method: u32 = 0,
+        /// Compositions committed because the user clicked elsewhere.
+        committed_by_click: u32 = 0,
     };
 
     pub fn open(gpa: Allocator, title: [*:0]const u8, w: u32, h: u32) Error!*Window {
@@ -405,6 +420,39 @@ pub const Window = struct {
         }
     }
 
+    pub const MouseKind = enum { down, dragged, up };
+
+    /// A left-button event at a point in layout units, delivered through
+    /// AppKit like `sendKey`: to the window, the view, and the input method,
+    /// which sees mouse events first. `clicks` is the click count AppKit
+    /// would have computed -- two for the second press of a double-click.
+    pub fn sendMouse(self: *Window, p: ui.Point, kind: MouseKind, clicks: u32, shift: bool) void {
+        const pool = objc.AutoreleasePool.push();
+        defer pool.pop();
+        const bounds = send(objc.CGRect, self.view, "bounds", .{});
+        const in_view: objc.CGPoint = .{ .x = p.x, .y = bounds.size.height - p.y };
+        const in_window = send(objc.CGPoint, self.view, "convertPoint:toView:", .{ in_view, @as(?id, null) });
+        const kind_code: objc.NSUInteger = switch (kind) {
+            .down => 1,
+            .up => 2,
+            .dragged => 6,
+        };
+        const flags: objc.NSUInteger = if (shift) 1 << 17 else 0;
+        const now = send(f64, send(id, objc.class("NSProcessInfo") catch return, "processInfo", .{}), "systemUptime", .{});
+        const ev = send(?id, objc.class("NSEvent") catch return, "mouseEventWithType:location:modifierFlags:timestamp:windowNumber:context:eventNumber:clickCount:pressure:", .{
+            kind_code,
+            in_window,
+            flags,
+            now,
+            send(objc.NSInteger, self.window, "windowNumber", .{}),
+            @as(?id, null),
+            @as(objc.NSInteger, 0),
+            @as(objc.NSInteger, @intCast(clicks)),
+            @as(f32, if (kind == .up) 0 else 1),
+        }) orelse return;
+        send(void, self.window, "sendEvent:", .{ev});
+    }
+
     pub const KeyMods = packed struct {
         shift: bool = false,
         control: bool = false,
@@ -622,6 +670,9 @@ fn viewClass() Error!objc.Class {
         try b.method("acceptsFirstResponder", &acceptsFirstResponder, B ++ "@:");
         try b.method("keyDown:", &keyDown, "v@:@");
         try b.method("selectAll:", &selectAll, "v@:@");
+        try b.method("mouseDown:", &mouseDown, "v@:@");
+        try b.method("mouseDragged:", &mouseDragged, "v@:@");
+        try b.method("mouseUp:", &mouseUp, "v@:@");
 
         try b.method("insertText:replacementRange:", &insertText, "v@:@" ++ R);
         try b.method("setMarkedText:selectedRange:replacementRange:", &setMarkedText, "v@:@" ++ R ++ R);
@@ -806,8 +857,76 @@ fn axHitTest(self: id, _: objc.SEL, p: objc.CGPoint) callconv(.c) ?id {
     return ax.viewHitTest(w, self, p);
 }
 
-fn characterIndex(_: id, _: objc.SEL, _: objc.CGPoint) callconv(.c) objc.NSUInteger {
-    // Asked when the user clicks inside marked text. There is no click
-    // handling yet, so there is no answer but this one.
-    return ic.not_found;
+/// Where an event's location is in the text, through the target's hit test.
+fn hitOf(w: *Window, event: id, clamp: bool) ?ui.editing.Hit {
+    const t = w.text orelse return null;
+    const f = t.hit orelse return null;
+    const loc = send(objc.CGPoint, event, "locationInWindow", .{});
+    const v = send(objc.CGPoint, w.view, "convertPoint:fromView:", .{ loc, @as(?id, null) });
+    const bounds = send(objc.CGRect, w.view, "bounds", .{});
+    return f(t.ctx, t.doc, .{ .x = @floatCast(v.x), .y = @floatCast(bounds.size.height - v.y) }, clamp);
+}
+
+/// Offers a mouse event to the input method, which sees them first: a click
+/// inside marked text is how a user picks a point in a composition, and only
+/// the input method knows what that means.
+fn toInputMethod(self: id, event: id) bool {
+    const ctx = send(?id, self, "inputContext", .{}) orelse return false;
+    return objc.truthy(send(objc.BOOL, ctx, "handleEvent:", .{event}));
+}
+
+fn mouseDown(self: id, _: objc.SEL, event: id) callconv(.c) void {
+    const w = stateOf(self) orelse return;
+    const t = w.text orelse return;
+    if (toInputMethod(self, event)) {
+        w.ime.presses_to_input_method += 1;
+        return;
+    }
+    const at = hitOf(w, event, false) orelse return;
+    // The input method declined the click, so the composition ends where it
+    // stands: committed, and the input method told to drop its state. This
+    // is what NSTextView does, and the alternative -- a caret outside a
+    // composition that is still provisional -- is the state `canEditNow`
+    // exists to forbid.
+    if (ic.hasMarkedText(t.doc)) {
+        ic.unmarkText(t.doc);
+        if (send(?id, self, "inputContext", .{})) |ctx| send(void, ctx, "discardMarkedText", .{});
+        w.ime.committed_by_click += 1;
+        w.text_changed = true;
+    }
+    const clicks: u32 = @intCast(@max(1, send(objc.NSInteger, event, "clickCount", .{})));
+    const flags = send(objc.NSUInteger, event, "modifierFlags", .{});
+    const p = ui.editing.press(t.doc, at, clicks, flags & (1 << 17) != 0) catch {
+        w.ime.refused += 1;
+        return;
+    };
+    w.gesture = p.gesture;
+    w.ime.presses += 1;
+    if (p.result.moved) w.text_changed = true;
+}
+
+fn mouseDragged(self: id, _: objc.SEL, event: id) callconv(.c) void {
+    const w = stateOf(self) orelse return;
+    const t = w.text orelse return;
+    if (toInputMethod(self, event)) return;
+    const g = w.gesture orelse return;
+    const at = hitOf(w, event, true) orelse return;
+    const res = ui.editing.drag(t.doc, g, at) catch return;
+    if (res.moved) w.text_changed = true;
+}
+
+fn mouseUp(self: id, _: objc.SEL, event: id) callconv(.c) void {
+    const w = stateOf(self) orelse return;
+    _ = toInputMethod(self, event);
+    w.gesture = null;
+}
+
+fn characterIndex(self: id, _: objc.SEL, screen: objc.CGPoint) callconv(.c) objc.NSUInteger {
+    // Asked by an input method about a click inside its marked text: which
+    // character, in UTF-16, is under this screen point.
+    const w = stateOf(self) orelse return ic.not_found;
+    const t = w.text orelse return ic.not_found;
+    const f = t.hit orelse return ic.not_found;
+    const h = f(t.ctx, t.doc, w.screenPointToLayout(screen), false) orelse return ic.not_found;
+    return ui.offsets.byteToUtf16(t.doc.text(), h.char);
 }
