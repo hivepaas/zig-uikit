@@ -10,11 +10,12 @@ A declarative GPU UI toolkit for Zig.
 > There are no widgets. Expect the API to change without notice.
 
 ```sh
-zig build test                           # 190 tests, no platform dependencies
+zig build test                           # 197 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
 zig build test-text                      # 16 tests, needs a font installed
 zig build test-input                     # 14 tests, needs xkbcommon and a layout
+zig build check-macos                    # type-checks the macOS sources, from Linux
 zig build test-gpu                       # Vulkan: 8 tests; Metal: 11 tests
 zig build gpu-demo                       # renders on the GPU, diffs against the reference
 zig build window                         # opens a window and renders into it
@@ -585,7 +586,16 @@ Wrapping also needs a width given to it rather than discovered, and that is a
 real limitation and not a simplification for the demo. The width a paragraph
 may use comes from layout, and layout needs the paragraph's size; resolving
 that needs a measure pass this engine does not have. A fixed-width container
-has no such problem, which is why the demo's popover is given one.
+has no such problem, which is why the demo's popover is given one — and the
+editable field, whose width comes from its row, is handled by laying out,
+wrapping to the width layout gave it, and laying out again. That is the
+measure pass, written at the one call site that needs it instead of hidden
+inside the engine. In the window it costs a frame of staleness on a resize and
+nothing otherwise.
+
+A selection that runs across a line break is also still one rectangle rather
+than several, so the demo draws none when the two ends are on different lines.
+What that needs is a repeat over the line table, which is a widget's job.
 
 Of the eight requirements in
 [docs/text-and-accessibility.md](docs/text-and-accessibility.md), §1 (unit
@@ -673,13 +683,22 @@ counters is a claim that can be falsified.
 
 ### What the editing layer refuses to do
 
-`.up` and `.down` are reported **unhandled**, not approximated. There is a
-line breaker now and `text_layout.byteOnLine` answers exactly the question a
-vertical arrow asks — but `editing.apply` takes a document and no geometry, so
-it is not the layer that can answer it. Wiring the two together is the next
-slice; a caret that guesses in the meantime is worse than one that does not
-move. `.home` and `.end` go to the ends of the *document* for the same reason,
-and the code says so. The clipboard
+`.up` and `.down` work now, and how they get geometry is the interesting part.
+`editing.Options` carries a borrowed `text_layout.Wrapped` — **the one place
+geometry enters the editing layer** — because which line a byte is on is a fact
+about how the text was *set*, not about the document. With none, the vertical
+movements still report themselves unhandled rather than guessing, and Home and
+End still mean the document's ends. Home is the line and Ctrl+Home the
+document, which is what both platforms do.
+
+**The column is the x, and it survives a short line.** Up and down aim for the
+x the caret had before the *first* of them, not the one it has now; without
+that, a caret that passes through a short line drifts left and never comes
+back, which is the single most noticeable thing a text field can get wrong
+about arrow keys. `Options.goal_x` carries it in, `Result.goal_x` carries it
+out, and every other movement reports null, which is how the caller knows to
+forget it. A test walks a caret down through a two-character line and back out
+onto a long one and checks it returns to the column it left. The clipboard
 keys are not handled either: Ctrl+C needs `wl_data_device` and a round trip
 through the compositor, which is a protocol dependency and not an editing
 operation with a key attached.
@@ -1168,6 +1187,38 @@ removed, **1**. The byte order now matters only to the capture, which reorders
 when it copies the frame out.
 
 ![the frame the compositor was handed](docs/demo-window.png)
+
+## A check that was not checking
+
+Commits from the Linux machine kept saying "every Zig source compiles; only
+the SDK is missing at link time", on the strength of
+`zig build -Dtarget=aarch64-macos` reporting nothing but
+`unable to find dynamic system library "freetype"`.
+
+**That was wrong, and had been for several commits.** Linking a system library
+the host does not have fails during library *resolution*, which happens before
+semantic analysis runs — so a genuine type error in a macOS source produces no
+diagnostic at all. Tested by putting one there on purpose:
+
+```zig
+const deliberate: u8 = "nope";
+```
+
+and watching the build report only the missing libraries. A real arity break
+had already slipped through: `demo.refreshEditable` grew two parameters and
+the macOS demo still called it with four.
+
+`zig build check-macos` is the check that does run. It is
+`build-exe -fno-emit-bin` with the link inputs dropped, which skips linking and
+does analyse, and it fails on the line above. It knows the macOS module graph
+by hand, which is duplication of the kind that fails loudly: a module renamed
+on the other side makes the step error rather than quietly check less.
+
+The first version of it reported success without running. A `Run` step with no
+declared file inputs is cached on its argv, and the argv does not change when a
+source does — the same failure in a new place, caught only because the negative
+test was run as well as the positive one. `has_side_effects` makes it run every
+time, which is what a check should do.
 
 ## macOS
 

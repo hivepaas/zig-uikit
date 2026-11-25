@@ -116,6 +116,11 @@ fn typeScript(gpa: std.mem.Allocator) ![]ui.KeyEvent {
 
     // Four characters back off the end; the last of them is multi-byte.
     for (0..4) |_| try list.append(gpa, ui.KeyEvent.named(.backspace));
+    // Down and back up: the field wraps, so these have a second line to move
+    // between, and the column has to survive the round trip.
+    try list.append(gpa, ui.KeyEvent.named(.down));
+    try list.append(gpa, ui.KeyEvent.named(.up));
+
     // To the start, one word in, then select to the end and type over it.
     try list.append(gpa, ui.KeyEvent.named(.home));
     try list.append(gpa, ui.KeyEvent.named(.right).withMods(ctrl));
@@ -123,6 +128,11 @@ fn typeScript(gpa: std.mem.Allocator) ![]ui.KeyEvent {
     try list.append(gpa, ui.KeyEvent.named(.end).withMods(shift));
     try list.append(gpa, ui.KeyEvent.typed("X"));
     try list.append(gpa, ui.KeyEvent.named(.backspace).withMods(ctrl));
+    // And the vertical pair again from the end, which is where the lines are
+    // uneven and a caret without a goal column would drift.
+    try list.append(gpa, ui.KeyEvent.named(.end).withMods(ctrl));
+    try list.append(gpa, ui.KeyEvent.named(.up));
+    try list.append(gpa, ui.KeyEvent.named(.down));
     return list.toOwnedSlice(gpa);
 }
 
@@ -231,6 +241,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Scratch for `displayText`, which splices the preedit in at the caret.
     var shown: std.ArrayList(u8) = .empty;
     defer shown.deinit(gpa);
+    // The wrapped run and its line table. Owned here because `demo.editable`
+    // borrows them: they live as long as the field does.
+    var wrapped_glyphs: std.ArrayList(ui.Glyph) = .empty;
+    defer wrapped_glyphs.deinit(gpa);
+    var wrapped_lines: std.ArrayList(ui.text_layout.Line) = .empty;
+    defer wrapped_lines.deinit(gpa);
+
+    // Wrap the field once before anything reads its geometry: `buildUi` set
+    // the text unwrapped, and the bridge and the input method below both ask
+    // where the caret is.
+    try demo.refreshEditable(&t, &fonts, &doc, &shown, &wrapped_glyphs, &wrapped_lines);
+    _ = t.flush();
 
     // Where the candidate window should go. Surface coordinates, which is
     // what `set_cursor_rectangle` takes -- so this needs the text layout and
@@ -341,6 +363,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer if (type_test) gpa.free(script);
     var script_at: usize = 0;
     var ime_at: usize = 0;
+    // A resize changes the width the text wraps to, so the field has to be
+    // laid out again -- the one thing about this field that a frame which
+    // changed no text still has to do.
+    var rewrap = false;
+    // The column a run of vertical arrow keys is aiming for. See
+    // `editing.Options.goal_x`.
+    var goal_x: ?f32 = null;
 
     while (!win.closed) {
         win.pump();
@@ -358,6 +387,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 .h = @floatFromInt(swapchain.extent.height),
             });
             relayouts += 1;
+            rewrap = true;
             // The hover highlight belongs to an element that may no longer be
             // under the pointer, and its saved paint was captured before the
             // relayout; forget it rather than restore it to the wrong element.
@@ -378,7 +408,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // input method's own edit is not news to it, and `tiDone` has already
         // answered it.
         const ime_changed = win.takeImeDirty();
-        var text_dirty = ime_changed;
+        var text_dirty = ime_changed or rewrap;
+        rewrap = false;
         var app_changed = false;
         // The input method's edit happened inside `pump` and produced no
         // `Edit` here, so the bridge recovers it by comparison.
@@ -412,7 +443,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 win.closed = true;
                 break;
             }
-            const r = ui.editing.apply(&doc, ev, .{}) catch |e| switch (e) {
+            const r = ui.editing.apply(&doc, ev, .{
+                .lines = demo.editableLines(),
+                .goal_x = goal_x,
+            }) catch |e| switch (e) {
                 // No input method is attached to this document yet, so there
                 // is nothing to hold a lock or to be composing. Reported
                 // rather than ignored, because if it ever happens it means the
@@ -430,6 +464,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 },
                 else => return e,
             };
+            // Kept across keystrokes and cleared by anything that is not a
+            // vertical move, which reports null.
+            goal_x = r.goal_x;
             if (r.handled) keystrokes += 1 else unhandled += 1;
             if (r.edited or r.moved) {
                 text_dirty = true;
@@ -445,7 +482,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
         if (text_dirty) {
             const e0 = nowNs();
-            demo.refreshEditable(&t, &fonts, &doc, &shown) catch |e| switch (e) {
+            demo.refreshEditable(&t, &fonts, &doc, &shown, &wrapped_glyphs, &wrapped_lines) catch |e| switch (e) {
                 // 512x512 holds thousands of glyphs at this size, so this
                 // needs a lot of distinct characters to reach. It is caught
                 // rather than propagated because losing the window over it
@@ -590,6 +627,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 .h = @floatFromInt(swapchain.extent.height),
             });
             relayouts += 1;
+            rewrap = true;
             hovered = 0;
             continue;
         }

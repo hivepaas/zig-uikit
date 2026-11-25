@@ -32,6 +32,7 @@
 const std = @import("std");
 
 const document = @import("document.zig");
+const text_layout = @import("text_layout.zig");
 const keys = @import("keys.zig");
 const offsets = @import("offsets.zig");
 
@@ -46,6 +47,28 @@ pub const Options = struct {
     /// unhandled so that whatever owns the field can treat it as "submit"
     /// rather than having to undo an insertion.
     multiline: bool = false,
+
+    /// The field's lines, as the text layer laid them out.
+    ///
+    /// This is the one place geometry enters the editing layer, and it is
+    /// borrowed rather than owned: which line a byte is on is a fact about
+    /// how the text was *set*, not about the document, and a field that has
+    /// not been laid out yet has no answer. Null means exactly that -- the
+    /// vertical movements then report themselves unhandled, and Home and End
+    /// mean the ends of the document, which is what they meant before there
+    /// was a line breaker.
+    lines: ?*const text_layout.Wrapped = null,
+
+    /// The x a run of vertical movements is aiming for.
+    ///
+    /// Up and down keep the column, and the column is the x the caret had
+    /// *before the first* of them -- not the x it has now. Without that, a
+    /// caret that passes through a short line drifts left and never comes
+    /// back, which is the single most noticeable thing a text editor can get
+    /// wrong about arrow keys. The caller keeps whatever `Result.goal_x` said
+    /// and hands it back; any other movement clears it, because it reports
+    /// null.
+    goal_x: ?f32 = null,
 };
 
 pub const Result = struct {
@@ -62,6 +85,9 @@ pub const Result = struct {
     /// Present exactly when `edited` is set, carrying the extent in all three
     /// offset units for whatever has to be told about it.
     edit: ?document.Edit = null,
+    /// The column a following vertical movement should aim for, or null to
+    /// forget one. See `Options.goal_x`.
+    goal_x: ?f32 = null,
 };
 
 /// What a keystroke means to a text field, apart from typing: the vocabulary
@@ -86,8 +112,15 @@ pub const Command = struct {
         char_right,
         word_left,
         word_right,
-        /// The ends of the document, not of a line: there is no line breaker.
-        /// See the note at the top of the file.
+        /// Up and down, keeping the column. They need `Options.lines`; with
+        /// none they report themselves unhandled rather than guessing.
+        line_up,
+        line_down,
+        /// The ends of the line the caret is on, or of the document when
+        /// there are no lines to ask.
+        line_start,
+        line_end,
+        /// The ends of the document: Ctrl+Home and Ctrl+End.
         doc_start,
         doc_end,
         delete_char_backward,
@@ -121,16 +154,21 @@ pub fn commandFor(ev: KeyEvent) ?Command {
     return switch (ev.key) {
         .left => .{ .op = if (m.ctrl) .word_left else .char_left, .extend = m.shift },
         .right => .{ .op = if (m.ctrl) .word_right else .char_right, .extend = m.shift },
-        .home => .{ .op = .doc_start, .extend = m.shift },
-        .end => .{ .op = .doc_end, .extend = m.shift },
+        // Home is the start of the line and Ctrl+Home the start of the
+        // document, which is what every toolkit on these two platforms does.
+        // With no lines to ask, the two mean the same thing.
+        .home => .{ .op = if (m.ctrl) .doc_start else .line_start, .extend = m.shift },
+        .end => .{ .op = if (m.ctrl) .doc_end else .line_end, .extend = m.shift },
+        .up => .{ .op = .line_up, .extend = m.shift },
+        .down => .{ .op = .line_down, .extend = m.shift },
         .backspace => .{ .op = if (m.ctrl) .delete_word_backward else .delete_char_backward },
         .delete => .{ .op = if (m.ctrl) .delete_word_forward else .delete_char_forward },
         .enter => .{ .op = .newline },
-        // No line breaker, so there is no second line to move to. Reported as
-        // unhandled rather than silently swallowed, so that a scroll view
-        // above can still act on it. Focus traversal and dismissal belong to
-        // whatever owns the field.
-        .up, .down, .page_up, .page_down, .tab, .escape, .insert, .none => null,
+        // A page is a viewport height, which this layer is not told. Focus
+        // traversal and dismissal belong to whatever owns the field. All
+        // reported as unhandled rather than silently swallowed, so that a
+        // scroll view above can still act on them.
+        .page_up, .page_down, .tab, .escape, .insert, .none => null,
     };
 }
 
@@ -171,7 +209,17 @@ pub fn apply(doc: *Document, ev: KeyEvent, opt: Options) Error!Result {
 /// as `apply`, for the same reasons.
 pub fn applyCommand(doc: *Document, cmd: Command, opt: Options) Error!Result {
     switch (cmd.op) {
-        .char_left, .char_right, .word_left, .word_right, .doc_start, .doc_end => return move(doc, cmd),
+        .char_left,
+        .char_right,
+        .word_left,
+        .word_right,
+        .line_start,
+        .line_end,
+        .doc_start,
+        .doc_end,
+        => return move(doc, cmd, opt),
+
+        .line_up, .line_down => return moveVertical(doc, cmd, opt),
 
         .select_all => {
             if (!doc.canEditNow()) return Error.Locked;
@@ -240,18 +288,24 @@ pub fn isInsertable(s: []const u8) bool {
 
 // ------------------------------------------------------------------- movement
 
-fn move(doc: *Document, cmd: Command) Error!Result {
+fn move(doc: *Document, cmd: Command, opt: Options) Error!Result {
     if (!doc.canEditNow()) return Error.Locked;
 
     const s = doc.text();
     const sel = doc.selection();
 
     const target: usize = switch (cmd.op) {
-        // To the ends of the DOCUMENT, not of the line. There is no line
-        // breaker, so there are no line ends to go to; when there is one, this
-        // is the function that changes.
         .doc_start => 0,
         .doc_end => s.len,
+        // The ends of the line the caret is on, when anything knows where
+        // those are. With no layout they are the document's, which is what
+        // Home and End meant before there was a line breaker.
+        .line_start, .line_end => blk: {
+            const w = opt.lines orelse break :blk if (cmd.op == .line_start) 0 else s.len;
+            if (w.lines.len == 0) break :blk 0;
+            const ln = w.lines[w.lineOf(doc.focus)];
+            break :blk if (cmd.op == .line_start) ln.start else ln.end;
+        },
         .char_left, .word_left => blk: {
             // An unshifted arrow with a selection collapses it to the near
             // edge rather than moving from the focus. Which edge is "near"
@@ -278,6 +332,48 @@ fn move(doc: *Document, cmd: Command) Error!Result {
     return .{
         .handled = true,
         .moved = doc.anchor != anchor_was or doc.focus != focus_was,
+    };
+}
+
+/// Up and down, keeping the column.
+///
+/// Reports itself unhandled with no layout, rather than approximating. A
+/// caret that guesses which line it is on is worse than one that does not
+/// move: the guess is invisible until the text wraps, and then it is wrong
+/// everywhere at once.
+fn moveVertical(doc: *Document, cmd: Command, opt: Options) Error!Result {
+    const w = opt.lines orelse return .{};
+    if (w.lines.len == 0) return .{};
+    if (!doc.canEditNow()) return Error.Locked;
+
+    const line = w.lineOf(doc.focus);
+    // The column is the one the caret had before the *first* vertical move,
+    // not the one it has now. See `Options.goal_x`.
+    const goal = opt.goal_x orelse w.caret(doc.focus).x;
+    const up = cmd.op == .line_up;
+
+    const target: usize = if (up and line == 0)
+        // Already on the first line: go to the start of the document, which
+        // is what every text field does and is more useful than refusing.
+        0
+    else if (!up and line + 1 >= w.lines.len)
+        doc.len()
+    else
+        w.byteOnLine(if (up) line - 1 else line + 1, goal, doc.len());
+
+    const anchor_was = doc.anchor;
+    const focus_was = doc.focus;
+    if (cmd.extend) {
+        try doc.setSelection(doc.anchor, target);
+    } else {
+        try doc.setCaret(target);
+    }
+    return .{
+        .handled = true,
+        .moved = doc.anchor != anchor_was or doc.focus != focus_was,
+        // Kept even when the caret ran into the end of the document, so that
+        // coming back up returns to the column it left.
+        .goal_x = goal,
     };
 }
 
@@ -771,4 +867,185 @@ test "a double-click on the right half of a word's last letter selects that word
     const g = std.mem.indexOf(u8, d.text(), "g").?;
     _ = try press(&d, .{ .caret = g + 1, .char = g }, 2, false);
     try testing.expectEqualStrings("tiếng", d.text()[d.selection().start..d.selection().end]);
+}
+
+// ------------------------------------------------------ up, down, and Home
+//
+// A layout built by hand, one glyph per codepoint and all the same width, for
+// the same reason `text_layout.zig` does it: the question is which line a byte
+// is on, not how wide a `W` is.
+
+const Laid = struct {
+    src: std.ArrayList(glyph_mod.Glyph) = .empty,
+    gl: std.ArrayList(glyph_mod.Glyph) = .empty,
+    ln: std.ArrayList(text_layout.Line) = .empty,
+    w: text_layout.Wrapped = undefined,
+
+    const advance = 10;
+
+    fn deinit(self: *Laid) void {
+        self.src.deinit(testing.allocator);
+        self.gl.deinit(testing.allocator);
+        self.ln.deinit(testing.allocator);
+    }
+
+    fn of(self: *Laid, s: []const u8, max_width: f32) !*const text_layout.Wrapped {
+        self.src.clearRetainingCapacity();
+        var i: usize = 0;
+        var k: f32 = 0;
+        while (i < s.len) {
+            const n = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
+            try self.src.append(testing.allocator, .{
+                .dx = k * advance,
+                .dy = 0,
+                .w = advance,
+                .h = 8,
+                .u0 = 0,
+                .v0 = 0,
+                .u1 = 1,
+                .v1 = 1,
+                .cluster = @intCast(i),
+                .pen_x = k * advance,
+            });
+            i += n;
+            k += 1;
+        }
+        const run: glyph_mod.TextRun = .{
+            .glyphs = self.src.items,
+            .width = k * advance,
+            .ascent = 8,
+            .descent = 2,
+        };
+        self.w = try text_layout.wrap(testing.allocator, run, s, max_width, 12, &self.gl, &self.ln);
+        return &self.w;
+    }
+};
+
+const glyph_mod = @import("glyph.zig");
+
+test "down moves to the line below at the same column" {
+    var d = try docWith("one two three");
+    defer d.deinit();
+    var l: Laid = .{};
+    defer l.deinit();
+    const w = try l.of(d.text(), 8 * Laid.advance);
+    // Two lines: "one two" and "three".
+    try testing.expectEqual(@as(usize, 2), w.lines.len);
+
+    try d.setCaret(2); // third character of line 0
+    const r = try apply(&d, KeyEvent.named(.down), .{ .lines = w });
+    try testing.expect(r.handled and r.moved);
+    try testing.expectEqual(@as(usize, 10), d.focus); // third character of line 1
+    try testing.expectEqual(@as(?f32, 2 * Laid.advance), r.goal_x);
+
+    const back = try apply(&d, KeyEvent.named(.up), .{ .lines = w, .goal_x = r.goal_x });
+    try testing.expect(back.moved);
+    try testing.expectEqual(@as(usize, 2), d.focus);
+}
+
+test "the column survives a short line instead of drifting left" {
+    // The thing a text editor is most noticeably wrong about when it gets
+    // this wrong: a caret that passes through a short line and never comes
+    // back to where it was.
+    var d = try docWith("aaaaaaaa\nbb\ncccccccc");
+    defer d.deinit();
+    var l: Laid = .{};
+    defer l.deinit();
+    const w = try l.of(d.text(), 1000);
+    try testing.expectEqual(@as(usize, 3), w.lines.len);
+
+    try d.setCaret(6); // seventh character of the first line
+    var goal: ?f32 = null;
+
+    const down1 = try apply(&d, KeyEvent.named(.down), .{ .lines = w, .goal_x = goal });
+    goal = down1.goal_x;
+    // The middle line has two characters, so the caret lands at its end.
+    try testing.expectEqual(@as(usize, 11), d.focus);
+
+    const down2 = try apply(&d, KeyEvent.named(.down), .{ .lines = w, .goal_x = goal });
+    goal = down2.goal_x;
+    // And the column comes back on the long line below. Without the goal it
+    // would have stayed at two characters across.
+    try testing.expectEqual(@as(usize, 18), d.focus);
+    try testing.expectEqual(@as(?f32, 6 * Laid.advance), goal);
+}
+
+test "any other movement forgets the column" {
+    var d = try docWith("aaaaaaaa\nbb\ncccccccc");
+    defer d.deinit();
+    var l: Laid = .{};
+    defer l.deinit();
+    const w = try l.of(d.text(), 1000);
+
+    try d.setCaret(6);
+    const down = try apply(&d, KeyEvent.named(.down), .{ .lines = w });
+    try testing.expect(down.goal_x != null);
+    // A horizontal move reports no column, which is how the caller knows to
+    // forget the one it was keeping.
+    const left = try apply(&d, KeyEvent.named(.left), .{ .lines = w });
+    try testing.expectEqual(@as(?f32, null), left.goal_x);
+}
+
+test "up on the first line and down on the last go to the document's ends" {
+    var d = try docWith("one\ntwo");
+    defer d.deinit();
+    var l: Laid = .{};
+    defer l.deinit();
+    const w = try l.of(d.text(), 1000);
+
+    try d.setCaret(2);
+    _ = try apply(&d, KeyEvent.named(.up), .{ .lines = w });
+    try testing.expectEqual(@as(usize, 0), d.focus);
+
+    try d.setCaret(5);
+    _ = try apply(&d, KeyEvent.named(.down), .{ .lines = w });
+    try testing.expectEqual(d.len(), d.focus);
+}
+
+test "shift and a vertical arrow extend the selection" {
+    var d = try docWith("one two three");
+    defer d.deinit();
+    var l: Laid = .{};
+    defer l.deinit();
+    const w = try l.of(d.text(), 8 * Laid.advance);
+
+    try d.setCaret(2);
+    _ = try apply(&d, KeyEvent.named(.down).withMods(.{ .shift = true }), .{ .lines = w });
+    try testing.expectEqual(@as(usize, 2), d.anchor);
+    try testing.expectEqual(@as(usize, 10), d.focus);
+    try testing.expectEqualStrings("e two th", d.text()[d.selection().start..d.selection().end]);
+}
+
+test "Home is the line, Ctrl+Home is the document" {
+    var d = try docWith("one two three");
+    defer d.deinit();
+    var l: Laid = .{};
+    defer l.deinit();
+    const w = try l.of(d.text(), 8 * Laid.advance);
+
+    try d.setCaret(10); // on the second line
+    _ = try apply(&d, KeyEvent.named(.home), .{ .lines = w });
+    try testing.expectEqual(@as(usize, 8), d.focus);
+
+    _ = try apply(&d, KeyEvent.named(.end), .{ .lines = w });
+    try testing.expectEqual(d.len(), d.focus);
+
+    try d.setCaret(10);
+    _ = try apply(&d, KeyEvent.named(.home).withMods(.{ .ctrl = true }), .{ .lines = w });
+    try testing.expectEqual(@as(usize, 0), d.focus);
+
+    _ = try apply(&d, KeyEvent.named(.end).withMods(.{ .ctrl = true }), .{ .lines = w });
+    try testing.expectEqual(d.len(), d.focus);
+}
+
+test "with no layout, Home and End still mean the document's ends" {
+    // The fallback that keeps a field which has never been laid out usable,
+    // and the reason the existing tests above did not have to change.
+    var d = try docWith("one two three");
+    defer d.deinit();
+    try d.setCaret(5);
+    _ = try apply(&d, KeyEvent.named(.home), .{});
+    try testing.expectEqual(@as(usize, 0), d.focus);
+    _ = try apply(&d, KeyEvent.named(.end), .{});
+    try testing.expectEqual(d.len(), d.focus);
 }

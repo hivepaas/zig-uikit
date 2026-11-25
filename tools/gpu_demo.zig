@@ -64,6 +64,27 @@ pub fn main() !void {
     try demo.buildUi(&t, if (fonts) |*f| f else null);
     t.layout(.{ .w = width, .h = height });
 
+    // Lay out, then wrap the editable field to the width that layout gave it,
+    // then lay out again. That is the measure pass this engine does not have,
+    // done by hand at the one call site that needs it -- and it is why
+    // `buildUi` leaves the field's text on one line: it has no width to wrap
+    // to until this has happened.
+    var doc = ui.Document.init(gpa);
+    defer doc.deinit();
+    _ = try doc.insert(.application, demo.editable_initial);
+    // Outside the branch, because `demo.editable.wrapped` borrows them and
+    // the field outlives any block they could be scoped to.
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(gpa);
+    var wg: std.ArrayList(ui.Glyph) = .empty;
+    defer wg.deinit(gpa);
+    var wl: std.ArrayList(ui.text_layout.Line) = .empty;
+    defer wl.deinit(gpa);
+    if (fonts) |*f| {
+        try demo.refreshEditable(&t, f, &doc, &scratch, &wg, &wl);
+        _ = t.flush();
+    }
+
     var scene = ui.Scene.init(gpa);
     defer scene.deinit();
     const stats = try scene.build(&t);
@@ -127,10 +148,14 @@ pub fn main() !void {
     @memset(is_text, false);
     for (scene.items()) |q| {
         if (!q.flags.textured) continue;
-        const x0: usize = @intFromFloat(@max(0, q.x));
-        const y0: usize = @intFromFloat(@max(0, q.y));
-        const x1: usize = @intFromFloat(@min(@as(f32, width), q.x + q.w));
-        const y1: usize = @intFromFloat(@min(@as(f32, height), q.y + q.h));
+        // Clamped at both ends, because a quad may lie entirely outside the
+        // window -- a popover hanging off the edge, or text wider than what
+        // holds it -- and `x0..x1` with `x1 < x0` is an integer overflow
+        // rather than an empty range. Found by a panic, not by a review.
+        const x0: usize = @intFromFloat(std.math.clamp(q.x, 0, @as(f32, width)));
+        const y0: usize = @intFromFloat(std.math.clamp(q.y, 0, @as(f32, height)));
+        const x1: usize = @max(x0, @as(usize, @intFromFloat(std.math.clamp(q.x + q.w, 0, @as(f32, width)))));
+        const y1: usize = @max(y0, @as(usize, @intFromFloat(std.math.clamp(q.y + q.h, 0, @as(f32, height)))));
         for (y0..y1) |y| for (x0..x1) |x| {
             is_text[y * width + x] = true;
         };
@@ -182,8 +207,10 @@ pub fn main() !void {
         total,
         max_delta,
         @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(total)),
-        over1, 100 * @as(f64, @floatFromInt(over1)) / @as(f64, @floatFromInt(total)),
-        over8, 100 * @as(f64, @floatFromInt(over8)) / @as(f64, @floatFromInt(total)),
+        over1,
+        100 * @as(f64, @floatFromInt(over1)) / @as(f64, @floatFromInt(total)),
+        over8,
+        100 * @as(f64, @floatFromInt(over8)) / @as(f64, @floatFromInt(total)),
     });
     std.debug.print(
         \\of which {d} pixels are covered by a glyph:

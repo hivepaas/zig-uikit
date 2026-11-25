@@ -54,6 +54,10 @@ pub var composition_text_w: f32 = 0;
 pub const Editable = struct {
     field: Index,
     label: Index,
+    /// The field's lines as they were last laid out, for `editing.Options`:
+    /// which line a byte is on is a fact about how the text was set, and this
+    /// is where it is known. Valid until the next `refreshEditable`.
+    wrapped: ?ui.text_layout.Wrapped = null,
     /// Behind the text, so it is created before the label.
     selection: Overlay,
     /// Under the provisional text while an input method is composing, and
@@ -65,6 +69,16 @@ pub const Editable = struct {
     run_h: f32,
 };
 pub var editable: ?Editable = null;
+
+/// The editable field's lines, for `editing.Options`. Null before the field
+/// has been laid out, which is what tells the editing layer to report a
+/// vertical arrow unhandled rather than guess.
+pub fn editableLines() ?*const ui.text_layout.Wrapped {
+    if (editable) |*e| {
+        if (e.wrapped) |*w| return w;
+    }
+    return null;
+}
 
 /// The accessibility tree `buildUi` registers its nodes in, when the caller
 /// wants one: a screen reader's view of the same interface. Null for the
@@ -90,10 +104,13 @@ fn register(t: *Tree, el: Index, info: ui.access.Info) !ui.access.NodeId {
 /// What the editable field starts out holding.
 ///
 /// Chosen so that the field is interesting before anyone types: multi-byte
-/// characters, a word boundary an ASCII word-scan would get wrong, and a colon
-/// to step over. It ends on a space so that a composition started at the caret
+/// characters, word boundaries an ASCII word-scan would get wrong, and enough
+/// of it to wrap, so that the arrow keys have more than one line to move
+/// between. It ends on a space so that a composition started at the caret
 /// reads as a new word rather than running into the last one.
-pub const editable_initial = "Gõ vào đây: tiếng ";
+pub const editable_initial =
+    "Gõ vào đây: ô này tự xuống dòng khi chữ dài hơn bề ngang của nó, " ++
+    "và mũi tên lên xuống đi được giữa các dòng. Gõ thử: tiếng ";
 
 pub const caret_color = Color.white;
 pub const selection_color = Color.hex(0x2F4B8F);
@@ -116,43 +133,78 @@ pub fn refreshEditable(
     fonts: *Fonts,
     doc: *const ui.Document,
     scratch: *std.ArrayList(u8),
+    glyphs: *std.ArrayList(ui.Glyph),
+    lines: *std.ArrayList(ui.text_layout.Line),
 ) !void {
-    const e = editable orelse return;
+    // `if (editable) |*p|` and not `&(editable orelse return)`: the second
+    // takes the address of the unwrapped payload as an expression, and the
+    // store to `e.wrapped` below has to reach the module variable.
+    const e = if (editable) |*p| p else return;
 
     const shown = try doc.displayText(scratch);
-    const run = try fonts.ui.shape(&fonts.atlas, shown.text);
+    const one = try fonts.ui.shape(&fonts.atlas, shown.text);
+
+    // The width to wrap to is the field's content box *as it was last laid
+    // out*. There is no better answer available: the width comes from layout
+    // and layout needs the text's size, so on the frame a resize happens the
+    // wrap is one frame behind. The window relays out and calls this again,
+    // so it catches up immediately; it is a frame of staleness and not a
+    // wrong answer that stays wrong.
+    const avail = @max(0, t.bounds(e.field).w - field_padding * 2);
+    const w = try ui.text_layout.wrap(t.gpa, one, shown.text, avail, fonts.ui.line_height, glyphs, lines);
+    e.wrapped = w;
+
+    // A field of one line centres its text; a field of several fills its
+    // content box, so the offset is zero. One expression covers both.
+    const top = @max(0, (t.bounds(e.field).h - field_padding * 2 - w.run.height()) / 2);
 
     // The selection's offsets index the document. When a Wayland preedit has
     // been spliced into the laid-out line they no longer index *it*, so the
     // highlight is dropped rather than drawn over the wrong bytes. Nothing is
     // spliced in the macOS and Windows shape -- the provisional text is in the
     // document already -- so there the selection stays.
+    //
+    // It is also drawn on one line only: a selection running across a line
+    // break is several rectangles, and three overlays cannot be that. What it
+    // needs is a repeat over `w.lines`, which is a widget's job rather than
+    // this demo's.
     if (doc.preedit.items.len > 0) {
-        try moveOverlay(t, e.selection, 0, 0);
+        try moveOverlay(t, e.selection, 0, 0, 0);
     } else {
         const sel = doc.selection();
-        const r = run.rangeRect(sel.start, sel.end);
-        try moveOverlay(t, e.selection, r.x, r.w);
+        const a = w.caret(sel.start);
+        const b = w.caret(sel.end);
+        if (a.y == b.y) {
+            try moveOverlay(t, e.selection, a.x, top + a.y, b.x - a.x);
+        } else {
+            try moveOverlay(t, e.selection, 0, 0, 0);
+        }
     }
 
     if (shown.composing) |cmp| {
-        const u = run.rangeRect(cmp.start, cmp.end);
-        try moveOverlay(t, e.underline, u.x, u.w);
+        const a = w.caret(cmp.start);
+        const b = w.caret(cmp.end);
+        if (a.y == b.y) {
+            try moveOverlay(t, e.underline, a.x, top + a.y + one.ascent + 2, b.x - a.x);
+        } else {
+            try moveOverlay(t, e.underline, 0, 0, 0);
+        }
     } else {
-        try moveOverlay(t, e.underline, 0, 0);
+        try moveOverlay(t, e.underline, 0, 0, 0);
     }
 
     // Null when the input method asked for no caret while its candidate list
     // is up. A zero-width quad is culled, so that needs no other special case.
     if (doc.displayCaret()) |at| {
-        try moveOverlay(t, e.caret, run.caretX(at), 1);
+        const c = w.caret(at);
+        try moveOverlay(t, e.caret, c.x, top + c.y, 1);
     } else {
-        try moveOverlay(t, e.caret, 0, 0);
+        try moveOverlay(t, e.caret, 0, 0, 0);
     }
 
-    // Last, because it copies the run out of the font's scratch buffer and the
-    // calls above read it.
-    try t.setText(e.label, run);
+    // Last, because it copies the run out of the list above and the calls
+    // here read it.
+    try t.setText(e.label, w.run);
 }
 
 /// Where a byte range of the editable field's text is drawn, in layout units
@@ -313,7 +365,11 @@ fn paragraph(
 fn textField(t: *Tree, parent: Index) !Index {
     const field = try t.appendChild(parent, .{
         .axis = .row,
-        .height = .{ .fixed = field_height },
+        // Content height with a floor, so a field whose text wraps grows
+        // instead of clipping it. One line still comes out at `field_height`,
+        // which is what the overlays' vertical centring assumes.
+        .height = .content,
+        .min_height = field_height,
         .flex_shrink = 0,
         .padding = field_padding,
         .align_items = .center,
@@ -373,9 +429,10 @@ pub const Overlay = struct {
 /// recomputes that element and places it, and touches nothing else. Moving the
 /// spacer that used to stand for `x` was a size change that climbed to the row
 /// and re-ran it.
-pub fn moveOverlay(t: *Tree, o: Overlay, x: f32, w: f32) !void {
+pub fn moveOverlay(t: *Tree, o: Overlay, x: f32, y: f32, w: f32) !void {
     var st = t.style(o.box);
     st.left = @max(0, x);
+    st.top = @max(0, y);
     st.width = .{ .fixed = @max(0, w) };
     try t.setStyle(o.box, st);
 }
@@ -742,6 +799,22 @@ pub fn main() !void {
     defer t.deinit();
     try buildUi(&t, &fonts);
     t.layout(.{ .w = width, .h = height });
+
+    // Lay out, wrap the editable field to the width layout gave it, lay out
+    // again. The measure pass this engine does not have, done by hand at the
+    // one call site that needs it: `buildUi` sets the field's text on one
+    // line because it has no width to wrap to until this has happened.
+    var doc = ui.Document.init(gpa);
+    defer doc.deinit();
+    _ = try doc.insert(.application, editable_initial);
+    var scratch: std.ArrayList(u8) = .empty;
+    defer scratch.deinit(gpa);
+    var wg: std.ArrayList(ui.Glyph) = .empty;
+    defer wg.deinit(gpa);
+    var wl: std.ArrayList(ui.text_layout.Line) = .empty;
+    defer wl.deinit(gpa);
+    try refreshEditable(&t, &fonts, &doc, &scratch, &wg, &wl);
+    _ = t.flush();
 
     var sc = ui.Scene.init(gpa);
     defer sc.deinit();

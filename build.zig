@@ -95,7 +95,10 @@ pub fn build(b: *std.Build) void {
     // macOS. `zig build window` means the same thing on both.
     switch (target.result.os.tag) {
         .macos => addMacos(b, target, optimize, mod, text_mod),
-        else => addLinux(b, target, optimize, mod, text_mod),
+        else => {
+            addLinux(b, target, optimize, mod, text_mod);
+            addMacosCheck(b, text_c);
+        },
     }
 
     const tests = b.addTest(.{ .root_module = mod });
@@ -275,6 +278,73 @@ fn addLinux(
     const run_gpu_demo = b.addRunArtifact(gpu_demo);
     b.step("gpu-demo", "Render the demo on the GPU and diff it against the software reference")
         .dependOn(&run_gpu_demo.step);
+}
+
+/// Type-checks the macOS sources from a machine that has no macOS SDK.
+///
+/// **`zig build -Dtarget=aarch64-macos` does not do this**, which was found by
+/// breaking a macOS source on purpose and watching the build not notice.
+/// Linking a system library the host does not have fails during library
+/// resolution, before semantic analysis runs, so the only errors that come
+/// back are "unable to find freetype" -- and a genuine type error in
+/// `window_demo_macos.zig` is invisible behind them. That had been treated as
+/// a passing check in this repository for several commits.
+///
+/// `build-exe -fno-emit-bin` with the link inputs dropped does run semantic
+/// analysis, and that is what this step is. It knows the macOS module graph by
+/// hand, which is duplication -- and the kind that fails loudly rather than
+/// quietly, because a module renamed on the other side makes this step error
+/// instead of silently checking less.
+fn addMacosCheck(b: *std.Build, text_c: *std.Build.Step.TranslateC) void {
+    const check = b.addSystemCommand(&.{
+        b.graph.zig_exe,
+        "build-exe",
+        "-fno-emit-bin",
+        "-target",
+        "aarch64-macos",
+        "-mcpu",
+        "baseline",
+        "--dep",
+        "zig-uikit",
+        "--dep",
+        "zig-uikit-metal",
+        "--dep",
+        "zig-uikit-macos",
+        "--dep",
+        "zig-uikit-text",
+        "-Mroot=tools/window_demo_macos.zig",
+        "-Mzig-uikit=src/root.zig",
+        "--dep",
+        "zig-uikit",
+        "--dep",
+        "objc",
+        "-Mzig-uikit-metal=src/gpu/metal.zig",
+        "--dep",
+        "objc",
+        "--dep",
+        "zig-uikit",
+        "-Mzig-uikit-macos=src/platform/macos.zig",
+        "--dep",
+        "c",
+        "--dep",
+        "zig-uikit",
+        "-Mzig-uikit-text=src/text/text.zig",
+        "-Mobjc=src/platform/objc.zig",
+    });
+    // The C surface is generated, so its path is not a string this file can
+    // write down.
+    check.addPrefixedFileArg("-Mc=", text_c.getOutput());
+    check.expectExitCode(0);
+    // Always run it.
+    //
+    // A `Run` step with no declared file inputs is cached on its argv, and
+    // the argv does not change when a source does -- so the first version of
+    // this step reported success without running, which is exactly the
+    // failure it was added to stop. Declaring every macOS source as an input
+    // would be a second list to keep in step with the first; running the
+    // check every time it is asked for is what a check should do anyway.
+    check.has_side_effects = true;
+    b.step("check-macos", "Type-check the macOS sources without a macOS SDK").dependOn(&check.step);
 }
 
 /// Metal and AppKit, both reached through the Objective-C runtime: there is no

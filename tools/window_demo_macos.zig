@@ -527,6 +527,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // both shapes is the point of that function.
     var shown: std.ArrayList(u8) = .empty;
     defer shown.deinit(gpa);
+    // The field's wrapped run and its line table. Owned here because
+    // `demo.editable` borrows them for as long as the field exists.
+    var wrapped_glyphs: std.ArrayList(ui.Glyph) = .empty;
+    defer wrapped_glyphs.deinit(gpa);
+    var wrapped_lines: std.ArrayList(ui.text_layout.Line) = .empty;
+    defer wrapped_lines.deinit(gpa);
     _ = try doc.insert(.application, demo.editable_initial);
     win.setTextTarget(.{ .doc = &doc, .rect = rangeRect, .hit = hitTest, .ctx = &t });
     defer win.setTextTarget(null);
@@ -664,7 +670,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 at.setDocument(demo.editable_node, &doc);
                 at.setFocus(demo.editable_node);
                 win.setAccessTarget(.{ .tree = &at, .layout = &t });
-                try demo.refreshEditable(&t, &fonts, &doc, &shown);
+                try demo.refreshEditable(&t, &fonts, &doc, &shown, &wrapped_glyphs, &wrapped_lines);
                 try renderer.setAtlas(fonts.atlas.view());
                 atlas_gen = fonts.atlas.generation;
                 scene.setPixelScale(win.scale);
@@ -708,7 +714,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
         if (win.text_changed) {
             win.text_changed = false;
-            demo.refreshEditable(&t, &fonts, &doc, &shown) catch |e| switch (e) {
+            demo.refreshEditable(&t, &fonts, &doc, &shown, &wrapped_glyphs, &wrapped_lines) catch |e| switch (e) {
                 error.AtlasFull => std.debug.print("atlas full -- text stopped updating\n", .{}),
                 else => return e,
             };
