@@ -107,8 +107,24 @@ pub const TextRun = struct {
     ascent: f32 = 0,
     descent: f32 = 0,
 
+    /// How many lines the glyphs are stacked over. One for a run that has not
+    /// been through `text_layout.wrap`.
+    lines: u32 = 1,
+    /// The font's preferred line spacing, used to stack them. Ignored while
+    /// `lines` is one, which is why a single-line run never has to carry it.
+    line_height: f32 = 0,
+
+    /// The box the glyphs need.
+    ///
+    /// For one line this is ascent plus descent, which is the bound that
+    /// cannot clip ink. For several it is the stack: the lines above spaced at
+    /// `line_height`, and the last one still given its full ascent and
+    /// descent, because the bottom of the box has to clear the deepest
+    /// descender on the last line and `line_height` does not promise that.
     pub fn height(self: TextRun) f32 {
-        return self.ascent + self.descent;
+        const base = self.ascent + self.descent;
+        if (self.lines <= 1) return base;
+        return self.line_height * @as(f32, @floatFromInt(self.lines - 1)) + base;
     }
 
     pub fn isEmpty(self: TextRun) bool {

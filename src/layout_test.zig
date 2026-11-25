@@ -860,3 +860,50 @@ test "incremental and full agree with out-of-flow children in the tree" {
 
     try expectIncrementalMatchesFull(&t);
 }
+
+test "a wrapped paragraph is given a box as tall as its lines" {
+    // The bug this pins: `setText` used to rebuild the run field by field and
+    // drop the two a wrapped paragraph carries, so a two-line paragraph got a
+    // one-line box and whatever came after it was laid out on top.
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    const col = try t.appendChild(t.root(), .{ .axis = .col });
+    const para = try t.appendChild(col, .{ .flex_shrink = 0 });
+    const after = try t.appendChild(col, .{
+        .width = .{ .fixed = 10 },
+        .height = .{ .fixed = 10 },
+        .flex_shrink = 0,
+    });
+
+    // Three lines, stacked at 20, with an ascent of 16 and a descent of 4.
+    var glyphs = [_]ui.Glyph{.{
+        .dx = 0,
+        .dy = 0,
+        .w = 5,
+        .h = 5,
+        .u0 = 0,
+        .v0 = 0,
+        .u1 = 1,
+        .v1 = 1,
+        .cluster = 0,
+        .pen_x = 0,
+    }};
+    try t.setText(para, .{
+        .glyphs = &glyphs,
+        .width = 100,
+        .ascent = 16,
+        .descent = 4,
+        .lines = 3,
+        .line_height = 20,
+    });
+    t.layout(viewport);
+
+    // 20 + 20 for the first two lines, then ascent plus descent for the last.
+    try testing.expectEqual(@as(f32, 60), t.bounds(para).h);
+    // And the element after it starts below, not over it.
+    try testing.expectEqual(t.bounds(para).y + 60, t.bounds(after).y);
+
+    // The run survived the copy intact, which is the part that broke.
+    try testing.expectEqual(@as(u32, 3), t.text(para).lines);
+    try testing.expectEqual(@as(f32, 20), t.text(para).line_height);
+}

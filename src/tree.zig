@@ -431,12 +431,15 @@ pub const Tree = struct {
         const e = &self.els.items[el];
         self.glyph_total -= e.text.glyphs.len;
         if (e.text.glyphs.len > 0) self.gpa.free(e.text.glyphs);
-        e.text = .{
-            .glyphs = copy,
-            .width = run.width,
-            .ascent = run.ascent,
-            .descent = run.descent,
-        };
+        // The whole run, with only the glyph slice replaced by the copy.
+        //
+        // Written out field by field first, which silently dropped the two
+        // that a wrapped paragraph carries -- `lines` and `line_height` -- so
+        // a two-line paragraph was given a one-line box and the next element
+        // was laid out over it. Copying the struct makes adding a field to
+        // `TextRun` safe by default instead of safe if someone remembers.
+        e.text = run;
+        e.text.glyphs = copy;
         self.glyph_total += copy.len;
 
         try self.dirty.append(self.gpa, el);

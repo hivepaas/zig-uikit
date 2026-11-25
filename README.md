@@ -10,10 +10,10 @@ A declarative GPU UI toolkit for Zig.
 > There are no widgets. Expect the API to change without notice.
 
 ```sh
-zig build test                           # 165 tests, no platform dependencies
+zig build test                           # 190 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
-zig build test-text                      # 15 tests, needs a font installed
+zig build test-text                      # 16 tests, needs a font installed
 zig build test-input                     # 14 tests, needs xkbcommon and a layout
 zig build test-gpu                       # Vulkan: 8 tests; Metal: 11 tests
 zig build gpu-demo                       # renders on the GPU, diffs against the reference
@@ -317,7 +317,55 @@ height is what the designer wants lines set at.
 
 So a single label's box is ascent plus descent, the bound that cannot clip ink,
 which matters most for exactly the text this project has to set correctly. A
-line breaker, when there is one, will stack lines at `line_height` instead.
+wrapped paragraph stacks its lines at `line_height` and then gives the last one
+a full ascent and descent, because the bottom of the box still has to clear the
+deepest descender on it and `line_height` does not promise that.
+
+### Line breaking, and the part of it that is not UAX #14
+
+`src/linebreak.zig` answers where a line may break, and it is **not** the
+Unicode line breaking algorithm: that is a pair table over forty-odd classes
+plus a dozen tailorings, and most of it exists for cases this toolkit does not
+meet yet. What is here is the subset that is *correct* for the text this
+project has to set — after a run of spaces, between two ideographs, after a
+hyphen, and at a newline — and the subset that is *not wrong* where it
+declines: no break before a closing bracket or a trailing comma, none after an
+opening one. Where no opportunity exists the line overflows, which is visible,
+rather than breaking somewhere a reader would notice.
+
+Vietnamese is the case worth saying out loud: its syllables are
+space-separated, so space breaking **is** correct Vietnamese line breaking.
+Thai and Khmer are not, and need a dictionary; their text will overflow rather
+than break mid-word, and that is stated rather than discovered.
+
+`src/text_layout.zig` turns a shaped run into lines. **The paragraph is shaped
+once and then sliced, not shaped per line.** The shaper already gave every
+glyph a pen position and a cluster, so the width of any prefix is a lookup and
+a line is a range of clusters. Re-shaping after choosing the breaks costs a
+pass per line and buys something only where a letter's form depends on a
+neighbour across the break — which is true for Arabic and not for Latin or
+Vietnamese. Which is which is better said than paid for.
+
+The result is still **one `TextRun`**, with each line's offset folded into its
+glyphs' `dy`. Nothing downstream changed: the scene builder emits the same
+quads, the renderer uploads the same instances, and the GPU still agrees with
+the software reference to within one unit of 255. The element's box grows
+because `TextRun.height` counts the lines.
+
+![a popover whose body is one paragraph broken into two lines](docs/demo.png)
+
+The demo's popover used to be two labels with the break typed in by hand, which
+is what a toolkit with no line breaking makes you do. It is one paragraph now,
+and one accessible node instead of two fragments — a screen reader should hear
+a sentence, not a typesetting decision.
+
+**A bug the picture found, and a class of bug the fix closes.** The first
+render put the button on top of the paragraph's second line. `Tree.setText`
+rebuilt the run field by field, so the two fields a wrapped paragraph carries —
+`lines` and `line_height` — were silently dropped, and a two-line paragraph was
+given a one-line box. It copies the struct and replaces only the glyph slice
+now, which makes adding a field to `TextRun` safe by default rather than safe
+if someone remembers. A layout test pins it.
 
 ### The caret, and the three units four protocols count in
 
@@ -529,9 +577,15 @@ and after.
 
 ### What text does not do yet
 
-Line breaking, bidirectional text, and font fallback for a glyph the matched
-family lacks. One shaped line is the unit here, and each of those is a separate
-piece of work on top of it rather than something to half-do inside it.
+Bidirectional text, and font fallback for a glyph the matched family lacks.
+Each is a separate piece of work rather than something to half-do inside what
+is here.
+
+Wrapping also needs a width given to it rather than discovered, and that is a
+real limitation and not a simplification for the demo. The width a paragraph
+may use comes from layout, and layout needs the paragraph's size; resolving
+that needs a measure pass this engine does not have. A fixed-width container
+has no such problem, which is why the demo's popover is given one.
 
 Of the eight requirements in
 [docs/text-and-accessibility.md](docs/text-and-accessibility.md), §1 (unit
@@ -619,10 +673,13 @@ counters is a claim that can be falsified.
 
 ### What the editing layer refuses to do
 
-`.up` and `.down` are reported **unhandled**, not approximated. There is no
-line breaker in this toolkit yet, so nothing knows where the second line
-starts, and a caret that guesses is worse than one that does not move. `.home`
-and `.end` go to the ends of the *document* and the code says so. The clipboard
+`.up` and `.down` are reported **unhandled**, not approximated. There is a
+line breaker now and `text_layout.byteOnLine` answers exactly the question a
+vertical arrow asks — but `editing.apply` takes a document and no geometry, so
+it is not the layer that can answer it. Wiring the two together is the next
+slice; a caret that guesses in the meantime is worse than one that does not
+move. `.home` and `.end` go to the ends of the *document* for the same reason,
+and the code says so. The clipboard
 keys are not handled either: Ctrl+C needs `wl_data_device` and a round trip
 through the compositor, which is a protocol dependency and not an editing
 operation with a key attached.
@@ -1363,7 +1420,7 @@ field has a caret and a selection highlight that are boxes and not things; a
 screen reader walking layout would announce all of them. So the builder registers the elements a person would
 name — labels as static text, cards as groups, the button, the typeable field
 as a text field backed by its `Document` — and a node's parent is its nearest
-registered layout ancestor. The demo has 172 layout elements and 71
+registered layout ancestor. The demo has 171 layout elements and 70
 accessible nodes. Bounds are not stored: a node names its element and
 reads layout when asked, so a relayout cannot leave it describing where things
 were. Ids are slots and are never reused.

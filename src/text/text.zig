@@ -313,6 +313,26 @@ pub const Font = struct {
         return @intCast(n);
     }
 
+    /// Shapes one paragraph and breaks it into lines no wider than `max_width`.
+    ///
+    /// The paragraph is shaped **once** and then sliced: the shaper already gave
+    /// every glyph a pen position and a cluster, so the width of any prefix is a
+    /// lookup. See `text_layout.zig` for when that is and is not the right trade.
+    ///
+    /// `glyphs` and `lines` are the caller's, and the returned run borrows the
+    /// first -- `Tree.setText` copies it, which is the intended destination.
+    pub fn shapeWrapped(
+        self: *Font,
+        atlas: *Atlas,
+        s: []const u8,
+        max_width: f32,
+        glyphs: *std.ArrayList(ui.Glyph),
+        lines: *std.ArrayList(ui.text_layout.Line),
+    ) (Error || Allocator.Error)!ui.text_layout.Wrapped {
+        const one = try self.shape(atlas, s);
+        return ui.text_layout.wrap(self.gpa, one, s, max_width, self.line_height, glyphs, lines);
+    }
+
     fn glyph(self: *Font, atlas: *Atlas, gid: u32) Error!Cached {
         if (self.cache.get(gid)) |e| return e;
 
@@ -355,6 +375,22 @@ pub const Font = struct {
 /// The whole point of the module in one function: the caller names an element
 /// and a string, and the font engine, the atlas and the tree are the three
 /// things it has to have already decided about.
+/// Shapes `s`, wraps it to `max_width`, and installs it on `el`.
+pub fn setWrappedText(
+    t: *ui.Tree,
+    el: ui.Index,
+    font: *Font,
+    atlas: *Atlas,
+    s: []const u8,
+    max_width: f32,
+    glyphs: *std.ArrayList(ui.Glyph),
+    lines: *std.ArrayList(ui.text_layout.Line),
+) (Error || ui.Error)!ui.text_layout.Wrapped {
+    const w = try font.shapeWrapped(atlas, s, max_width, glyphs, lines);
+    try t.setText(el, w.run);
+    return w;
+}
+
 pub fn setText(
     t: *ui.Tree,
     el: ui.Index,
@@ -688,4 +724,54 @@ test "recolouring text runs no layout" {
     // ...and the flexbox engine must not have run at all.
     try testing.expectEqual(@as(u32, 0), stats.total());
     try testing.expectEqual(@as(u32, 0), stats.full_layouts);
+}
+
+test "a paragraph wraps between Vietnamese syllables, with a real font" {
+    // The core's line-breaking tests use hand-built runs where every glyph is
+    // the same width. This one uses a font, so it is the test that the two
+    // halves fit together: HarfBuzz's clusters are byte offsets into the same
+    // string the breaker looks at, and `ế` is three bytes in both.
+    var lib = try Library.init();
+    defer lib.deinit();
+    var font = try openSans(&lib, testing.allocator);
+    defer font.deinit();
+    var atlas = try Atlas.init(testing.allocator, 256, 256);
+    defer atlas.deinit();
+
+    var glyphs: std.ArrayList(ui.Glyph) = .empty;
+    defer glyphs.deinit(testing.allocator);
+    var lines: std.ArrayList(ui.text_layout.Line) = .empty;
+    defer lines.deinit(testing.allocator);
+
+    const s = "tiếng Việt rất hay và rất khó sắp chữ cho đúng";
+    const one = try font.shape(&atlas, s);
+    const full_width = one.width;
+
+    // A third of the natural width, so it has to break several times.
+    const w = try font.shapeWrapped(&atlas, s, full_width / 3, &glyphs, &lines);
+    try testing.expect(w.lines.len >= 3);
+    try testing.expectEqual(@as(u32, @intCast(w.lines.len)), w.run.lines);
+
+    // Every line is whole syllables and valid UTF-8, and none of them is
+    // wider than the limit unless it is a single word that cannot fit.
+    for (w.lines) |ln| {
+        const text = s[ln.start..ln.end];
+        try testing.expect(std.unicode.utf8ValidateSlice(text));
+        try testing.expect(text.len == 0 or text[0] != ' ');
+        try testing.expect(ln.width <= full_width / 3 + 0.01);
+    }
+
+    // The lines reassemble into the original, give or take the spaces the
+    // breaks consumed.
+    var joined: std.ArrayList(u8) = .empty;
+    defer joined.deinit(testing.allocator);
+    for (w.lines, 0..) |ln, i| {
+        if (i > 0) try joined.append(testing.allocator, ' ');
+        try joined.appendSlice(testing.allocator, s[ln.start..ln.end]);
+    }
+    try testing.expectEqualStrings(s, joined.items);
+
+    // And the box is the stack, which is what makes an element sized for it.
+    try testing.expect(w.run.height() > one.height());
+    try testing.expectEqual(font.line_height, w.run.line_height);
 }

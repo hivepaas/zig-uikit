@@ -263,6 +263,52 @@ fn label(t: *Tree, parent: Index, f: ?*text.Font, atlas: ?*text.Atlas, s: []cons
     return e;
 }
 
+/// A paragraph broken into lines no wider than `max_width`.
+///
+/// One element and one `TextRun`, like a single-line label: the lines are
+/// folded into the glyphs' `dy`, so nothing downstream knows the difference
+/// and the element's box grows because `TextRun.height` counts them.
+///
+/// The width has to be given rather than discovered, and that is a real
+/// limitation rather than a simplification for the demo: the width a paragraph
+/// may use comes from layout, and layout needs the paragraph's size. A toolkit
+/// that wraps text inside a content-sized box needs a measure pass that this
+/// engine does not have. A fixed-width container has no such problem, which is
+/// why the popover below is given one.
+fn paragraph(
+    t: *Tree,
+    parent: Index,
+    f: ?*text.Font,
+    atlas: ?*text.Atlas,
+    s: []const u8,
+    max_width: f32,
+    c: Color,
+) !Index {
+    if (f == null or atlas == null) {
+        const e = try t.appendChild(parent, .{
+            .width = .{ .fixed = max_width },
+            .height = .{ .fixed = 16 },
+            .flex_shrink = 0,
+        });
+        t.setPaint(e, .{ .background = c, .corner_radius = 3.5 });
+        return e;
+    }
+    // The run is copied onto the element, so these live no longer than the
+    // call.
+    var gl: std.ArrayList(ui.Glyph) = .empty;
+    defer gl.deinit(t.gpa);
+    var ls: std.ArrayList(ui.text_layout.Line) = .empty;
+    defer ls.deinit(t.gpa);
+
+    const e = try t.appendChild(parent, .{ .flex_shrink = 0 });
+    t.setPaint(e, .{ .text_color = c });
+    _ = try text.setWrappedText(t, e, f.?, atlas.?, s, max_width, &gl, &ls);
+    // One accessible node for the paragraph, not one per line: the lines are
+    // a typesetting decision and a screen reader should not hear them.
+    if (!access_mute) _ = try register(t, e, .{ .role = .static_text, .name = s });
+    return e;
+}
+
 /// A bordered box that holds one line of text and whatever is drawn over it.
 fn textField(t: *Tree, parent: Index) !Index {
     const field = try t.appendChild(parent, .{
@@ -283,6 +329,9 @@ fn textField(t: *Tree, parent: Index) !Index {
 
 /// The height of a text field's content box: everything the overlays below
 /// measure from.
+const popover_width = 250;
+const popover_padding = 12;
+
 const field_padding = 8;
 const field_height = 34;
 const field_inner_h = field_height - field_padding * 2;
@@ -436,10 +485,13 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
         const pop = try t.appendChild(row, .{
             .axis = .col,
             .position = .absolute,
-            // Sized by its text, where it used to be a fixed 230x116 chosen to
-            // look right around placeholder bars.
+            // A definite width now, because the paragraph inside it has to be
+            // broken to something and the width a content-sized box would end
+            // up with is not known until after the text is laid out. See
+            // `paragraph`.
+            .width = .{ .fixed = popover_width },
             .flex_shrink = 0,
-            .padding = 12,
+            .padding = popover_padding,
             .gap = 8,
         });
         t.setPaint(pop, .{
@@ -450,8 +502,18 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
             .layer = ui.layers.popover,
         });
         _ = try label(t, pop, strong_font, atlas, "Tài liệu", Color.white);
-        _ = try label(t, pop, ui_font, atlas, "Thư mục này nằm trong hộp cuộn", bright);
-        _ = try label(t, pop, ui_font, atlas, "nhưng vẫn vẽ ra ngoài được.", bright);
+        // One paragraph, broken by the line breaker. It used to be two labels
+        // with the break typed in by hand, which is what a toolkit with no
+        // line breaking makes you do.
+        _ = try paragraph(
+            t,
+            pop,
+            ui_font,
+            atlas,
+            "Thư mục này nằm trong hộp cuộn nhưng vẫn vẽ được ra ngoài.",
+            popover_width - 2 * popover_padding,
+            bright,
+        );
         const ok = try t.appendChild(pop, .{
             .height = .{ .fixed = 24 },
             .flex_shrink = 0,
