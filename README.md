@@ -636,9 +636,12 @@ measure pass, written at the one call site that needs it instead of hidden
 inside the engine. In the window it costs a frame of staleness on a resize and
 nothing otherwise.
 
-A selection that runs across a line break is also still one rectangle rather
-than several, so the demo draws none when the two ends are on different lines.
-What that needs is a repeat over the line table, which is a widget's job.
+A selection that runs across a line break is three rectangles however many
+lines it crosses — the rest of its first line, one block of the whole lines
+between, and the start of its last — so the demo's three overlays draw it
+without a repeat over the line table. The first two are a line pitch tall
+rather than a run tall, so they abut instead of showing the leading between
+them as stripes.
 
 Of the eight requirements in
 [docs/text-and-accessibility.md](docs/text-and-accessibility.md), §1 (unit
@@ -1514,7 +1517,7 @@ What a click does is decided in core, like what a key does: `editing.press`
 and `editing.drag` take a position in the text and a click count, and carry the
 rules every desktop text field shares — one click places the caret, Shift-click
 extends from the anchor, two clicks select a word, three select the line (all
-of it, with no line breaker), and a drag that began with two clicks extends a
+of it: the field is one paragraph), and a drag that began with two clicks extends a
 whole word at a time and keeps the word it started on. Eight tests, no pointer.
 The Mac view adds `mouseDown:`/`mouseDragged:`, offering each event to the
 input method first, which is where a click inside a composition belongs; if
@@ -1537,17 +1540,104 @@ substring, so the script follows the text rather than pixels:
   a click places the caret: "" -- ok
   a drag selects: "Gõ vào đây:" -- ok
   a double-click dragged back extends by words: "Gõ vào đây" -- ok
-  a drag past the end of the field: "vào đây: tiếng " -- ok
-  a triple-click selects it all: "Gõ vào đây: tiếng " -- ok
-  a click outside the field changes nothing: "Gõ vào đây: tiếng " -- ok
-8 gestures, 0 wrong; 11 presses reached the field, 0 the input method
+  a drag off the right of the first line: "vào đây: … đi được" -- ok
+  a drag onto the next line selects across the break: "vào đây: … đi được giữa " -- ok
+  a drag out of the bottom of the field: "vào đây: … Gõ thử: tiếng " -- ok
+  a triple-click selects it all: "Gõ vào đây: … Gõ thử: tiếng " -- ok
+  a click outside the field changes nothing: "Gõ vào đây: … Gõ thử: tiếng " -- ok
+10 gestures, 0 wrong; 13 presses reached the field, 0 the input method
 ```
+
+(Elided here; the run prints the whole selection.)
 
 The same hit test answers `characterIndexForPoint:`, which an input method
 asks when the user clicks into its marked text, and VoiceOver can now move the
 caret: `setAccessibilitySelectedTextRange:` is the one write the accessibility
 tree accepts, going to the window's document through the same refusal as every
 other caret move. `ax_probe` sets the range to `tiếng` and reads it back.
+
+### Lines on the Mac
+
+The field wraps, and three things on the Mac had assumed it did not.
+
+**The pointer reads y.** `editableHit` asked the run for the byte at an x, and
+on a wrapped run every line starts at x zero: a click on the second line landed
+on the first. It now finds the line from y and the byte on it
+(`Wrapped.byteAt`), and the character under the pointer the same way
+(`Wrapped.clusterAt`, the per-line version of `TextRun.clusterAt`). A drag
+that leaves the field to the right stops at that line's end; one that leaves it
+below goes to the document's end, which is how a selection is dragged to
+either end.
+
+**The key bindings mean lines now.** `moveUp:` and `moveDown:` were keys passed
+on to the application; they are `line_up` and `line_down`, and the window
+keeps the column between them (`editing.Options.goal_x`), forgetting it on any
+edit, click or other movement. A field with no lines to move between still
+reports them unhandled, and the view then passes them on as keys, as before.
+Cmd+Left and Cmd+Right are `moveToLeftEndOfLine:` and `moveToRightEndOfLine:`
+and go to the line's ends; Cmd+Up and Cmd+Down stay the document's; Cmd+Backspace
+is `deleteToBeginningOfLine:` and deletes to the start of the line, through two
+new commands, `delete_to_line_start` and `delete_to_line_end`. Ctrl+A and
+Ctrl+E are paragraph commands on a Mac and stay at the document's ends, since a
+field is one paragraph until it takes a newline. `--type` now sends Down, Up,
+and Cmd+Down then Up and Down — the vertical keys the Wayland script gained —
+and the Linux side of the comparison wraps the text before every keystroke,
+with the same font to the same width, so that both sides are asking about the
+same lines:
+
+```
+33 scripted keystrokes through AppKit
+  editing commands      14, refused 0; 3 moved between lines
+  layout on demand      1 (geometry asked for before the frame laid the text out)
+the same edits with Linux chords through editing.apply: … -- identical, selection included
+```
+
+**A line table can be one keystroke old.** The window lays the field out once
+per frame, and AppKit can deliver several events in one turn of the event
+loop: a letter and then a Down arrow, or an input method that inserts and then
+asks where the caret is. The second asks about lines that describe text which
+is not there any more. So `TextTarget` has a `sync` callback, and the window
+calls it before any geometry is read — by the pointer, by the line commands,
+by `firstRectForCharacterRange:`, by an accessibility client — when the bytes
+changed since the application last said the geometry was current
+(`textGeometryChanged`). `--type` sends its first Down in the same turn as the
+last Backspace, and the counter shows the one layout that caused. That case
+does not *need* it — four characters off the end move no line break, and the
+run with the callback disabled ends identically — so it shows the path runs,
+not that it is necessary; a test that needs it is one where the edit moves a
+break above the caret, and the script does not have one yet.
+
+Two rules about the ends of lines changed in core on the way, both pinned by
+tests. **Past the end of the last line is the end of the paragraph, trailing
+space included.** A click there used to land before the field's final space,
+so the next word typed ran into the last; on a line that is not the last, the
+caret still stops where the ink does, before the space that wrapped it. End
+and Cmd+Right follow the same rule. And **a line's span, for a screen reader,
+includes its trailing space**, while the caret after that space is drawn on the
+next line: `Wrapped.lineOwning` and `Wrapped.lineOf` answer those two
+different questions.
+
+Accessibility reads the lines too. `AXRangeForLine`, `AXLineForIndex` and
+`AXInsertionPointLineNumber` were stubs that said everything is line 0; they
+read the same line table now, which is how VoiceOver reads a field line by
+line. `ax_probe` walks the lines until it is told there are none left and
+checks they read back as the whole text:
+
+```
+  line 0: "Gõ vào đây: ô này tự xuống dòng khi chữ dài hơn bề ngang của nó, và mũi tên lên xuống đi được "
+  line 1: "giữa các dòng. Gõ thử: tiếng "
+  AXRangeForLine: 2 lines that read back as the whole text -- ok
+  AXInsertionPointLineNumber 1 is the last line, where the caret is -- ok
+  AXLineForIndex(117) puts "tiếng" on line 1 -- ok
+  the second line's bounds are below the first's -- ok
+```
+
+The window also wraps again when it is resized, and on every step of a live
+resize, since the field is as wide as the window lets it be. The selection
+across the break, as presented, against the software reference (largest
+channel difference 1):
+
+![A selection across a line break](docs/demo-selection-macos.png)
 
 ### Accessibility on macOS
 
@@ -1575,27 +1665,28 @@ API that VoiceOver and Accessibility Inspector use:
 ./zig-out/bin/window_demo --ax &     # ten seconds; types `xin chào` at 3 s,
 sleep 1; ./zig-out/bin/ax_probe $!   # removes the button's node at 5 s
 
-76 nodes: 66 static text, 4 groups, 457 queries, 20.4 ms to walk
-text field "Gõ vào đây: tiếng "
+76 nodes: 66 static text, 4 groups, 457 queries, 17.4 ms to walk
+text field "Gõ vào đây: ô này tự xuống dòng … Gõ thử: tiếng "
   AXValue is the document -- ok
-  AXNumberOfCharacters 18 is UTF-16 units, not 24 bytes -- ok
+  AXNumberOfCharacters 123 is UTF-16 units, not 163 bytes -- ok
   AXSelectedTextRange is the caret at the end -- ok
-  AXStringForRange(12, 5) is "tiếng" -- ok
+  AXStringForRange(117, 5) is "tiếng" -- ok
+  setting AXSelectedTextRange(117, 5) selects "tiếng" -- ok
   AXBoundsForRange puts the word inside the field, in screen coordinates -- ok
+  (the four line checks, under "Lines on the Mac")
   AXFocusedUIElement is the text field -- ok
   the element at the button's centre is the button -- ok
   AXPress on the button -- ok
-  setting AXSelectedTextRange(12, 5) selects "tiếng" -- ok
 listening while the demo types...
-  8 AXValueChanged, 8 AXSelectedTextChanged
+  8 AXValueChanged, 9 AXSelectedTextChanged
   one value change per character of "xin chào" -- ok
-  AXValue afterwards is "Gõ vào đây: tiếng xin chào" -- ok
+  AXValue afterwards is "… Gõ thử: tiếng xin chào" -- ok
   AXUIElementDestroyed for the removed button, 1 of them -- ok
   asking the removed button its role is error -25202 -- ok
-476 queries in all, 0 wrong
+485 queries in all, 0 wrong
 ```
 
-And what the demo counted coming in, for those 473 queries:
+And what the demo counted coming in, in the run this was first measured on (473 queries, before the field wrapped):
 
 | method | calls |
 | --- | --- |

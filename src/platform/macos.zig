@@ -118,6 +118,14 @@ pub const Window = struct {
     /// typing, by an input method or by a command, and cleared by the caller
     /// once it has reshaped the line.
     text_changed: bool = false,
+    /// Set when the document's bytes changed and nothing has laid them out
+    /// since, so the target's geometry -- its line table, where a range is,
+    /// what is under a point -- describes the text as it was. See
+    /// `TextTarget.sync` and `textGeometry`.
+    text_stale: bool = false,
+    /// The column a run of up and down arrows is aiming for, kept between
+    /// keystrokes as `editing.Options.goal_x` says.
+    goal_x: ?f32 = null,
     /// What the input method did, counted. The evidence a spike reports.
     ime: ImeStats = .{},
 
@@ -155,6 +163,17 @@ pub const Window = struct {
         /// at the nearer end, which is what a drag that leaves the field
         /// wants. Null disables the pointer.
         hit: ?*const fn (ctx: ?*anyopaque, doc: *const ui.Document, p: ui.Point, clamp: bool) ?ui.editing.Hit = null,
+        /// Lays the document out again, so that `rect`, `hit` and
+        /// `options.lines` describe the text as it is now.
+        ///
+        /// Called before any of them is consulted when the bytes changed
+        /// since the application last laid them out -- which happens inside
+        /// one turn of the event loop: a keystroke and a Down arrow in the
+        /// same batch of events, or an input method that inserts and then
+        /// asks where the caret is before the frame has drawn anything. A
+        /// line table one keystroke old answers with offsets into text that
+        /// is not there any more. Null trusts the geometry as it stands.
+        sync: ?*const fn (ctx: ?*anyopaque) void = null,
         ctx: ?*anyopaque = null,
     };
 
@@ -183,6 +202,11 @@ pub const Window = struct {
         presses_to_input_method: u32 = 0,
         /// Compositions committed because the user clicked elsewhere.
         committed_by_click: u32 = 0,
+        /// Up and down arrows that moved between lines, and the times the
+        /// geometry had to be laid out again before a question about it
+        /// could be answered (`TextTarget.sync`).
+        vertical: u32 = 0,
+        syncs: u32 = 0,
     };
 
     pub fn open(gpa: Allocator, title: [*:0]const u8, w: u32, h: u32) Error!*Window {
@@ -304,6 +328,22 @@ pub const Window = struct {
         self.text = target;
     }
 
+    /// The text target, with its geometry brought up to date first if the
+    /// document changed since it was laid out. Everything that asks where
+    /// text is goes through here: the input method, the pointer, the line
+    /// commands, and an accessibility client.
+    pub fn textGeometry(self: *Window) ?TextTarget {
+        const t = self.text orelse return null;
+        if (self.text_stale) {
+            self.text_stale = false;
+            if (t.sync) |f| {
+                f(t.ctx);
+                self.ime.syncs += 1;
+            }
+        }
+        return t;
+    }
+
     /// Attaches the accessibility tree this window describes, or detaches it.
     /// Both trees are borrowed and must outlive the attachment.
     pub fn setAccessTarget(self: *Window, target: ?ax.Target) void {
@@ -343,7 +383,11 @@ pub const Window = struct {
 
     /// Tells the input method that the text moved on screen, so that it asks
     /// for `firstRectForCharacterRange:` again.
+    ///
+    /// It also tells this window the target's geometry is current again,
+    /// so a query that follows does not lay the text out a second time.
     pub fn textGeometryChanged(self: *Window) void {
+        self.text_stale = false;
         const pool = objc.AutoreleasePool.push();
         defer pool.pop();
         if (send(?id, self.view, "inputContext", .{})) |ctx| send(void, ctx, "invalidateCharacterCoordinates", .{});
@@ -773,20 +817,47 @@ fn keyDown(self: id, _: objc.SEL, event: id) callconv(.c) void {
 
 fn selectAll(self: id, _: objc.SEL, _: ?id) callconv(.c) void {
     const w = stateOf(self) orelse return;
-    runCommand(w, .{ .op = .select_all });
+    _ = runCommand(w, .{ .op = .select_all });
 }
 
-fn runCommand(w: *Window, cmd: ui.editing.Command) void {
-    const t = w.text orelse return;
-    const res = ui.editing.applyCommand(t.doc, cmd, t.options) catch {
+/// Whether the field took the command. One it did not take is the
+/// application's: Enter in a single-line field, or up and down in a field
+/// with no line to move to.
+fn runCommand(w: *Window, cmd: ui.editing.Command) bool {
+    // Only the commands that read the line table need it current; the rest
+    // are about bytes, and laying the text out for them would be waste.
+    const needs_lines = switch (cmd.op) {
+        .line_up, .line_down, .line_start, .line_end, .delete_to_line_start, .delete_to_line_end => true,
+        else => false,
+    };
+    const t = (if (needs_lines) w.textGeometry() else w.text) orelse return false;
+    var opt = t.options;
+    opt.goal_x = w.goal_x;
+    const res = ui.editing.applyCommand(t.doc, cmd, opt) catch {
         w.ime.refused += 1;
-        return;
+        return true;
     };
     w.ime.commands += 1;
+    // Null from anything but a vertical move, which is how the column is
+    // forgotten.
+    w.goal_x = res.goal_x;
+    if ((cmd.op == .line_up or cmd.op == .line_down) and res.moved) w.ime.vertical += 1;
+    if (res.edited) w.text_stale = true;
     if (res.edited or res.moved) w.text_changed = true;
-    // A command the field does not act on -- Enter in a single-line field --
-    // is the application's, as it is from `editing.apply`.
-    if (!res.handled and cmd.op == .newline) w.keys.push(ui.KeyEvent.named(.enter));
+    if (!res.handled and cmd.op == .newline) {
+        w.keys.push(ui.KeyEvent.named(.enter));
+        return true;
+    }
+    return res.handled;
+}
+
+/// The document's bytes changed under the window's feet: by typing, by the
+/// input method. The column is forgotten, as any edit forgets it, and the
+/// geometry is stale until something lays the text out.
+fn bytesChanged(w: *Window) void {
+    w.text_changed = true;
+    w.text_stale = true;
+    w.goal_x = null;
 }
 
 fn insertText(self: id, _: objc.SEL, string: id, replacement: ic.Utf16Range) callconv(.c) void {
@@ -806,7 +877,7 @@ fn insertText(self: id, _: objc.SEL, string: id, replacement: ic.Utf16Range) cal
         w.ime.refused += 1;
         return;
     };
-    w.text_changed = true;
+    bytesChanged(w);
 }
 
 fn setMarkedText(self: id, _: objc.SEL, string: id, sel: ic.Utf16Range, replacement: ic.Utf16Range) callconv(.c) void {
@@ -818,7 +889,7 @@ fn setMarkedText(self: id, _: objc.SEL, string: id, sel: ic.Utf16Range, replacem
         w.ime.refused += 1;
         return;
     };
-    w.text_changed = true;
+    bytesChanged(w);
 }
 
 fn unmarkText(self: id, _: objc.SEL) callconv(.c) void {
@@ -833,7 +904,7 @@ fn doCommandBySelector(self: id, _: objc.SEL, which: objc.SEL) callconv(.c) void
     const w = stateOf(self) orelse return;
     const name = objc.selName(which);
     if (ic.commandForSelector(name)) |cmd| {
-        if (w.text != null) return runCommand(w, cmd);
+        if (w.text != null and runCommand(w, cmd)) return;
     }
     w.ime.passed_on += 1;
     if (ic.keyForSelector(name)) |ev| w.keys.push(ev);
@@ -883,7 +954,7 @@ fn firstRect(self: id, _: objc.SEL, range: ic.Utf16Range, actual: ?*ic.Utf16Rang
     const w = stateOf(self) orelse return zero;
     w.ime.rect_queries += 1;
     var local: ui.Rect = .{};
-    if (w.text) |t| {
+    if (w.textGeometry()) |t| {
         const b = ic.toBytes(t.doc.text(), range);
         if (actual) |a| a.* = ic.fromBytes(t.doc.text(), b);
         if (t.rect) |f| local = f(t.ctx, b);
@@ -941,7 +1012,7 @@ fn didEndLiveResize(self: id, _: objc.SEL) callconv(.c) void {
 
 /// Where an event's location is in the text, through the target's hit test.
 fn hitOf(w: *Window, event: id, clamp: bool) ?ui.editing.Hit {
-    const t = w.text orelse return null;
+    const t = w.textGeometry() orelse return null;
     const f = t.hit orelse return null;
     const loc = send(objc.CGPoint, event, "locationInWindow", .{});
     const v = send(objc.CGPoint, w.view, "convertPoint:fromView:", .{ loc, @as(?id, null) });
@@ -983,6 +1054,7 @@ fn mouseDown(self: id, _: objc.SEL, event: id) callconv(.c) void {
         return;
     };
     w.gesture = p.gesture;
+    w.goal_x = null;
     w.ime.presses += 1;
     if (p.result.moved) w.text_changed = true;
 }
@@ -1007,7 +1079,7 @@ fn characterIndex(self: id, _: objc.SEL, screen: objc.CGPoint) callconv(.c) objc
     // Asked by an input method about a click inside its marked text: which
     // character, in UTF-16, is under this screen point.
     const w = stateOf(self) orelse return ic.not_found;
-    const t = w.text orelse return ic.not_found;
+    const t = w.textGeometry() orelse return ic.not_found;
     const f = t.hit orelse return ic.not_found;
     const h = f(t.ctx, t.doc, w.screenPointToLayout(screen), false) orelse return ic.not_found;
     return ui.offsets.byteToUtf16(t.doc.text(), h.char);

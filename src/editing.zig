@@ -127,10 +127,13 @@ pub const Command = struct {
         delete_char_forward,
         delete_word_backward,
         delete_word_forward,
-        /// Cmd+Backspace on a Mac, which deletes to the start of the *line*;
-        /// here, of the document, for the same reason as `doc_start`.
         delete_to_doc_start,
         delete_to_doc_end,
+        /// Cmd+Backspace on a Mac: to the start of the line the caret is on,
+        /// and Ctrl+Delete's opposite number to its end. With no lines to
+        /// ask, the document's ends, as `line_start` and `line_end` do.
+        delete_to_line_start,
+        delete_to_line_end,
         select_all,
         newline,
     };
@@ -227,7 +230,7 @@ pub fn applyCommand(doc: *Document, cmd: Command, opt: Options) Error!Result {
             return .{ .handled = true, .moved = true };
         },
 
-        .delete_char_backward, .delete_word_backward, .delete_to_doc_start => {
+        .delete_char_backward, .delete_word_backward, .delete_to_doc_start, .delete_to_line_start => {
             if (!doc.canEditNow()) return Error.Locked;
             const sel = doc.selection();
             if (!sel.isEmpty()) return deleteRange(doc, sel);
@@ -235,12 +238,13 @@ pub fn applyCommand(doc: *Document, cmd: Command, opt: Options) Error!Result {
             const to: usize = switch (cmd.op) {
                 .delete_word_backward => prevWord(doc.text(), sel.start),
                 .delete_to_doc_start => 0,
+                .delete_to_line_start => lineEdge(doc.text(), sel.start, .start, opt),
                 else => offsets.prevChar(doc.text(), sel.start),
             };
             return deleteRange(doc, .{ .start = to, .end = sel.start });
         },
 
-        .delete_char_forward, .delete_word_forward, .delete_to_doc_end => {
+        .delete_char_forward, .delete_word_forward, .delete_to_doc_end, .delete_to_line_end => {
             if (!doc.canEditNow()) return Error.Locked;
             const sel = doc.selection();
             if (!sel.isEmpty()) return deleteRange(doc, sel);
@@ -248,6 +252,7 @@ pub fn applyCommand(doc: *Document, cmd: Command, opt: Options) Error!Result {
             const to: usize = switch (cmd.op) {
                 .delete_word_forward => nextWord(doc.text(), sel.end),
                 .delete_to_doc_end => doc.len(),
+                .delete_to_line_end => lineEdge(doc.text(), sel.end, .end, opt),
                 else => offsets.nextChar(doc.text(), sel.end),
             };
             return deleteRange(doc, .{ .start = sel.end, .end = to });
@@ -260,6 +265,23 @@ pub fn applyCommand(doc: *Document, cmd: Command, opt: Options) Error!Result {
             return .{ .handled = true, .edited = true, .moved = true, .edit = e };
         },
     }
+}
+
+/// The start or the end of the line a caret at `at` is drawn on, or of the
+/// document when there are no lines to ask.
+///
+/// A line's end is where its ink stops, before the space that wrapped it: End
+/// on a wrapped line leaves the caret on that line, where the space after it
+/// would put it at the start of the next. The last line has no next, so its
+/// end is the document's -- a field that ends in a space has End go past it.
+fn lineEdge(s: []const u8, at: usize, edge: enum { start, end }, opt: Options) usize {
+    const w = opt.lines orelse return if (edge == .start) 0 else s.len;
+    if (w.lines.len == 0) return if (edge == .start) 0 else s.len;
+    const i = w.lineOf(at);
+    const ln = w.lines[i];
+    if (edge == .start) return @min(ln.start, s.len);
+    if (i + 1 == w.lines.len) return s.len;
+    return @min(ln.end, s.len);
 }
 
 fn deleteRange(doc: *Document, r: Range) Error!Result {
@@ -300,12 +322,8 @@ fn move(doc: *Document, cmd: Command, opt: Options) Error!Result {
         // The ends of the line the caret is on, when anything knows where
         // those are. With no layout they are the document's, which is what
         // Home and End meant before there was a line breaker.
-        .line_start, .line_end => blk: {
-            const w = opt.lines orelse break :blk if (cmd.op == .line_start) 0 else s.len;
-            if (w.lines.len == 0) break :blk 0;
-            const ln = w.lines[w.lineOf(doc.focus)];
-            break :blk if (cmd.op == .line_start) ln.start else ln.end;
-        },
+        .line_start => lineEdge(s, doc.focus, .start, opt),
+        .line_end => lineEdge(s, doc.focus, .end, opt),
         .char_left, .word_left => blk: {
             // An unshifted arrow with a selection collapses it to the near
             // edge rather than moving from the focus. Which edge is "near"
@@ -1048,4 +1066,43 @@ test "with no layout, Home and End still mean the document's ends" {
     try testing.expectEqual(@as(usize, 0), d.focus);
     _ = try apply(&d, KeyEvent.named(.end), .{});
     try testing.expectEqual(d.len(), d.focus);
+}
+
+test "Cmd+Backspace deletes to the start of the line, not of the document" {
+    // The Mac's `deleteToBeginningOfLine:`. With a line table it is the
+    // line the caret is drawn on; without one, the document's start, which is
+    // what it was before there were lines.
+    var d = try docWith("one two three");
+    defer d.deinit();
+    var l: Laid = .{};
+    defer l.deinit();
+    const w = try l.of(d.text(), 8 * Laid.advance);
+    try d.setCaret(11); // "thr|ee"
+    const r = try applyCommand(&d, .{ .op = .delete_to_line_start }, .{ .lines = w });
+    try testing.expect(r.edited);
+    try testing.expectEqualStrings("one two ee", d.text());
+
+    var d2 = try docWith("one two three");
+    defer d2.deinit();
+    try d2.setCaret(11);
+    _ = try applyCommand(&d2, .{ .op = .delete_to_line_start }, .{});
+    try testing.expectEqualStrings("ee", d2.text());
+}
+
+test "End on a wrapped line stops at its ink, and on the last line goes past a trailing space" {
+    var d = try docWith("one two three ");
+    defer d.deinit();
+    var l: Laid = .{};
+    defer l.deinit();
+    const w = try l.of(d.text(), 8 * Laid.advance);
+    try testing.expectEqual(@as(usize, 2), w.lines.len);
+    try d.setCaret(1);
+    _ = try applyCommand(&d, .{ .op = .line_end }, .{ .lines = w });
+    // Before the space that wrapped the line: after it is the next line.
+    try testing.expectEqual(@as(usize, 7), d.focus);
+    try d.setCaret(9);
+    _ = try applyCommand(&d, .{ .op = .line_end }, .{ .lines = w });
+    try testing.expectEqual(d.len(), d.focus);
+    _ = try applyCommand(&d, .{ .op = .line_start }, .{ .lines = w });
+    try testing.expectEqual(@as(usize, 8), d.focus);
 }

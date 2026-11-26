@@ -58,8 +58,11 @@ pub const Editable = struct {
     /// which line a byte is on is a fact about how the text was set, and this
     /// is where it is known. Valid until the next `refreshEditable`.
     wrapped: ?ui.text_layout.Wrapped = null,
-    /// Behind the text, so it is created before the label.
-    selection: Overlay,
+    /// Behind the text, so they are created before the label. Three,
+    /// because that is how many rectangles a selection is however many lines
+    /// it crosses: the rest of its first line, a block of the whole lines
+    /// between, and the start of its last. On one line only the first is used.
+    selection: [3]Overlay,
     /// Under the provisional text while an input method is composing, and
     /// zero-width otherwise. `docs/text-and-accessibility.md` §2 says
     /// provisional text is drawn differently and is part of the laid-out
@@ -150,7 +153,7 @@ pub fn refreshEditable(
     // wrap is one frame behind. The window relays out and calls this again,
     // so it catches up immediately; it is a frame of staleness and not a
     // wrong answer that stays wrong.
-    const avail = @max(0, t.bounds(e.field).w - field_padding * 2);
+    const avail = editableWrapWidth(t);
     const w = try ui.text_layout.wrap(t.gpa, one, shown.text, avail, fonts.ui.line_height, glyphs, lines);
     e.wrapped = w;
 
@@ -164,20 +167,23 @@ pub fn refreshEditable(
     // spliced in the macOS and Windows shape -- the provisional text is in the
     // document already -- so there the selection stays.
     //
-    // It is also drawn on one line only: a selection running across a line
-    // break is several rectangles, and three overlays cannot be that. What it
-    // needs is a repeat over `w.lines`, which is a widget's job rather than
-    // this demo's.
-    if (doc.preedit.items.len > 0) {
-        try moveOverlay(t, e.selection, 0, 0, 0);
-    } else {
+    // Across a line break it is three rectangles, whatever the number of
+    // lines: the rest of the first line to the field's edge, one block for
+    // every whole line between, and the last line up to the focus. The first
+    // two are a line pitch tall rather than a run tall, so the three abut
+    // instead of being stripes with the leading showing between them.
+    for (e.selection) |o| try placeOverlay(t, o, 0, 0, 0, e.run_h);
+    if (doc.preedit.items.len == 0) {
         const sel = doc.selection();
         const a = w.caret(sel.start);
         const b = w.caret(sel.end);
         if (a.y == b.y) {
-            try moveOverlay(t, e.selection, a.x, top + a.y, b.x - a.x);
+            try placeOverlay(t, e.selection[0], a.x, top + a.y, b.x - a.x, e.run_h);
         } else {
-            try moveOverlay(t, e.selection, 0, 0, 0);
+            const pitch = w.run.line_height;
+            try placeOverlay(t, e.selection[0], a.x, top + a.y, avail - a.x, pitch);
+            try placeOverlay(t, e.selection[1], 0, top + a.y + pitch, avail, b.y - a.y - pitch);
+            try placeOverlay(t, e.selection[2], 0, top + b.y, b.x, e.run_h);
         }
     }
 
@@ -207,17 +213,36 @@ pub fn refreshEditable(
     try t.setText(e.label, w.run);
 }
 
+/// The width the editable field's text wraps to: its content box as last
+/// laid out. Public so that a test replaying the same keystrokes elsewhere can
+/// wrap the same text the same way.
+pub fn editableWrapWidth(t: *const Tree) f32 {
+    const e = editable orelse return 0;
+    return @max(0, t.bounds(e.field).w - field_padding * 2);
+}
+
 /// Where a byte range of the editable field's text is drawn, in layout units
 /// from the top-left of the window: what an input method asks so that its
 /// candidate window opens beside the text. Read from the tree after layout,
 /// so it is wherever the field actually is, not where it was built.
+///
+/// A range that crosses a line break answers with the part on its first line,
+/// which is what `firstRectForCharacterRange:` is named for: the candidate
+/// window opens beside where the composition starts.
 pub fn editableRangeRect(t: *const Tree, r: ui.Range) ui.Rect {
     const e = editable orelse return .{};
     const b = t.bounds(e.label);
-    const run = t.text(e.label);
     const pad = t.style(e.label).padding;
-    const rr = run.rangeRect(r.start, r.end);
-    return .{ .x = b.x + pad + rr.x, .y = b.y + pad + rr.y, .w = rr.w, .h = rr.h };
+    const w = editableLines() orelse {
+        const rr = t.text(e.label).rangeRect(r.start, r.end);
+        return .{ .x = b.x + pad + rr.x, .y = b.y + pad + rr.y, .w = rr.w, .h = rr.h };
+    };
+    const lo = @min(r.start, r.end);
+    const hi = @max(r.start, r.end);
+    const a = w.caret(lo);
+    const z = w.caret(hi);
+    const right = if (a.y == z.y) z.x else w.lines[w.lineOf(lo)].width;
+    return .{ .x = b.x + pad + a.x, .y = b.y + pad + a.y, .w = @max(0, right - a.x), .h = a.h };
 }
 
 /// Where a point in layout units is in the editable field's text, or null
@@ -234,8 +259,15 @@ pub fn editableHit(t: *const Tree, doc_len: usize, p: ui.Point, clamp: bool) ?ui
     if (!clamp and (p.x < f.x or p.y < f.y or p.x >= f.x + f.w or p.y >= f.y + f.h)) return null;
     const b = t.bounds(e.label);
     const pad = t.style(e.label).padding;
-    const run = t.text(e.label);
     const x = p.x - (b.x + pad);
+    // The line comes from y, so a click on the second line is on it -- and a
+    // drag that leaves the field above or below clamps to the first or the
+    // last line, which is how a selection is dragged to either end.
+    if (editableLines()) |w| {
+        const y = p.y - (b.y + pad);
+        return .{ .caret = w.byteAt(x, y, doc_len), .char = w.clusterAt(x, y, doc_len) };
+    }
+    const run = t.text(e.label);
     return .{ .caret = run.byteAt(x, doc_len), .char = run.clusterAt(x, doc_len) };
 }
 
@@ -434,6 +466,16 @@ pub fn moveOverlay(t: *Tree, o: Overlay, x: f32, y: f32, w: f32) !void {
     st.left = @max(0, x);
     st.top = @max(0, y);
     st.width = .{ .fixed = @max(0, w) };
+    try t.setStyle(o.box, st);
+}
+
+/// `moveOverlay` with a height: a selection block that covers several lines.
+pub fn placeOverlay(t: *Tree, o: Overlay, x: f32, y: f32, w: f32, h: f32) !void {
+    var st = t.style(o.box);
+    st.left = @max(0, x);
+    st.top = @max(0, y);
+    st.width = .{ .fixed = @max(0, w) };
+    st.height = .{ .fixed = @max(0, h) };
     try t.setStyle(o.box, st);
 }
 
@@ -718,7 +760,8 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
         if (ui_font) |f| {
             const run = try f.shape(atlas.?, editable_initial);
             const h = run.height();
-            const sel = try overlay(t, field, 0, 0, 0, h, h, selection_color);
+            var sel: [3]Overlay = undefined;
+            for (&sel) |*o| o.* = try overlay(t, field, 0, 0, 0, h, h, selection_color);
             // The same place and thickness as the composition row above.
             const under = try overlay(t, field, 0, run.ascent + 2, 0, 1, h, accent);
             const caret = try overlay(t, field, run.width, 0, 1, h, h, caret_color);

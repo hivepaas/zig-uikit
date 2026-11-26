@@ -425,13 +425,27 @@ fn selectedText(self: id, _: objc.SEL) callconv(.c) ?id {
 
 fn visibleCharacterRange(self: id, _: objc.SEL) callconv(.c) ic.Utf16Range {
     const d = docOf(self, .visible_character_range) orelse return .{ .location = 0, .length = 0 };
-    // One line and no scrolling: all of it.
+    // Nothing scrolls, so every line is visible: all of it.
     return .{ .location = 0, .length = utf16Len(d.doc.text()) };
 }
 
+/// The field's line table, current, when the window's text target edits this
+/// node's document -- the one place lines are known. Null for text nothing has
+/// laid out, which then reads as one line.
+fn linesOf(w: *Window, doc: *const ui.Document) ?*const ui.text_layout.Wrapped {
+    const tt = w.textGeometry() orelse return null;
+    if (tt.doc != doc) return null;
+    const lines = tt.options.lines orelse return null;
+    return if (lines.lines.len == 0) null else lines;
+}
+
+/// The line the caret is drawn on, which is the line VoiceOver reads when the
+/// user asks "what line am I on": after a trailing space that wrapped, that
+/// is the next line, as it is on screen.
 fn insertionPointLine(self: id, _: objc.SEL) callconv(.c) objc.NSInteger {
-    _ = docOf(self, .insertion_point_line);
-    return 0;
+    const d = docOf(self, .insertion_point_line) orelse return 0;
+    const lines = linesOf(d.w, d.doc) orelse return 0;
+    return @intCast(lines.lineOf(d.doc.focus));
 }
 
 fn stringForRange(self: id, _: objc.SEL, range: ic.Utf16Range) callconv(.c) ?id {
@@ -446,22 +460,36 @@ fn frameForRange(self: id, _: objc.SEL, range: ic.Utf16Range) callconv(.c) objc.
     // The input method's geometry callback answers the same question for the
     // same document, so it is asked here too: one function says where a byte
     // range is drawn, for both clients (§7).
-    if (r.w.text) |tt| if (tt.doc == d) if (tt.rect) |f| {
+    if (r.w.textGeometry()) |tt| if (tt.doc == d) if (tt.rect) |f| {
         return r.w.layoutRectToScreen(f(tt.ctx, ic.toBytes(d.text(), range)));
     };
     const b = r.t.tree.bounds(r.n.id, r.t.layout) orelse return zero_rect;
     return r.w.layoutRectToScreen(b);
 }
 
-fn lineForIndex(self: id, _: objc.SEL, _: objc.NSInteger) callconv(.c) objc.NSInteger {
-    _ = docOf(self, .line_for_index);
-    return 0;
+/// The line that owns the *character* at a UTF-16 index: a trailing space is
+/// on the line it ends. VoiceOver reads a line by asking this for the caret's
+/// index and then `rangeForLine` for the answer.
+fn lineForIndex(self: id, _: objc.SEL, index: objc.NSInteger) callconv(.c) objc.NSInteger {
+    const d = docOf(self, .line_for_index) orelse return 0;
+    const lines = linesOf(d.w, d.doc) orelse return 0;
+    const s = d.doc.text();
+    const b = ui.offsets.utf16ToByte(s, @intCast(@max(0, index)));
+    return @intCast(lines.lineOwning(b));
 }
 
+/// A line's characters, trailing spaces included, in UTF-16. Past the last
+/// line, not found: VoiceOver walks lines until it is told there are no more.
 fn rangeForLine(self: id, _: objc.SEL, line: objc.NSInteger) callconv(.c) ic.Utf16Range {
     const d = docOf(self, .range_for_line) orelse return .{ .location = 0, .length = 0 };
-    if (line != 0) return .{ .location = ic.not_found, .length = 0 };
-    return .{ .location = 0, .length = utf16Len(d.doc.text()) };
+    const s = d.doc.text();
+    const lines = linesOf(d.w, d.doc) orelse {
+        if (line != 0) return .{ .location = ic.not_found, .length = 0 };
+        return .{ .location = 0, .length = utf16Len(s) };
+    };
+    if (line < 0 or line >= lines.lines.len) return .{ .location = ic.not_found, .length = 0 };
+    const span = lines.lineSpan(@intCast(line), s.len);
+    return ic.fromBytes(s, .{ .start = span.start, .end = span.end });
 }
 
 /// VoiceOver moving the caret: the one write this tree accepts. It goes to the
@@ -475,6 +503,7 @@ fn setSelectedTextRange(self: id, _: objc.SEL, range: ic.Utf16Range) callconv(.c
     if (tt.doc != d or !tt.doc.canEditNow()) return;
     const b = ic.toBytes(tt.doc.text(), range);
     tt.doc.setSelection(b.start, b.end) catch return;
+    r.w.goal_x = null;
     r.w.text_changed = true;
 }
 

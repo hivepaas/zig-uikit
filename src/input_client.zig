@@ -158,8 +158,16 @@ fn targetRange(doc: *const Document, replacement: Utf16Range) Error!Range {
 // a text view that switched on the key instead would ignore every binding the
 // user has.
 //
-// Line and paragraph commands go to the ends of the document, because there
-// is no line breaker; `editing.zig` says the same of Home and End.
+// Line commands are the line the caret is drawn on, which needs the field's
+// line table in `editing.Options`; without one they fall back to the ends of
+// the document, as `editing.zig` says. Paragraph commands are the document's
+// ends, because a field is one paragraph until it takes a newline -- Ctrl+A
+// and Ctrl+E, which Emacs users reach for, are paragraph commands on a Mac,
+// and that is right for every field this toolkit has.
+//
+// Up and down are commands too, now that there are lines. When a field has
+// none they report themselves unhandled, and the view passes them on as keys
+// (`keyForSelector`) for a list or a scroll view to act on.
 
 const Op = editing.Command.Op;
 
@@ -184,18 +192,23 @@ const bindings = [_]Binding{
     .{ .name = "moveWordBackwardAndModifySelection:", .op = .word_left, .extend = true },
     .{ .name = "moveWordForwardAndModifySelection:", .op = .word_right, .extend = true },
 
-    .{ .name = "moveToLeftEndOfLine:", .op = .doc_start },
-    .{ .name = "moveToRightEndOfLine:", .op = .doc_end },
-    .{ .name = "moveToBeginningOfLine:", .op = .doc_start },
-    .{ .name = "moveToEndOfLine:", .op = .doc_end },
+    .{ .name = "moveUp:", .op = .line_up },
+    .{ .name = "moveDown:", .op = .line_down },
+    .{ .name = "moveUpAndModifySelection:", .op = .line_up, .extend = true },
+    .{ .name = "moveDownAndModifySelection:", .op = .line_down, .extend = true },
+
+    .{ .name = "moveToLeftEndOfLine:", .op = .line_start },
+    .{ .name = "moveToRightEndOfLine:", .op = .line_end },
+    .{ .name = "moveToBeginningOfLine:", .op = .line_start },
+    .{ .name = "moveToEndOfLine:", .op = .line_end },
     .{ .name = "moveToBeginningOfParagraph:", .op = .doc_start },
     .{ .name = "moveToEndOfParagraph:", .op = .doc_end },
     .{ .name = "moveToBeginningOfDocument:", .op = .doc_start },
     .{ .name = "moveToEndOfDocument:", .op = .doc_end },
-    .{ .name = "moveToLeftEndOfLineAndModifySelection:", .op = .doc_start, .extend = true },
-    .{ .name = "moveToRightEndOfLineAndModifySelection:", .op = .doc_end, .extend = true },
-    .{ .name = "moveToBeginningOfLineAndModifySelection:", .op = .doc_start, .extend = true },
-    .{ .name = "moveToEndOfLineAndModifySelection:", .op = .doc_end, .extend = true },
+    .{ .name = "moveToLeftEndOfLineAndModifySelection:", .op = .line_start, .extend = true },
+    .{ .name = "moveToRightEndOfLineAndModifySelection:", .op = .line_end, .extend = true },
+    .{ .name = "moveToBeginningOfLineAndModifySelection:", .op = .line_start, .extend = true },
+    .{ .name = "moveToEndOfLineAndModifySelection:", .op = .line_end, .extend = true },
     .{ .name = "moveToBeginningOfParagraphAndModifySelection:", .op = .doc_start, .extend = true },
     .{ .name = "moveToEndOfParagraphAndModifySelection:", .op = .doc_end, .extend = true },
     .{ .name = "moveToBeginningOfDocumentAndModifySelection:", .op = .doc_start, .extend = true },
@@ -210,8 +223,8 @@ const bindings = [_]Binding{
     .{ .name = "deleteForward:", .op = .delete_char_forward },
     .{ .name = "deleteWordBackward:", .op = .delete_word_backward },
     .{ .name = "deleteWordForward:", .op = .delete_word_forward },
-    .{ .name = "deleteToBeginningOfLine:", .op = .delete_to_doc_start },
-    .{ .name = "deleteToEndOfLine:", .op = .delete_to_doc_end },
+    .{ .name = "deleteToBeginningOfLine:", .op = .delete_to_line_start },
+    .{ .name = "deleteToEndOfLine:", .op = .delete_to_line_end },
     .{ .name = "deleteToBeginningOfParagraph:", .op = .delete_to_doc_start },
     .{ .name = "deleteToEndOfParagraph:", .op = .delete_to_doc_end },
 
@@ -230,9 +243,10 @@ pub fn commandForSelector(name: []const u8) ?editing.Command {
     return null;
 }
 
-/// The key to report to the application for a selector that is not an editing
-/// command but that the application may want: Escape, Tab, and vertical
-/// movement, which `editing` leaves unhandled so a scroll view can act on it.
+/// The key to report to the application for a selector the field did not act
+/// on but the application may want: Escape, Tab, paging, and up and down when
+/// the field has no lines to move between, so that a scroll view can act on
+/// them.
 pub fn keyForSelector(name: []const u8) ?keys.KeyEvent {
     const table = [_]struct { []const u8, keys.Key, keys.Mods }{
         .{ "cancelOperation:", .escape, .{} },
@@ -240,6 +254,8 @@ pub fn keyForSelector(name: []const u8) ?keys.KeyEvent {
         .{ "insertBacktab:", .tab, .{ .shift = true } },
         .{ "moveUp:", .up, .{} },
         .{ "moveDown:", .down, .{} },
+        .{ "moveUpAndModifySelection:", .up, .{ .shift = true } },
+        .{ "moveDownAndModifySelection:", .down, .{ .shift = true } },
         .{ "pageUp:", .page_up, .{} },
         .{ "pageDown:", .page_down, .{} },
         .{ "scrollPageUp:", .page_up, .{} },
@@ -372,14 +388,19 @@ test "key-binding selectors are editing commands, by meaning and not by chord" {
     const word = commandForSelector("moveWordLeftAndModifySelection:").?;
     try testing.expectEqual(Op.word_left, word.op);
     try testing.expect(word.extend);
-    try testing.expectEqual(Op.doc_start, commandForSelector("moveToLeftEndOfLine:").?.op);
+    try testing.expectEqual(Op.line_start, commandForSelector("moveToLeftEndOfLine:").?.op);
+    try testing.expectEqual(Op.doc_start, commandForSelector("moveToBeginningOfDocument:").?.op);
     try testing.expectEqual(Op.delete_to_doc_end, commandForSelector("deleteToEndOfParagraph:").?.op);
-    try testing.expectEqual(@as(?editing.Command, null), commandForSelector("moveUp:"));
+    try testing.expectEqual(Op.line_up, commandForSelector("moveUp:").?.op);
+    try testing.expectEqual(Op.line_end, commandForSelector("moveToEndOfLine:").?.op);
     try testing.expectEqual(@as(?editing.Command, null), commandForSelector("noop:"));
 
     try testing.expectEqual(keys.Key.escape, keyForSelector("cancelOperation:").?.key);
     try testing.expect(keyForSelector("insertBacktab:").?.mods.shift);
     try testing.expectEqual(@as(?keys.KeyEvent, null), keyForSelector("moveLeft:"));
+    // Up and down are both: a command first, and a key for the application
+    // when the field had no line to move to.
+    try testing.expectEqual(keys.Key.up, keyForSelector("moveUp:").?.key);
 }
 
 test "Option+Left on a Mac moves by word through a Vietnamese syllable" {
@@ -394,6 +415,7 @@ test "Option+Left on a Mac moves by word through a Vietnamese syllable" {
     _ = try editing.applyCommand(&doc, cmd, .{});
     try testing.expectEqualStrings("tiếng Việt", doc.text()[doc.focus..]);
 
+    // Cmd+Backspace. One line, since nothing laid it out: to the start.
     _ = try editing.applyCommand(&doc, commandForSelector("deleteToBeginningOfLine:").?, .{});
     try testing.expectEqualStrings("tiếng Việt", doc.text());
 }

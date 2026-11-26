@@ -87,9 +87,60 @@ pub const Wrapped = struct {
     /// The byte a click at `(x, y)` should move the caret to.
     pub fn byteAt(self: Wrapped, x: f32, y: f32, len: usize) usize {
         if (self.lines.len == 0) return 0;
+        return self.byteOnLine(self.lineAtY(y), x, len);
+    }
+
+    /// The line a point at height `y` is on: above the first is the first,
+    /// below the last is the last.
+    pub fn lineAtY(self: Wrapped, y: f32) usize {
         var i: usize = 0;
         while (i + 1 < self.lines.len and y >= self.lines[i + 1].y) i += 1;
-        return self.byteOnLine(i, x, len);
+        return i;
+    }
+
+    /// The character *under* `(x, y)`, not rounded to an edge: what a
+    /// double-click selects the word around. `TextRun.clusterAt` for one line
+    /// of a paragraph, and for the same reason -- rounding would turn a click
+    /// on the right half of a word's last letter into the space after it.
+    ///
+    /// Before a line's first glyph, its first character. Past its ink, the
+    /// line's end, which is the trailing space the line owns; on the last
+    /// line, `len`, as `TextRun.clusterAt` says past the end of one line.
+    pub fn clusterAt(self: Wrapped, x: f32, y: f32, len: usize) usize {
+        if (self.lines.len == 0) return 0;
+        const i = self.lineAtY(y);
+        const ln = self.lines[i];
+        const past = if (i + 1 == self.lines.len) len else ln.end;
+        const gs = self.run.glyphs[ln.first..][0..ln.count];
+        if (gs.len == 0) return past;
+        if (x < gs[0].pen_x) return gs[0].cluster;
+        for (gs, 0..) |g, k| {
+            // The trailing spaces have glyphs but no ink to be under.
+            if (g.cluster >= ln.end) break;
+            const next_x = if (k + 1 < gs.len) @min(gs[k + 1].pen_x, ln.width) else ln.width;
+            if (x < next_x) return g.cluster;
+        }
+        return past;
+    }
+
+    /// The bytes line `i` owns: from its start to where the next line starts,
+    /// trailing spaces included, and to `len` for the last. What a screen
+    /// reader reads as "the line" -- it reads the space too, and a line that
+    /// lost its space would make the next one start mid-word.
+    pub fn lineSpan(self: Wrapped, i: usize, len: usize) struct { start: usize, end: usize } {
+        if (self.lines.len == 0) return .{ .start = 0, .end = len };
+        const k = @min(i, self.lines.len - 1);
+        const end = if (k + 1 < self.lines.len) self.lines[k + 1].start else len;
+        return .{ .start = self.lines[k].start, .end = end };
+    }
+
+    /// The line whose span holds the character at byte `b`. Not `lineOf`,
+    /// which answers where a *caret* before `b` is drawn: a trailing space is
+    /// on the line it ends, and the caret after it is on the next.
+    pub fn lineOwning(self: Wrapped, b: usize) usize {
+        var i: usize = 0;
+        while (i + 1 < self.lines.len and b >= self.lines[i + 1].start) i += 1;
+        return i;
     }
 
     /// The byte a caret at `x` should move to on line `i`. What a vertical
@@ -97,7 +148,8 @@ pub const Wrapped = struct {
     /// characters are not all the same width.
     pub fn byteOnLine(self: Wrapped, i: usize, x: f32, len: usize) usize {
         if (self.lines.len == 0) return 0;
-        const ln = self.lines[@min(i, self.lines.len - 1)];
+        const li = @min(i, self.lines.len - 1);
+        const ln = self.lines[li];
         const gs = self.run.glyphs[ln.first..][0..ln.count];
         if (gs.len == 0) return ln.start;
         for (gs, 0..) |g, k| {
@@ -105,17 +157,23 @@ pub const Wrapped = struct {
             if (x >= next_x) continue;
             const mid = (g.pen_x + next_x) * 0.5;
             if (x < mid) return g.cluster;
-            return if (k + 1 < gs.len) gs[k + 1].cluster else lineEnd(ln, len);
+            return if (k + 1 < gs.len) gs[k + 1].cluster else self.lineEnd(li, len);
         }
-        return lineEnd(ln, len);
+        return self.lineEnd(li, len);
     }
 
-    fn lineEnd(ln: Line, len: usize) usize {
+    fn lineEnd(self: Wrapped, i: usize, len: usize) usize {
         // The trailing spaces are on this line, but a caret dropped past the
         // end of it belongs before them: a click in the margin should land
         // where the ink stops, not after a space that is not there to see.
-        _ = len;
-        return ln.end;
+        //
+        // Except on the last line, where there is no next line for the caret
+        // after the space to be drawn on: past the end of the paragraph is
+        // its end. A field that ends in a space -- the demo's does, so that
+        // typing starts a new word -- otherwise puts a click after the text
+        // *before* that space, and the next word typed runs into the last.
+        if (i + 1 >= self.lines.len) return len;
+        return self.lines[i].end;
     }
 
     fn xOnLine(self: Wrapped, ln: Line, b: usize) f32 {
@@ -537,4 +595,56 @@ test "a width of zero does not wrap at every character" {
     const w = try b.run(s, 0);
     try expectWellFormed(w, s);
     try testing.expectEqual(@as(usize, 1), w.lines.len);
+}
+
+test "past the end of the last line is the end of the paragraph, trailing space included" {
+    // The demo's field ends in a space so that typing starts a new word. A
+    // click after the text that landed before that space would run the next
+    // word into the last one. On a line that is not the last, the caret
+    // still stops where the ink does.
+    var b: Bits = .{};
+    defer b.deinit();
+    const s = "one two three ";
+    const w = try b.run(s, 8 * adv);
+    try testing.expectEqual(@as(usize, 2), w.lines.len);
+    try testing.expectEqual(s.len, w.byteAt(1000, 12, s.len));
+    try testing.expectEqual(@as(usize, 7), w.byteAt(1000, 0, s.len));
+}
+
+test "the character under a point is found on the line the point is on" {
+    var b: Bits = .{};
+    defer b.deinit();
+    const s = "one two three";
+    const w = try b.run(s, 8 * adv);
+    // The right half of `o` in "two" is still the `o`, not the boundary
+    // after it, which is what keeps a double-click on the word.
+    try testing.expectEqual(@as(usize, 6), w.clusterAt(6.8 * adv, 0, s.len));
+    try testing.expectEqual(@as(usize, 6), w.byteAt(6.4 * adv, 0, s.len));
+    // The same x on the second line is the `e` of "three".
+    try testing.expectEqual(@as(usize, 11), w.clusterAt(3.8 * adv, 12, s.len));
+    // Past the ink of the first line is its trailing space, not the next
+    // line's first character; past the last is the end.
+    try testing.expectEqual(@as(usize, 7), w.clusterAt(1000, 0, s.len));
+    try testing.expectEqual(s.len, w.clusterAt(1000, 12, s.len));
+}
+
+test "a line's span is what a screen reader reads, and the space is on the line it ends" {
+    var b: Bits = .{};
+    defer b.deinit();
+    const s = "one two three";
+    const w = try b.run(s, 8 * adv);
+    const first = w.lineSpan(0, s.len);
+    try testing.expectEqualStrings("one two ", s[first.start..first.end]);
+    const last = w.lineSpan(1, s.len);
+    try testing.expectEqualStrings("three", s[last.start..last.end]);
+    // Asked past the last line, the last.
+    try testing.expectEqual(last.start, w.lineSpan(9, s.len).start);
+
+    // The space at byte 7 is the first line's. A caret *after* it is drawn
+    // on the second line, which is `lineOf`'s answer and a different
+    // question.
+    try testing.expectEqual(@as(usize, 0), w.lineOwning(7));
+    try testing.expectEqual(@as(usize, 1), w.lineOwning(8));
+    try testing.expectEqual(@as(usize, 1), w.lineOf(8));
+    try testing.expectEqual(@as(usize, 1), w.lineOwning(s.len));
 }

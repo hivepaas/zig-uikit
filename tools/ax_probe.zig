@@ -59,6 +59,7 @@ extern "CoreFoundation" fn CFNumberGetTypeID() usize;
 extern "CoreFoundation" fn CFArrayGetCount(a: CFTypeRef) isize;
 extern "CoreFoundation" fn CFArrayGetValueAtIndex(a: CFTypeRef, i: isize) CFTypeRef;
 extern "CoreFoundation" fn CFNumberGetValue(n: CFTypeRef, t: c_int, out: *anyopaque) bool;
+extern "CoreFoundation" fn CFNumberCreate(alloc: ?*anyopaque, t: c_int, value: *const anyopaque) ?CFTypeRef;
 extern "CoreFoundation" fn CFRelease(v: CFTypeRef) void;
 extern "CoreFoundation" fn CFRetain(v: CFTypeRef) CFTypeRef;
 extern "CoreFoundation" fn CFRunLoopGetCurrent() *anyopaque;
@@ -124,6 +125,13 @@ fn frameOf(el: AXUIElementRef) ?CGRect {
     const p = axValue(CGPoint, attr(el, "AXPosition"), kAXValueCGPointType) orelse return null;
     const s = axValue(CGSize, attr(el, "AXSize"), kAXValueCGSizeType) orelse return null;
     return .{ .origin = p, .size = s };
+}
+
+/// A `CFNumber` for a line number or a character index, the parameter of
+/// `AXRangeForLine` and `AXLineForIndex`.
+fn lineParam(n: anytype) ?CFTypeRef {
+    const v: i64 = @intCast(n);
+    return CFNumberCreate(null, kCFNumberSInt64Type, &v);
 }
 
 fn check(ok: bool, comptime what: []const u8, args: anytype) void {
@@ -215,20 +223,25 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var b1: [512]u8 = undefined;
     const value = str(attr(field, "AXValue"), &b1) orelse "";
     std.debug.print("text field \"{s}\"\n", .{value});
-    const initial = "Gõ vào đây: tiếng ";
+    // `demo.editable_initial`, which this process does not link.
+    const initial = "Gõ vào đây: ô này tự xuống dòng khi chữ dài hơn bề ngang của nó, " ++
+        "và mũi tên lên xuống đi được giữa các dòng. Gõ thử: tiếng ";
     check(std.mem.eql(u8, value, initial), "AXValue is the document", .{});
-    // 18 UTF-16 units, 24 bytes: a client counting bytes gets 24.
+    // UTF-16 units, not bytes: every Vietnamese letter with a mark is two or
+    // three bytes and one unit, so a client counting bytes gets far more.
+    const units: i64 = @intCast(std.unicode.calcUtf16LeLen(initial) catch unreachable);
     const n_chars = int(attr(field, "AXNumberOfCharacters")) orelse -1;
-    check(n_chars == 18, "AXNumberOfCharacters {d} is UTF-16 units, not 24 bytes", .{n_chars});
+    check(n_chars == units, "AXNumberOfCharacters {d} is UTF-16 units, not {d} bytes", .{ n_chars, initial.len });
     const sel = axValue(CFRange, attr(field, "AXSelectedTextRange"), kAXValueCFRangeType);
-    check(sel != null and sel.?.location == 18 and sel.?.length == 0, "AXSelectedTextRange is the caret at the end", .{});
-    // `tiếng` is units 12..17 and bytes 16..23.
-    const want_range: CFRange = .{ .location = 12, .length = 5 };
+    check(sel != null and sel.?.location == units and sel.?.length == 0, "AXSelectedTextRange is the caret at the end", .{});
+    // `tiếng`, the last word, by its UTF-16 position.
+    const tieng_at: isize = @intCast(std.unicode.calcUtf16LeLen(initial[0..std.mem.lastIndexOf(u8, initial, "tiếng").?]) catch unreachable);
+    const want_range: CFRange = .{ .location = tieng_at, .length = 5 };
     const range_v = AXValueCreate(kAXValueCFRangeType, &want_range).?;
     defer CFRelease(range_v);
     var b2: [64]u8 = undefined;
     const sub = str(paramAttr(field, "AXStringForRange", range_v), &b2) orelse "";
-    check(std.mem.eql(u8, sub, "tiếng"), "AXStringForRange(12, 5) is \"{s}\"", .{sub});
+    check(std.mem.eql(u8, sub, "tiếng"), "AXStringForRange({d}, 5) is \"{s}\"", .{ tieng_at, sub });
     // VoiceOver moving the caret: the one attribute the field lets a client
     // set. Selected, read back, and put back, so the typing below still
     // appends rather than replacing.
@@ -236,8 +249,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const set_err = AXUIElementSetAttributeValue(field, cf("AXSelectedTextRange"), range_v);
     var b6: [64]u8 = undefined;
     const selected = str(attr(field, "AXSelectedText"), &b6) orelse "";
-    check(set_err == 0 and std.mem.eql(u8, selected, "tiếng"), "setting AXSelectedTextRange(12, 5) selects \"{s}\"", .{selected});
-    const end_range: CFRange = .{ .location = 18, .length = 0 };
+    check(set_err == 0 and std.mem.eql(u8, selected, "tiếng"), "setting AXSelectedTextRange({d}, 5) selects \"{s}\"", .{ tieng_at, selected });
+    const end_range: CFRange = .{ .location = @intCast(units), .length = 0 };
     const end_v = AXValueCreate(kAXValueCFRangeType, &end_range).?;
     defer CFRelease(end_v);
     queries += 1;
@@ -248,6 +261,40 @@ pub fn main(init: std.process.Init.Minimal) !void {
         word.?.origin.x > field_frame.?.origin.x and
         word.?.origin.x + word.?.size.width < field_frame.?.origin.x + field_frame.?.size.width and
         word.?.size.width > 10, "AXBoundsForRange puts the word inside the field, in screen coordinates", .{});
+    // --- lines: how VoiceOver reads a field that wraps ---
+    //
+    // Line by line until it is told there are no more, each line's text by
+    // its range. The lines must partition the text -- nothing dropped at a
+    // break, nothing read twice -- and there must be more than one, or the
+    // field is not wrapping and none of this was tested.
+    var joined: [1024]u8 = undefined;
+    var joined_len: usize = 0;
+    var n_lines: i64 = 0;
+    var line_frames: [8]?CGRect = @splat(null);
+    while (n_lines < 32) : (n_lines += 1) {
+        const ln = lineParam(n_lines) orelse break;
+        defer CFRelease(ln);
+        const lr = axValue(CFRange, paramAttr(field, "AXRangeForLine", ln), kAXValueCFRangeType) orelse break;
+        if (lr.location < 0 or lr.location > units) break;
+        const lv = AXValueCreate(kAXValueCFRangeType, &lr).?;
+        defer CFRelease(lv);
+        var lb: [512]u8 = undefined;
+        const text = str(paramAttr(field, "AXStringForRange", lv), &lb) orelse "";
+        @memcpy(joined[joined_len..][0..text.len], text);
+        joined_len += text.len;
+        if (n_lines < line_frames.len) line_frames[@intCast(n_lines)] = axValue(CGRect, paramAttr(field, "AXBoundsForRange", lv), kAXValueCGRectType);
+        std.debug.print("  line {d}: \"{s}\"\n", .{ n_lines, text });
+    }
+    check(n_lines >= 2 and std.mem.eql(u8, joined[0..joined_len], initial), "AXRangeForLine: {d} lines that read back as the whole text", .{n_lines});
+    const ip_line = int(attr(field, "AXInsertionPointLineNumber")) orelse -1;
+    check(ip_line == n_lines - 1, "AXInsertionPointLineNumber {d} is the last line, where the caret is", .{ip_line});
+    const idx = lineParam(tieng_at).?;
+    defer CFRelease(idx);
+    const tieng_line = int(paramAttr(field, "AXLineForIndex", idx)) orelse -1;
+    check(tieng_line == n_lines - 1, "AXLineForIndex({d}) puts \"tiếng\" on line {d}", .{ tieng_at, tieng_line });
+    check(line_frames[0] != null and line_frames[1] != null and
+        line_frames[1].?.origin.y > line_frames[0].?.origin.y + 1, "the second line's bounds are below the first's", .{});
+
     var b3: [64]u8 = undefined;
     const focused = attr(app, "AXFocusedUIElement");
     const focused_role = if (focused) |f| blk: {

@@ -98,6 +98,7 @@ const Live = struct {
     t: *ui.Tree,
     scene: *ui.Scene,
     fonts: *demo.Fonts,
+    field: *Field,
     /// Which step of the drag to capture and compare, 0 for none.
     capture_step: u32 = 0,
     captured: ?Diff = null,
@@ -106,6 +107,34 @@ const Live = struct {
     ns_worst: u64 = 0,
     timed: u32 = 0,
 };
+
+/// The editable field and everything laying it out again needs. It is the
+/// context of the text target's callbacks, and what a resize re-wraps with:
+/// the field is as wide as the window lets it be, so a narrower window is more
+/// lines.
+const Field = struct {
+    win: *mac.Window,
+    t: *ui.Tree,
+    fonts: *demo.Fonts,
+    doc: *ui.Document,
+    shown: *std.ArrayList(u8),
+    glyphs: *std.ArrayList(ui.Glyph),
+    lines: *std.ArrayList(ui.text_layout.Line),
+
+    /// Shapes and wraps the field again, and hands the text target the new
+    /// line table -- `demo.editableLines` is null until the first wrap.
+    fn refresh(self: *Field) !void {
+        try demo.refreshEditable(self.t, self.fonts, self.doc, self.shown, self.glyphs, self.lines);
+        if (self.win.text) |*tt| tt.options.lines = demo.editableLines();
+    }
+};
+
+/// `TextTarget.sync`: the document changed inside this turn of the event loop
+/// and something asked where its text is before the frame laid it out.
+fn syncField(ctx: ?*anyopaque) void {
+    const f: *Field = @ptrCast(@alignCast(ctx.?));
+    f.refresh() catch {};
+}
 
 /// A frame at the window's new size, drawn from `setFrameSize:` while the
 /// user drags. The same work the main loop does on a resize -- new
@@ -125,7 +154,11 @@ fn liveDraw(ctx: ?*anyopaque, win: *mac.Window) void {
     };
     l.swapchain.recreate(win.pixelWidth(), win.pixelHeight(), win.scale) catch return;
     l.t.layout(viewport(win));
+    // The field's width changed, so its lines did: wrapped to the width just
+    // laid out, and laid out again for the height that gives it.
+    l.field.refresh() catch {};
     _ = l.t.flush();
+    win.textGeometryChanged();
     _ = l.scene.build(l.t) catch return;
     if (capture) l.swapchain.capture_request = true;
     const presented = l.swapchain.drawAndPresent(l.renderer, l.scene, bg) catch return;
@@ -143,10 +176,11 @@ fn checkPresentedFrame(
     scene: *const ui.Scene,
     atlas: ui.AtlasView,
     t: *const ui.Tree,
-    /// A magnified crop of the editable field, written only by `--telex` so
-    /// that a plain `--capture` does not replace it with an untouched field:
-    /// the input method's work, mid-word, as the window server was handed it.
-    crop: ?[]const u8,
+    /// A crop of the editable field, written only by `--telex` and `--click`
+    /// so that a plain `--capture` does not replace it with an untouched
+    /// field: the input method's work, mid-word, or a selection across a line
+    /// break, as the window server was handed it.
+    crop: ?Crop,
 ) !void {
     const w = swapchain.extent.width;
     const h = swapchain.extent.height;
@@ -161,8 +195,11 @@ fn checkPresentedFrame(
     var threaded: std.Io.Threaded = .init_single_threaded;
     const io = threaded.io();
     var fb: ui.Framebuffer = .{ .gpa = gpa, .w = w, .h = h, .px = rgba };
-    try fb.writePng(io, "docs/demo-window-macos.png");
-    if (crop) |path| if (demo.editable) |ed| {
+    // The whole window only from the runs that leave it as it starts: a
+    // selection is not what the picture of the demo should show.
+    const whole = if (crop) |c| c.whole else true;
+    if (whole) try fb.writePng(io, "docs/demo-window-macos.png");
+    if (crop) |c| if (demo.editable) |ed| {
         // In pixels: the frame is two pixels per point, and the crop is of
         // the frame.
         const s = swapchain.scale;
@@ -170,20 +207,28 @@ fn checkPresentedFrame(
         try demo.writeCrop(gpa, io, &fb, .{
             .x = b.x * s,
             .y = b.y * s,
-            .w = @min(b.w, 360) * s,
+            .w = @min(b.w, c.max_w) * s,
             .h = b.h * s,
-        }, 1, path);
-        std.debug.print("wrote {s}\n", .{path});
+        }, 1, c.path);
+        std.debug.print("wrote {s}\n", .{c.path});
     };
     std.debug.print(
         \\presented frame vs software reference, {d}x{d} pixels at scale {d}, {d} glyphs:
         \\  largest channel difference   {d}
         \\  pixels differing by > 1      {d}
-        \\wrote docs/demo-window-macos.png
-        \\
         \\
     , .{ w, h, swapchain.scale, glyphs, worst, over1 });
+    if (whole) std.debug.print("wrote docs/demo-window-macos.png\n", .{});
+    std.debug.print("\n", .{});
 }
+
+const Crop = struct {
+    path: []const u8,
+    /// In points: the crop's width, at most.
+    max_w: f32 = 360,
+    /// Whether to write the whole window as well.
+    whole: bool = true,
+};
 
 /// `clock_gettime(MONOTONIC)` on macOS is only microsecond-resolution, which
 /// rounds a 300 ns idle frame to 0 or 1000. `CLOCK_UPTIME_RAW` through
@@ -202,14 +247,22 @@ const Stroke = struct {
     chars: []const u8,
     bare: []const u8,
     mods: mac.Window.KeyMods = .{},
+    /// Sent in the same turn of the event loop as the stroke before it, so
+    /// that nothing lays the text out in between -- what a fast typist or a
+    /// key repeat does. See `TextTarget.sync`.
+    with_previous: bool = false,
 };
 
 const kVK_Delete = 51;
 const kVK_LeftArrow = 123;
 const kVK_RightArrow = 124;
 const kVK_Space = 49;
+const kVK_DownArrow = 125;
+const kVK_UpArrow = 126;
 const left_arrow = "\u{F702}";
 const right_arrow = "\u{F703}";
+const up_arrow = "\u{F700}";
+const down_arrow = "\u{F701}";
 const backspace = "\x7f";
 
 /// The ANSI key code for a lower-case letter: what an input method reads,
@@ -241,32 +294,72 @@ fn typeScript(gpa: std.mem.Allocator) ![]Stroke {
     // character palette or a dictation result looks like to a view.
     while (it.nextCodepointSlice()) |ch| try list.append(gpa, .{ .code = if (ch.len == 1) letterCode(ch[0]) else 0, .chars = ch, .bare = ch });
     for (0..4) |_| try list.append(gpa, .{ .code = kVK_Delete, .chars = backspace, .bare = backspace });
+    // Down and back up, between the field's lines: `moveDown:` and
+    // `moveUp:`, which keep the column across both.
+    // The Down arrives with the last backspace, before any frame has laid
+    // out the shorter text: the line table it needs is one keystroke old
+    // unless the window asks for a new one.
+    try list.append(gpa, .{ .code = kVK_DownArrow, .chars = down_arrow, .bare = down_arrow, .mods = .{ .function = true }, .with_previous = true });
+    try list.append(gpa, .{ .code = kVK_UpArrow, .chars = up_arrow, .bare = up_arrow, .mods = .{ .function = true } });
     try list.append(gpa, .{ .code = kVK_LeftArrow, .chars = left_arrow, .bare = left_arrow, .mods = .{ .command = true, .function = true } });
     try list.append(gpa, .{ .code = kVK_RightArrow, .chars = right_arrow, .bare = right_arrow, .mods = .{ .option = true, .function = true } });
     try list.append(gpa, .{ .code = kVK_RightArrow, .chars = right_arrow, .bare = right_arrow, .mods = .{ .option = true, .function = true } });
     try list.append(gpa, .{ .code = kVK_RightArrow, .chars = right_arrow, .bare = right_arrow, .mods = .{ .command = true, .shift = true, .function = true } });
     try list.append(gpa, .{ .code = 7, .chars = "X", .bare = "x", .mods = .{ .shift = true } });
     try list.append(gpa, .{ .code = kVK_Delete, .chars = backspace, .bare = backspace, .mods = .{ .option = true } });
+    // Cmd+Down is `moveToEndOfDocument:`, Ctrl+End's opposite number; then
+    // up and down again from the end, where the lines are uneven.
+    try list.append(gpa, .{ .code = kVK_DownArrow, .chars = down_arrow, .bare = down_arrow, .mods = .{ .command = true, .function = true } });
+    try list.append(gpa, .{ .code = kVK_UpArrow, .chars = up_arrow, .bare = up_arrow, .mods = .{ .function = true } });
+    try list.append(gpa, .{ .code = kVK_DownArrow, .chars = down_arrow, .bare = down_arrow, .mods = .{ .function = true } });
     return list.toOwnedSlice(gpa);
 }
 
 /// What `--type` should leave in the document: the Wayland demo's script,
 /// with Linux chords, applied by `editing.apply` with no window at all.
-fn linuxEquivalent(gpa: std.mem.Allocator) !ui.Document {
-    var doc = ui.Document.init(gpa);
-    errdefer doc.deinit();
-    _ = try doc.insert(.application, demo.editable_initial);
+///
+/// The text is wrapped before every keystroke, with the same font to the same
+/// width as the window's field, because the vertical keys and Home and End
+/// are about lines: without the line table they would mean something else and
+/// the comparison would be of two different scripts.
+fn linuxEquivalent(gpa: std.mem.Allocator, fonts: *demo.Fonts, width: f32) !ui.Document {
+    const Replay = struct {
+        gpa: std.mem.Allocator,
+        doc: ui.Document,
+        fonts: *demo.Fonts,
+        width: f32,
+        glyphs: std.ArrayList(ui.Glyph) = .empty,
+        lines: std.ArrayList(ui.text_layout.Line) = .empty,
+        goal_x: ?f32 = null,
+
+        fn key(self: *@This(), ev: ui.KeyEvent) !void {
+            const one = try self.fonts.ui.shape(&self.fonts.atlas, self.doc.text());
+            const w = try ui.text_layout.wrap(self.gpa, one, self.doc.text(), self.width, self.fonts.ui.line_height, &self.glyphs, &self.lines);
+            const r = try ui.editing.apply(&self.doc, ev, .{ .lines = &w, .goal_x = self.goal_x });
+            self.goal_x = r.goal_x;
+        }
+    };
+    var rp: Replay = .{ .gpa = gpa, .doc = ui.Document.init(gpa), .fonts = fonts, .width = width };
+    defer rp.glyphs.deinit(gpa);
+    defer rp.lines.deinit(gpa);
+    errdefer rp.doc.deinit();
+    _ = try rp.doc.insert(.application, demo.editable_initial);
     const ctrl: ui.Mods = .{ .ctrl = true };
     var it = (std.unicode.Utf8View.init(" — thử xoá và chọn") catch unreachable).iterator();
-    while (it.nextCodepointSlice()) |ch| _ = try ui.editing.apply(&doc, ui.KeyEvent.typed(ch), .{});
-    for (0..4) |_| _ = try ui.editing.apply(&doc, ui.KeyEvent.named(.backspace), .{});
-    _ = try ui.editing.apply(&doc, ui.KeyEvent.named(.home), .{});
-    _ = try ui.editing.apply(&doc, ui.KeyEvent.named(.right).withMods(ctrl), .{});
-    _ = try ui.editing.apply(&doc, ui.KeyEvent.named(.right).withMods(ctrl), .{});
-    _ = try ui.editing.apply(&doc, ui.KeyEvent.named(.end).withMods(.{ .shift = true }), .{});
-    _ = try ui.editing.apply(&doc, ui.KeyEvent.typed("X"), .{});
-    _ = try ui.editing.apply(&doc, ui.KeyEvent.named(.backspace).withMods(ctrl), .{});
-    return doc;
+    while (it.nextCodepointSlice()) |ch| try rp.key(ui.KeyEvent.typed(ch));
+    for (0..4) |_| try rp.key(ui.KeyEvent.named(.backspace));
+    try rp.key(ui.KeyEvent.named(.down));
+    try rp.key(ui.KeyEvent.named(.up));
+    try rp.key(ui.KeyEvent.named(.home));
+    try rp.key(ui.KeyEvent.named(.right).withMods(ctrl));
+    try rp.key(ui.KeyEvent.named(.right).withMods(ctrl));
+    try rp.key(ui.KeyEvent.named(.end).withMods(.{ .shift = true }));
+    try rp.key(ui.KeyEvent.typed("X"));
+    try rp.key(ui.KeyEvent.named(.backspace).withMods(ctrl));
+    try rp.key(ui.KeyEvent.named(.end).withMods(ctrl));
+    try rp.key(ui.KeyEvent.named(.up));
+    try rp.key(ui.KeyEvent.named(.down));
+    return rp.doc;
 }
 
 /// `--telex`: to the end of the field, then `tieengs Vieetj ` as key codes
@@ -346,8 +439,8 @@ fn sleepNs(ns: u64) void {
 }
 
 fn hitTest(ctx: ?*anyopaque, doc: *const ui.Document, p: ui.Point, clamp: bool) ?ui.editing.Hit {
-    const t: *const ui.Tree = @ptrCast(@alignCast(ctx.?));
-    return demo.editableHit(t, doc.len(), p, clamp);
+    const f: *const Field = @ptrCast(@alignCast(ctx.?));
+    return demo.editableHit(f.t, doc.len(), p, clamp);
 }
 
 const MouseEv = struct { p: ui.Point, kind: mac.Window.MouseKind, clicks: u32 = 1, shift: bool = false };
@@ -359,6 +452,8 @@ const ClickStep = struct {
     selected: []const u8,
     /// For a gesture that leaves a caret: where, as the text after it.
     caret_before: ?[]const u8 = null,
+    /// Capture the frame that shows the result.
+    capture: bool = false,
 };
 
 /// The gestures, at positions read from the laid-out field. Everything is
@@ -420,11 +515,28 @@ fn clickScript(arena: std.mem.Allocator, t: *const ui.Tree, s: []const u8) ![]Cl
         .{ .p = q.in(1, 0.5), .kind = .dragged, .clicks = 2 },
         .{ .p = q.in(1, 0.5), .kind = .up, .clicks = 2 },
     }), .selected = "Gõ vào đây" });
-    try steps.append(arena, .{ .what = "a drag past the end of the field", .events = try arena.dupe(MouseEv, &.{
+    // The field wraps, so "past the end" is two places: to the right of a
+    // line, which is that line's end, and below the field, which is the
+    // document's.
+    const first_line_end = demo.editableLines().?.lines[0].end;
+    const right_of_first = q.in(vao, 0.25);
+    try steps.append(arena, .{ .what = "a drag off the right of the first line", .events = try arena.dupe(MouseEv, &.{
         .{ .p = q.in(vao, 0.25), .kind = .down },
-        .{ .p = .{ .x = field.x + field.w + 80, .y = field.y + field.h / 2 }, .kind = .dragged },
-        .{ .p = .{ .x = field.x + field.w + 80, .y = field.y + field.h / 2 }, .kind = .up },
-    }), .selected = "vào đây: tiếng " });
+        .{ .p = .{ .x = field.x + field.w + 80, .y = right_of_first.y }, .kind = .dragged },
+        .{ .p = .{ .x = field.x + field.w + 80, .y = right_of_first.y }, .kind = .up },
+    }), .selected = s[vao..first_line_end] });
+    const next_line = q.at("các dòng");
+    try steps.append(arena, .{ .what = "a drag onto the next line selects across the break", .events = try arena.dupe(MouseEv, &.{
+        .{ .p = q.in(vao, 0.25), .kind = .down },
+        .{ .p = q.in(next_line, 0.25), .kind = .dragged },
+        .{ .p = q.in(next_line, 0.25), .kind = .up },
+    }), .selected = s[vao..next_line], .capture = true });
+    std.debug.assert(next_line > first_line_end);
+    try steps.append(arena, .{ .what = "a drag out of the bottom of the field", .events = try arena.dupe(MouseEv, &.{
+        .{ .p = q.in(vao, 0.25), .kind = .down },
+        .{ .p = .{ .x = field.x + field.w / 2, .y = field.y + field.h + 40 }, .kind = .dragged },
+        .{ .p = .{ .x = field.x + field.w / 2, .y = field.y + field.h + 40 }, .kind = .up },
+    }), .selected = s[vao..] });
     try steps.append(arena, .{ .what = "a triple-click selects it all", .events = try arena.dupe(MouseEv, &.{
         .{ .p = q.in(vao, 0.5), .kind = .down },
         .{ .p = q.in(vao, 0.5), .kind = .up },
@@ -441,8 +553,8 @@ fn clickScript(arena: std.mem.Allocator, t: *const ui.Tree, s: []const u8) ![]Cl
 }
 
 fn rangeRect(ctx: ?*anyopaque, r: ui.Range) ui.Rect {
-    const t: *const ui.Tree = @ptrCast(@alignCast(ctx.?));
-    return demo.editableRangeRect(t, r);
+    const f: *const Field = @ptrCast(@alignCast(ctx.?));
+    return demo.editableRangeRect(f.t, r);
 }
 
 fn viewport(win: *const mac.Window) ui.Size {
@@ -489,7 +601,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer gpu.deinit();
 
     var swapchain = try mtl.Swapchain.init(&gpu, win.layer, win.pixelWidth(), win.pixelHeight(), win.scale, .{
-        .capturable = capture or resize_test,
+        .capturable = capture or resize_test or click_test,
     });
     defer swapchain.deinit();
 
@@ -534,8 +646,21 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var wrapped_lines: std.ArrayList(ui.text_layout.Line) = .empty;
     defer wrapped_lines.deinit(gpa);
     _ = try doc.insert(.application, demo.editable_initial);
-    win.setTextTarget(.{ .doc = &doc, .rect = rangeRect, .hit = hitTest, .ctx = &t });
+    var field: Field = .{
+        .win = win,
+        .t = &t,
+        .fonts = &fonts,
+        .doc = &doc,
+        .shown = &shown,
+        .glyphs = &wrapped_glyphs,
+        .lines = &wrapped_lines,
+    };
+    win.setTextTarget(.{ .doc = &doc, .rect = rangeRect, .hit = hitTest, .sync = syncField, .ctx = &field });
     defer win.setTextTarget(null);
+    // Wrapped once before anything asks where the text is: `buildUi` set it
+    // as one line, and the field's width is known now that it is laid out.
+    try field.refresh();
+    _ = t.flush();
     at.setDocument(demo.editable_node, &doc);
     at.setFocus(demo.editable_node);
     win.setAccessTarget(.{ .tree = &at, .layout = &t });
@@ -589,6 +714,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .t = &t,
         .scene = &scene,
         .fonts = &fonts,
+        .field = &field,
         .capture_step = if (resize_test) 15 else 0,
     };
     if (!live_off) win.setLiveFrame(.{ .ctx = &live, .draw = liveDraw });
@@ -598,6 +724,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var click_steps: []ClickStep = &.{};
     var click_at: usize = 0;
     var click_wrong: u32 = 0;
+    var click_capture_frame: u64 = std.math.maxInt(u64);
     var ax_removed = false;
     const frame_ns = win.refreshInterval() * 1e9;
     var last_present_ns: u64 = 0;
@@ -670,12 +797,23 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 at.setDocument(demo.editable_node, &doc);
                 at.setFocus(demo.editable_node);
                 win.setAccessTarget(.{ .tree = &at, .layout = &t });
-                try demo.refreshEditable(&t, &fonts, &doc, &shown, &wrapped_glyphs, &wrapped_lines);
                 try renderer.setAtlas(fonts.atlas.view());
                 atlas_gen = fonts.atlas.generation;
                 scene.setPixelScale(win.scale);
             }
             t.layout(viewport(win));
+            // A new width is new lines. Wrapped to it and laid out again,
+            // before the hover test below reads any bounds.
+            try field.refresh();
+            _ = t.flush();
+            win.textGeometryChanged();
+            // After a change of display the document is shaped at the new
+            // size for the first time, and may have glyphs the rebuilt tree
+            // did not.
+            if (fonts.atlas.generation != atlas_gen) {
+                try renderer.setAtlas(fonts.atlas.view());
+                atlas_gen = fonts.atlas.generation;
+            }
             relayouts += 1;
             // The highlighted element may no longer be under the pointer, and
             // its saved paint predates the relayout; forget it.
@@ -692,17 +830,20 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // the result. It is timed because that is the per-keystroke cost of
         // the whole Mac text system, input method included.
         if (script_at < script.len and frames % 4 == 0 and frames > 0) {
-            const st = script[script_at];
             scripted_frame = true;
-            const k0 = nowNs();
-            if (st.chars.len == 0) win.sendKeyCode(st.code, st.mods) else win.sendKey(st.code, st.chars, st.bare, st.mods);
-            const k = nowNs() - k0;
-            keystroke_ns_total += k;
-            keystroke_ns_worst = @max(keystroke_ns_worst, k);
-            script_at += 1;
-            if (telex and script_at == telex_capture_after) {
-                swapchain.capture_request = true;
-                capture_pending = true;
+            while (true) {
+                const st = script[script_at];
+                const k0 = nowNs();
+                if (st.chars.len == 0) win.sendKeyCode(st.code, st.mods) else win.sendKey(st.code, st.chars, st.bare, st.mods);
+                const k = nowNs() - k0;
+                keystroke_ns_total += k;
+                keystroke_ns_worst = @max(keystroke_ns_worst, k);
+                script_at += 1;
+                if (telex and script_at == telex_capture_after) {
+                    swapchain.capture_request = true;
+                    capture_pending = true;
+                }
+                if (script_at == script.len or !script[script_at].with_previous) break;
             }
         }
         while (win.keys.pop()) |ev| {
@@ -714,7 +855,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
         if (win.text_changed) {
             win.text_changed = false;
-            demo.refreshEditable(&t, &fonts, &doc, &shown, &wrapped_glyphs, &wrapped_lines) catch |e| switch (e) {
+            field.refresh() catch |e| switch (e) {
                 error.AtlasFull => std.debug.print("atlas full -- text stopped updating\n", .{}),
                 else => return e,
             };
@@ -742,6 +883,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 if (st.caret_before) |after| ok = ok and std.mem.eql(u8, doc.text()[doc.focus..], after);
                 if (!ok) click_wrong += 1;
                 std.debug.print("  {s}: \"{s}\" -- {s}\n", .{ st.what, got, if (ok) "ok" else "WRONG" });
+                // The selection that crosses a line break is three
+                // rectangles; the frame that shows it is compared against
+                // the software reference and kept. The next frame's, because
+                // this one's field was refreshed before the gesture ran (and
+                // `frames` has already counted this one by the time it draws).
+                if (st.capture) click_capture_frame = frames + 2;
                 click_at += 1;
             } else if (frames > 10 + 6 * (click_steps.len + 2)) {
                 std.debug.print("{d} gestures, {d} wrong; {d} presses reached the field, {d} the input method\n", .{
@@ -865,6 +1012,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
         // Requested and checked in the same iteration, for the reason given in
         // `window_demo.zig`: a frame later is a different scene under --sweep.
+        if (frames == click_capture_frame) {
+            swapchain.capture_request = true;
+            capture_pending = true;
+        }
         if (capture and !telex and frames == 9) {
             swapchain.capture_request = true;
             capture_pending = true;
@@ -880,9 +1031,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // The request is cleared by the present that honoured it.
         if (capture_pending and !swapchain.capture_request) {
             capture_pending = false;
-            try checkPresentedFrame(gpa, &swapchain, &scene, fonts.atlas.view(), &t, if (telex) "docs/demo-typing-macos.png" else null);
+            const crop: ?Crop = if (telex)
+                .{ .path = "docs/demo-typing-macos.png" }
+            else if (click_test)
+                .{ .path = "docs/demo-selection-macos.png", .max_w = 10_000, .whole = false }
+            else
+                null;
+            try checkPresentedFrame(gpa, &swapchain, &scene, fonts.atlas.view(), &t, crop);
             capture = false;
-            if (sweep == 0 and script.len == 0) break;
+            if (sweep == 0 and script.len == 0 and !click_test) break;
         }
         if (sweep > 0 and frames >= sweep) break;
         if (script.len > 0 and script_at >= script.len and frames >= script.len * 4 + 20) break;
@@ -896,7 +1053,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             \\  insertText            {d} ({d} of them replacing text already there)
             \\  setMarkedText         {d} (and {d} cancelling)
             \\  unmarkText            {d}
-            \\  editing commands      {d}, refused {d}
+            \\  editing commands      {d}, refused {d}; {d} moved between lines
+            \\  layout on demand      {d} (geometry asked for before the frame laid the text out)
             \\  passed on as keys     {d} ({d} reached the application)
             \\  substring queries     {d}, rectangle queries {d}
             \\  atlas re-uploads      {d}
@@ -913,6 +1071,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
             n.unmarked,
             n.commands,
             n.refused,
+            n.vertical,
+            n.syncs,
             n.passed_on,
             unhandled,
             n.substring_queries,
@@ -921,7 +1081,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             doc.text(),
         });
         if (type_test) {
-            var want = try linuxEquivalent(gpa);
+            var want = try linuxEquivalent(gpa, &fonts, demo.editableWrapWidth(&t));
             defer want.deinit();
             const same = std.mem.eql(u8, want.text(), doc.text()) and
                 want.anchor == doc.anchor and want.focus == doc.focus;
