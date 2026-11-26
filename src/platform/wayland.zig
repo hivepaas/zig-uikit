@@ -163,6 +163,18 @@ pub const Window = struct {
     pointer_inside: bool = false,
     clicked: bool = false,
 
+    /// Scroll accumulated since the application last took it, in surface
+    /// units -- the same space pointer motion is in, which is what the
+    /// protocol says and what makes a touchpad's smooth scrolling come out as
+    /// a distance rather than as notches.
+    ///
+    /// Accumulated rather than delivered one event at a time because a
+    /// compositor sends several axis events per frame and a scroll is a
+    /// distance: adding them up loses nothing, where a queue would make the
+    /// caller add them up itself.
+    scroll_x: f32 = 0,
+    scroll_y: f32 = 0,
+
     pub fn open(gpa: Allocator, title: [*:0]const u8, w: u32, h: u32) Error!*Window {
         const display = c.wl_display_connect(null) orelse return Error.NoWaylandDisplay;
         const self = try gpa.create(Window);
@@ -296,6 +308,16 @@ pub const Window = struct {
     fn stopRepeat(self: *Window) void {
         self.repeat_code = 0;
         self.repeat_at_ns = 0;
+    }
+
+    /// How far the pointer has scrolled since this was last asked, and clears
+    /// it. Zero when nothing scrolled.
+    pub fn takeScroll(self: *Window) ui.Point {
+        defer {
+            self.scroll_x = 0;
+            self.scroll_y = 0;
+        }
+        return .{ .x = self.scroll_x, .y = self.scroll_y };
     }
 
     /// The active keyboard layout's name, or an empty string before the keymap
@@ -644,7 +666,26 @@ fn ptrButton(
     if (state == c.WL_POINTER_BUTTON_STATE_PRESSED) self.clicked = true;
 }
 
-fn ptrAxis(_: ?*anyopaque, _: ?*c.struct_wl_pointer, _: u32, _: u32, _: c.wl_fixed_t) callconv(.c) void {}
+/// The wheel, or two fingers on a touchpad.
+///
+/// Only `axis` is handled and not `axis_discrete`, which is deliberate: the
+/// protocol always sends `axis` and sends `axis_discrete` as extra information
+/// about the same movement, so acting on both scrolls twice.
+fn ptrAxis(
+    data: ?*anyopaque,
+    _: ?*c.struct_wl_pointer,
+    _: u32,
+    axis: u32,
+    value: c.wl_fixed_t,
+) callconv(.c) void {
+    const self: *Window = @ptrCast(@alignCast(data.?));
+    const v = fixedToFloat(value);
+    switch (axis) {
+        c.WL_POINTER_AXIS_VERTICAL_SCROLL => self.scroll_y += v,
+        c.WL_POINTER_AXIS_HORIZONTAL_SCROLL => self.scroll_x += v,
+        else => {},
+    }
+}
 fn ptrFrame(_: ?*anyopaque, _: ?*c.struct_wl_pointer) callconv(.c) void {}
 fn ptrAxisSource(_: ?*anyopaque, _: ?*c.struct_wl_pointer, _: u32) callconv(.c) void {}
 fn ptrAxisStop(_: ?*anyopaque, _: ?*c.struct_wl_pointer, _: u32, _: u32) callconv(.c) void {}

@@ -10,7 +10,7 @@ A declarative GPU UI toolkit for Zig.
 > There are no widgets. Expect the API to change without notice.
 
 ```sh
-zig build test                           # 197 tests, no platform dependencies
+zig build test                           # 204 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
 zig build test-text                      # 19 tests, needs a font installed
@@ -21,9 +21,10 @@ zig build gpu-demo                       # renders on the GPU, diffs against the
 zig build window                         # opens a window and renders into it
 ```
 
-`window` takes `--capture`, `--sweep`, `--type` and `--a11y-events`; `--type`
-scripts a sequence of keystrokes through the editable field and reports what
-each one cost. The last two steps follow the target: Vulkan and Wayland on
+`window` takes `--capture`, `--sweep`, `--type`, `--scroll` and
+`--a11y-events`; `--type` scripts a sequence of keystrokes through the editable
+field and `--scroll` a run of wheel steps through the list, each reporting what
+it cost. The last two steps follow the target: Vulkan and Wayland on
 Linux, Metal and AppKit on macOS. `test-input` is Linux-only, and so is the
 AT-SPI bridge, which the window starts if an accessibility bus is there and
 runs without if it is not.
@@ -185,6 +186,49 @@ One thing a caller has to know: an out-of-flow child is **not** centred by its
 parent's `align_items`, so whatever places it says where it goes. The demo's
 overlays compute their vertical offset from the field's content height for
 that reason, and a test pins it.
+
+### Scrolling is layout, not a transform
+
+The demo's list has always had more rows than fit, and the wheel has always
+done nothing: `wl_pointer`'s `axis` handler was an empty function. It is not
+any more.
+
+`Style.scroll_x` and `scroll_y` sit on the element that **clips**, not on its
+children, and are subtracted from where the children are placed. So a scroll
+box is one element whose content is longer than it is, and the rows inside it
+never learn they are in one.
+
+**It is in layout and not in the scene builder**, which is the decision worth
+stating. Offsetting the quads at draw time would be cheaper and would make the
+bounds lie: hit testing, `Component.GetExtents` and a caret rectangle all read
+what layout produced, and two answers to "where is this row" is the kind of
+disagreement that shows up as a screen reader pointing at the wrong thing. A
+test scrolls a list and checks the hit test follows.
+
+What it costs, measured on the 172-element demo over 200 wheel steps:
+
+| | |
+| --- | --- |
+| applying one scroll — clamp, extent, `setStyle` | **285-408 ns** |
+| the frame it lands in, end to end | ~8.7 us |
+| a frame that scrolled nothing | 156-366 ns |
+
+The frame figure is the hit test, the layout flush and a full scene rebuild of
+649 quads, because everything inside the box really did move. The scroll
+itself does not climb: the box's own size did not change, so `flushElement`
+repositions its subtree and stops — the same property `position: .absolute`
+has, and a test asserts the elements above and after the box do not move.
+
+A wheel event names a position and not an element, so `Tree.scrollTargetAt`
+walks up from the hit until it finds a box with content past its edge: a list
+inside a panel scrolls the list, and the same wheel over the panel's margin
+scrolls the panel. `scrollBy` clamps and returns how far it really went, which
+is how a caller knows the box is at its end and the wheel should pass to
+whatever is behind it — a decision this layer reports rather than makes.
+
+Only `axis` is handled and not `axis_discrete`, deliberately: the protocol
+always sends `axis` and sends `axis_discrete` as extra information about the
+same movement, so acting on both scrolls twice.
 
 ### A known divergence from CSS
 

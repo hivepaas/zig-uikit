@@ -73,6 +73,9 @@ pub const Editable = struct {
 };
 pub var editable: ?Editable = null;
 
+/// The clipped list, for the demo tools that scroll it without a pointer.
+pub var list_panel: Index = std.math.maxInt(Index);
+
 /// The editable field's lines, for `editing.Options`. Null before the field
 /// has been laid out, which is what tells the editing layer to report a
 /// vertical arrow unhandled rather than guess.
@@ -796,6 +799,7 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
         .gap = 4,
         .align_items = .stretch,
     });
+    list_panel = list;
     t.setPaint(list, .{
         .background = card,
         .border_color = line,

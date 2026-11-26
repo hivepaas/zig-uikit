@@ -116,6 +116,21 @@ pub const Style = struct {
     justify: Justify = .start,
     align_items: AlignItems = .start,
 
+    /// How far the content is scrolled, in layout units, subtracted from
+    /// where the children are placed.
+    ///
+    /// On the element that *clips*, not on the children: a scroll box is one
+    /// element whose content is longer than it is, and saying so once is what
+    /// keeps the children unaware they are inside one.
+    ///
+    /// It is in `Style` and not in `Paint`, so changing it dirties layout --
+    /// which it must, because the children really do move and hit testing and
+    /// a screen reader's extents both read the bounds layout produced. The
+    /// cost is a reposition of that element's subtree and nothing above it;
+    /// `Tree.scrollBy` reports what it was.
+    scroll_x: f32 = 0,
+    scroll_y: f32 = 0,
+
     position: Position = .flow,
     /// Only with `position: .absolute`: the offset from the parent's content
     /// origin. Ignored in flow, where the parent decides.
@@ -133,6 +148,7 @@ pub const Style = struct {
             a.padding == b.padding and a.gap == b.gap and
             a.wrap == b.wrap and
             a.justify == b.justify and a.align_items == b.align_items and
-            a.position == b.position and a.left == b.left and a.top == b.top;
+            a.position == b.position and a.left == b.left and a.top == b.top and
+            a.scroll_x == b.scroll_x and a.scroll_y == b.scroll_y;
     }
 };

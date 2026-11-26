@@ -176,12 +176,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var capture = false;
     var sweep: u64 = 0;
     var type_test = false;
+    var scroll_test: u64 = 0;
     var a11y_events = false;
     var args = std.process.Args.Iterator.init(init.args);
     _ = args.next();
     while (args.next()) |a| {
         if (std.mem.eql(u8, a, "--capture")) capture = true;
         if (std.mem.eql(u8, a, "--sweep")) sweep = 180;
+        // Scrolls the list a fixed number of steps, no pointer involved, and
+        // reports what a step cost. `--sweep` is to hovering what this is to
+        // the wheel: a human turning one is not a measurement.
+        if (std.mem.eql(u8, a, "--scroll")) scroll_test = 200;
         // Feeds `typeScript` into the key queue, a keystroke every few frames,
         // and reports what each one cost.
         if (std.mem.eql(u8, a, "--type")) type_test = true;
@@ -367,6 +372,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // laid out again -- the one thing about this field that a frame which
     // changed no text still has to do.
     var rewrap = false;
+    var scrolls: u64 = 0;
+    var scroll_ns_total: u64 = 0;
     // The column a run of vertical arrow keys is aiming for. See
     // `editing.Options.goal_x`.
     var goal_x: ?f32 = null;
@@ -549,6 +556,33 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
         }
 
+        // --- the wheel ---
+        //
+        // A wheel event names a position and not an element, so the tree is
+        // asked which box under the pointer has anything to scroll. The
+        // amount is the distance the compositor reported, in surface units:
+        // a touchpad's smooth scrolling arrives as a distance and a wheel's
+        // notch as whatever that compositor calls a notch, and neither is
+        // this program's business to reinterpret.
+        if (scroll_test > 0 and frames % 2 == 0 and scrolls < scroll_test) {
+            win.scroll_y += if ((scrolls / 20) % 2 == 0) @as(f32, 12) else @as(f32, -12);
+        }
+        const wheel = win.takeScroll();
+        if (wheel.x != 0 or wheel.y != 0) {
+            const target = if (scroll_test > 0)
+                demo.list_panel
+            else
+                t.scrollTargetAt(.{ .x = win.pointer_x, .y = win.pointer_y });
+            if (target != 0 and target != std.math.maxInt(ui.Index)) {
+                const s0 = nowNs();
+                const moved = try t.scrollBy(target, wheel.x, wheel.y);
+                if (moved.x != 0 or moved.y != 0) {
+                    scrolls += 1;
+                    scroll_ns_total += nowNs() - s0;
+                }
+            }
+        }
+
         // --- hover: a paint change and nothing else ---
         var px = win.pointer_x;
         var py = win.pointer_y;
@@ -650,6 +684,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
         }
         if (sweep > 0 and frames >= sweep) break;
+        if (scroll_test > 0 and scrolls >= scroll_test) break;
         // Long enough after the last scripted keystroke for the frame it
         // produced to have been presented.
         if (type_test and script_at >= script.len and win.keys.len() == 0 and frames >= script.len * 4 + 20) break;
@@ -672,6 +707,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         \\  atlas re-uploads                        {d}, mean {d} ns each
         \\  text-input focus gained {d} times, {d} resyncs sent, {d} stale `done` events
         \\  input-method events: {d} done, {d} preedit, {d} commit, {d} delete_surrounding
+        \\  {d} scrolls, mean {d} ns each
         \\
         \\The CPU figure is everything between the pointer moving and the quads
         \\being ready to upload: hit test, layout flush, scene build. Timing the
@@ -707,6 +743,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
         win.ime_events.preedit,
         win.ime_events.commit,
         win.ime_events.delete,
+        scrolls,
+        if (scrolls == 0) 0 else scroll_ns_total / scrolls,
     });
     if (win.ime_error) |e| std.debug.print("the input-method path reported {s}\n", .{@errorName(e)});
     if (bridge) |b| std.debug.print(

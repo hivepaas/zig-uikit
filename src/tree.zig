@@ -506,6 +506,73 @@ pub const Tree = struct {
     }
 
     /// Marks an element whose own size inputs changed by some other route.
+    /// The innermost element at `p` that has something to scroll, or 0.
+    ///
+    /// A wheel event names a position, not an element, so something has to
+    /// decide which box it means. Walking up from the hit until a box has
+    /// content past its edge is what every toolkit does and what a user
+    /// expects: a list inside a panel scrolls the list, and the same wheel
+    /// over the panel's margin scrolls the panel.
+    pub fn scrollTargetAt(self: *const Tree, p: Point) Index {
+        var el = self.hitTest(p);
+        while (el != none and el != 0) : (el = self.els.items[el].parent) {
+            const e = &self.els.items[el];
+            const pad = e.style.padding;
+            const ext = self.scrollExtent(el);
+            if (ext.h > e.bounds.h - pad * 2 + 0.5 or ext.w > e.bounds.w - pad * 2 + 0.5) {
+                return el;
+            }
+        }
+        return 0;
+    }
+
+    /// How far `el`'s children reach from its content origin, in layout
+    /// units: what a scroll box can scroll through.
+    ///
+    /// Distinct from `contentSize`, which is the element's own intrinsic
+    /// size. Computed from where the children actually are rather than from a
+    /// cached sum, because the cached one (`sum_main`) is the main axis only
+    /// and is overwritten for an element with a definite size. Scrolling is a
+    /// human action; a walk over one element's children is not a cost worth
+    /// caching against.
+    pub fn scrollExtent(self: *const Tree, el: Index) Size {
+        const e = &self.els.items[el];
+        const pad = e.style.padding;
+        const ox = e.bounds.x + pad - e.style.scroll_x;
+        const oy = e.bounds.y + pad - e.style.scroll_y;
+        var w: f32 = 0;
+        var h: f32 = 0;
+        var c = e.first_child;
+        while (c != none) : (c = self.els.items[c].next_sibling) {
+            const b = self.els.items[c].bounds;
+            w = @max(w, b.x + b.w - ox);
+            h = @max(h, b.y + b.h - oy);
+        }
+        return .{ .w = w, .h = h };
+    }
+
+    /// Scrolls `el`'s content by `dx`, `dy`, clamped to what there is.
+    ///
+    /// Returns the amount actually scrolled, which is how a caller knows the
+    /// box is at its end and the wheel should pass to whatever is behind it.
+    pub fn scrollBy(self: *Tree, el: Index, dx: f32, dy: f32) Error!Point {
+        const content = self.scrollExtent(el);
+        const e = &self.els.items[el];
+        const pad = e.style.padding;
+        const max_x = @max(0, content.w - @max(0, e.bounds.w - pad * 2));
+        const max_y = @max(0, content.h - @max(0, e.bounds.h - pad * 2));
+
+        var s = e.style;
+        const want_x = std.math.clamp(s.scroll_x + dx, 0, max_x);
+        const want_y = std.math.clamp(s.scroll_y + dy, 0, max_y);
+        const moved: Point = .{ .x = want_x - s.scroll_x, .y = want_y - s.scroll_y };
+        if (moved.x == 0 and moved.y == 0) return moved;
+        s.scroll_x = want_x;
+        s.scroll_y = want_y;
+        try self.setStyle(el, s);
+        return moved;
+    }
+
     pub fn markDirty(self: *Tree, el: Index) Error!void {
         try self.dirty.append(self.gpa, el);
     }
@@ -991,8 +1058,12 @@ pub const Tree = struct {
     fn placeAbsolute(self: *Tree, parent: Index, child: Index) void {
         const p = &self.els.items[parent];
         const pad = p.style.padding;
-        const inner_x = p.bounds.x + pad;
-        const inner_y = p.bounds.y + pad;
+        // Out-of-flow children scroll with the content, as in CSS: the one
+        // case that matters is a popover anchored to a row inside a scroll
+        // box, and it has to follow the row. An overlay that should stay put
+        // is a sibling of the scroll box, not a child of it.
+        const inner_x = p.bounds.x + pad - p.style.scroll_x;
+        const inner_y = p.bounds.y + pad - p.style.scroll_y;
         const inner_w = @max(0, p.bounds.w - pad * 2);
         const inner_h = @max(0, p.bounds.h - pad * 2);
 
@@ -1023,8 +1094,11 @@ pub const Tree = struct {
 
         const pad = e.style.padding;
         const gap = e.style.gap;
-        const inner_x = e.bounds.x + pad;
-        const inner_y = e.bounds.y + pad;
+        // The children are placed from the scrolled origin; the space they
+        // are given is the unscrolled viewport. Scrolling moves the content,
+        // it does not change how much room there is.
+        const inner_x = e.bounds.x + pad - e.style.scroll_x;
+        const inner_y = e.bounds.y + pad - e.style.scroll_y;
         const inner_w = @max(0, e.bounds.w - pad * 2);
         const inner_h = @max(0, e.bounds.h - pad * 2);
         const avail_main = switch (e.axis) {
@@ -1267,8 +1341,8 @@ pub const Tree = struct {
         }
         self.stats.fast_path += 1;
 
-        const inner_x = e.bounds.x + pad;
-        const inner_y = e.bounds.y + pad;
+        const inner_x = e.bounds.x + pad - e.style.scroll_x;
+        const inner_y = e.bounds.y + pad - e.style.scroll_y;
         // The fast path only ever runs on a single non-wrapping line, so the
         // line's cross extent is the container's inner cross size; see the
         // same decision in `positionChildren`. This used to read

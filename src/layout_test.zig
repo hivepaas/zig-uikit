@@ -907,3 +907,194 @@ test "a wrapped paragraph is given a box as tall as its lines" {
     try testing.expectEqual(@as(u32, 3), t.text(para).lines);
     try testing.expectEqual(@as(f32, 20), t.text(para).line_height);
 }
+
+// ------------------------------------------------------------------ scrolling
+
+fn scrollBox(t: *Tree, rows: usize, row_h: f32) !Index {
+    const box = try t.appendChild(t.root(), .{
+        .axis = .col,
+        .padding = 4,
+        .gap = 2,
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 50 },
+        .flex_shrink = 0,
+        .align_items = .stretch,
+    });
+    for (0..rows) |_| {
+        _ = try t.appendChild(box, .{ .height = .{ .fixed = row_h }, .flex_shrink = 0 });
+    }
+    return box;
+}
+
+test "scrolling moves the content and not the box" {
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    const box = try scrollBox(&t, 10, 20);
+    t.layout(viewport);
+
+    const box_was = t.bounds(box);
+    const first = t.firstChild(box);
+    const first_was = t.bounds(first);
+
+    const moved = try t.scrollBy(box, 0, 30);
+    _ = t.flush();
+
+    try testing.expectEqual(@as(f32, 30), moved.y);
+    try testing.expect(Rect.eql(box_was, t.bounds(box)));
+    try testing.expectEqual(first_was.y - 30, t.bounds(first).y);
+    // The space the children are given does not change: scrolling moves the
+    // content, it does not make the box bigger or smaller.
+    try testing.expectEqual(first_was.w, t.bounds(first).w);
+
+    try expectIncrementalMatchesFull(&t);
+}
+
+test "a scroll clamps to the content and reports what it did" {
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    // Ten rows of 20 with a gap of 2 is 218 of content in a 42-unit viewport.
+    const box = try scrollBox(&t, 10, 20);
+    t.layout(viewport);
+
+    try testing.expectEqual(@as(f32, 218), t.scrollExtent(box).h);
+
+    // Past the end clamps, and the return value says how far it really went.
+    const far = try t.scrollBy(box, 0, 1000);
+    _ = t.flush();
+    try testing.expectEqual(@as(f32, 218 - 42), far.y);
+
+    // At the end, another scroll does nothing and says so -- which is how a
+    // caller knows to let the wheel through to whatever is behind.
+    const none_left = try t.scrollBy(box, 0, 10);
+    try testing.expectEqual(@as(f32, 0), none_left.y);
+
+    // And back up clamps at zero.
+    const up = try t.scrollBy(box, 0, -1000);
+    _ = t.flush();
+    try testing.expectEqual(-(218 - 42), up.y);
+    try testing.expectEqual(@as(f32, 0), t.style(box).scroll_y);
+}
+
+test "content that fits does not scroll at all" {
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    const box = try scrollBox(&t, 1, 10);
+    t.layout(viewport);
+    const moved = try t.scrollBy(box, 0, 50);
+    try testing.expectEqual(@as(f32, 0), moved.y);
+}
+
+test "scrolling costs one subtree and nothing above it" {
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    const outer = try t.appendChild(t.root(), .{ .axis = .col, .gap = 5, .align_items = .stretch });
+    const box = try t.appendChild(outer, .{
+        .axis = .col,
+        .padding = 4,
+        .width = .{ .fixed = 100 },
+        .height = .{ .fixed = 50 },
+        .flex_shrink = 0,
+        .align_items = .stretch,
+    });
+    for (0..10) |_| _ = try t.appendChild(box, .{ .height = .{ .fixed = 20 }, .flex_shrink = 0 });
+    const after = try t.appendChild(outer, .{ .height = .{ .fixed = 10 }, .flex_shrink = 0 });
+    t.layout(viewport);
+
+    const outer_was = t.bounds(outer);
+    const after_was = t.bounds(after);
+    _ = try t.scrollBy(box, 0, 20);
+    const stats = t.flush();
+
+    // Nothing above the box moved, and no full layout ran: a scroll is a
+    // reposition of one subtree, which is the claim worth having.
+    try testing.expect(Rect.eql(outer_was, t.bounds(outer)));
+    try testing.expect(Rect.eql(after_was, t.bounds(after)));
+    try testing.expectEqual(@as(u32, 0), stats.full_layouts);
+    try expectIncrementalMatchesFull(&t);
+}
+
+test "an out-of-flow child scrolls with the content" {
+    // A popover anchored to a row inside a scroll box has to follow the row.
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    const box = try scrollBox(&t, 5, 20);
+    const pop = try t.appendChild(box, .{
+        .position = .absolute,
+        .left = 3,
+        .top = 60,
+        .width = .{ .fixed = 20 },
+        .height = .{ .fixed = 20 },
+    });
+    t.layout(viewport);
+    const was = t.bounds(pop);
+
+    _ = try t.scrollBy(box, 0, 25);
+    _ = t.flush();
+    try testing.expectEqual(was.y - 25, t.bounds(pop).y);
+    try expectIncrementalMatchesFull(&t);
+}
+
+test "hit testing follows the scrolled content" {
+    // The reason the offset is in layout and not in the scene builder: the
+    // bounds are what hit testing and a screen reader's extents both read, so
+    // there is one answer to where a row is and not two.
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    const box = try scrollBox(&t, 10, 20);
+    t.layout(viewport);
+
+    const b = t.bounds(box);
+    const probe: ui.Point = .{ .x = b.x + 10, .y = b.y + 10 };
+    const before = t.hitTest(probe);
+    _ = try t.scrollBy(box, 0, 44);
+    _ = t.flush();
+    const after = t.hitTest(probe);
+    try testing.expect(before != after);
+    try testing.expect(after != 0);
+}
+
+test "the wheel finds the innermost box that has anything to scroll" {
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    // A panel that overflows, holding a list that overflows, holding rows
+    // that do not.
+    const panel = try t.appendChild(t.root(), .{
+        .axis = .col,
+        .width = .{ .fixed = 200 },
+        .height = .{ .fixed = 60 },
+        .flex_shrink = 0,
+        .align_items = .stretch,
+    });
+    const list = try t.appendChild(panel, .{
+        .axis = .col,
+        .height = .{ .fixed = 40 },
+        .flex_shrink = 0,
+        .align_items = .stretch,
+    });
+    var rows: [6]Index = undefined;
+    for (&rows) |*r| {
+        r.* = try t.appendChild(list, .{ .height = .{ .fixed = 15 }, .flex_shrink = 0 });
+    }
+    // Enough after the list to overflow the panel too.
+    _ = try t.appendChild(panel, .{ .height = .{ .fixed = 80 }, .flex_shrink = 0 });
+    t.layout(viewport);
+
+    // Over a row: the row has nothing to scroll, the list does.
+    const in_list = t.bounds(rows[0]);
+    try testing.expectEqual(list, t.scrollTargetAt(.{ .x = in_list.x + 2, .y = in_list.y + 2 }));
+
+    // Over the panel below the list: the panel.
+    const below = t.bounds(panel);
+    try testing.expectEqual(panel, t.scrollTargetAt(.{ .x = below.x + 2, .y = below.y + 50 }));
+
+    // Once the list is at its end it still owns the wheel -- deciding to pass
+    // it on is the caller's, from what `scrollBy` reports.
+    _ = try t.scrollBy(list, 0, 1000);
+    _ = t.flush();
+    try testing.expectEqual(list, t.scrollTargetAt(.{ .x = in_list.x + 2, .y = in_list.y + 2 }));
+    const none_left = try t.scrollBy(list, 0, 10);
+    try testing.expectEqual(@as(f32, 0), none_left.y);
+
+    // And nowhere over nothing.
+    try testing.expectEqual(@as(Index, 0), t.scrollTargetAt(.{ .x = 900, .y = 500 }));
+}
