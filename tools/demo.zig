@@ -479,6 +479,11 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
     _ = try spacer(t, title);
     _ = try label(t, title, ui_font, atlas, "zig-uikit — bản thử nghiệm", bright);
     _ = try spacer(t, title);
+    // Not decoration: none of these characters is in the family fontconfig
+    // matched for `sans`, so before font fallback existed every one of them
+    // was that font's empty `.notdef` box -- and nothing said so. They are in
+    // the title bar because that is where a wrong one would be obvious.
+    _ = try label(t, title, ui_font, atlas, "日本語 한국어 Ελληνικά →", dim);
 
     // --- body ---
     const body = try t.appendChild(t.root(), .{
@@ -855,12 +860,28 @@ pub fn main() !void {
         \\{d} culled as entirely outside their clip, of {d} list rows and their contents
         \\{d} painting layers
         \\atlas {d}x{d}, {d:.1}% full
+        \\{d} fallback faces opened ({s}), {d} characters with no glyph in any font
         \\wrote {s} ({d}x{d})
         \\
     , .{
-        t.count(),     s.visited,                     s.emitted,     s.glyphs,
-        s.culled,      row_total,                     s.layers_used, fonts.atlas.w,
-        fonts.atlas.h, fonts.atlas.fillRatio() * 100, path,          width,
+        t.count(),
+        s.visited,
+        s.emitted,
+        s.glyphs,
+        s.culled,
+        row_total,
+        s.layers_used,
+        fonts.atlas.w,
+        fonts.atlas.h,
+        fonts.atlas.fillRatio() * 100,
+        fonts.ui.fallbacks.items.len + fonts.strong.fallbacks.items.len + fonts.big.fallbacks.items.len,
+        if (fonts.ui.fallbacks.items.len > 0)
+            std.fs.path.basename(fonts.ui.fallbacks.items[0].path)
+        else
+            "none",
+        fonts.ui.missing + fonts.strong.missing + fonts.big.missing,
+        path,
+        width,
         height,
     });
 }

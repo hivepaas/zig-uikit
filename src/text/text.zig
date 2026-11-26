@@ -143,6 +143,7 @@ pub const Library = struct {
         const m = face.*.size.*.metrics;
         return .{
             .gpa = gpa,
+            .ft = self.ft,
             .face = face,
             .hb = hb,
             .buf = c.hb_buffer_create() orelse return Error.OutOfMemory,
@@ -156,6 +157,15 @@ pub const Library = struct {
     }
 };
 
+/// The byte after the character starting at `b`. A local copy of
+/// `offsets.nextChar`, because this module takes core as `ui` and reaching
+/// into its internals for three lines would be worse than three lines.
+fn offsets_nextChar(s: []const u8, b: usize) usize {
+    if (b >= s.len) return s.len;
+    const n = std.unicode.utf8ByteSequenceLength(s[b]) catch 1;
+    return @min(b + n, s.len);
+}
+
 fn f26dot6(v: c_long) f32 {
     return @as(f32, @floatFromInt(v)) / 64.0;
 }
@@ -168,6 +178,10 @@ fn f26dot6(v: c_long) f32 {
 /// happy to do.
 pub const Font = struct {
     gpa: Allocator,
+    /// FreeType's handle, so a font can open the fallbacks it needs without a
+    /// reference to the `Library` struct -- which is returned by value and
+    /// therefore moves, where this pointer does not.
+    ft: c.FT_Library,
     face: c.FT_Face,
     hb: *c.hb_font_t,
     /// Reused across calls. A HarfBuzz buffer holds the scratch arrays shaping
@@ -195,6 +209,22 @@ pub const Font = struct {
     /// Scratch for the run being built, reused between calls.
     scratch: std.ArrayList(ui.Glyph) = .empty,
 
+    /// Fonts opened to cover characters this one does not have.
+    ///
+    /// Owned, and kept per font rather than per library because the glyph
+    /// cache is keyed by glyph id: the same id means different glyphs in two
+    /// faces, so two faces cannot share a cache and a fallback is simply
+    /// another `Font`.
+    fallbacks: std.ArrayList(Font) = .empty,
+
+    /// Characters that had no glyph in this font and none in any fallback
+    /// either, since this font was opened.
+    ///
+    /// Reported rather than hidden: a missing glyph draws the font's `.notdef`
+    /// box, and a toolkit that silently draws boxes is one you find out about
+    /// from a screenshot.
+    missing: u32 = 0,
+
     const Cached = struct {
         slot: Slot,
         /// FreeType's bitmap offsets from the pen position, in whole pixels.
@@ -203,6 +233,8 @@ pub const Font = struct {
     };
 
     pub fn deinit(self: *Font) void {
+        for (self.fallbacks.items) |*f| f.deinit();
+        self.fallbacks.deinit(self.gpa);
         self.cache.deinit(self.gpa);
         self.scratch.deinit(self.gpa);
         self.gpa.free(self.path);
@@ -222,60 +254,32 @@ pub const Font = struct {
     /// The returned run borrows this font's scratch buffer, so it is valid
     /// until the next call on the same font. `Tree.setText` copies it, which is
     /// why that is the intended destination.
+    /// Shapes one line of UTF-8 and rasterises whatever is not already cached.
+    ///
+    /// The returned run borrows this font's scratch buffer, so it is valid
+    /// until the next call on the same font. `Tree.setText` copies it, which is
+    /// why that is the intended destination.
+    ///
+    /// Characters this font lacks are shaped again with a font that has them;
+    /// see `fallbackFor`. The baseline stays this font's, so a line that mixes
+    /// families still sits on one.
     pub fn shape(self: *Font, atlas: *Atlas, s: []const u8) Error!ui.TextRun {
-        c.hb_buffer_reset(self.buf);
-        c.hb_buffer_add_utf8(self.buf, s.ptr, @intCast(s.len), 0, @intCast(s.len));
-        // Direction, script and language inferred from the text itself. For
-        // Latin and Vietnamese this is right; for mixed-direction text it is
-        // the thing a real itemiser replaces, and it is honest about being a
-        // guess in a way that hardcoding LTR/Latin would not be.
-        c.hb_buffer_guess_segment_properties(self.buf);
-        c.hb_shape(self.hb, self.buf, null, 0);
-
-        var n: c_uint = 0;
-        const infos = c.hb_buffer_get_glyph_infos(self.buf, &n);
-        const positions = c.hb_buffer_get_glyph_positions(self.buf, &n);
-        const count: usize = @intCast(n);
-
         self.scratch.clearRetainingCapacity();
-        try self.scratch.ensureTotalCapacity(self.gpa, count);
+        try self.scratch.ensureTotalCapacity(self.gpa, s.len);
 
         var pen_x: f32 = 0;
-        var pen_y: f32 = 0;
-        for (0..count) |i| {
-            const gid = infos[i].codepoint;
-            const pos = positions[i];
-            const entry = try self.glyph(atlas, gid);
+        var max_ascent = self.ascent;
+        var max_descent = self.descent;
+        try self.shapeRange(atlas, s, 0, s.len, &pen_x, &max_ascent, &max_descent, true);
 
-            // The pen is fractional -- kerning and mark positioning are not
-            // whole pixels -- and the glyph's position is rounded, because the
-            // bitmap was rasterised on the pixel grid and sampling it anywhere
-            // else is what makes text blurry. The pen itself is NOT rounded:
-            // accumulating rounded advances drifts, and over a long line the
-            // drift is visible as uneven spacing.
-            const gx = @round(pen_x + f26dot6(pos.x_offset));
-            const gy = @round(pen_y - f26dot6(pos.y_offset));
-
-            // Every shaped glyph goes in the run, including the ones with no
-            // ink. A space advances the pen and draws nothing, and dropping it
-            // would leave a hole in the cluster sequence exactly where a caret
-            // has to be able to sit. The scene builder skips the ones with no
-            // ink, so this costs entries in the run and no quads in the scene.
-            self.scratch.appendAssumeCapacity(.{
-                .dx = gx + @as(f32, @floatFromInt(entry.left)),
-                .dy = self.ascent + gy - @as(f32, @floatFromInt(entry.top)),
-                .w = @floatFromInt(entry.slot.width()),
-                .h = @floatFromInt(entry.slot.height()),
-                .u0 = entry.slot.u0,
-                .v0 = entry.slot.v0,
-                .u1 = entry.slot.u1,
-                .v1 = entry.slot.v1,
-                .cluster = infos[i].cluster,
-                .pen_x = pen_x,
-            });
-
-            pen_x += f26dot6(pos.x_advance);
-            pen_y -= f26dot6(pos.y_advance);
+        // A fallback with a taller ascent needs the whole line pushed down,
+        // because the baseline was placed at this font's ascent before the
+        // taller one was known. One pass over the glyphs rather than two over
+        // the text: the alternative is shaping everything twice to find the
+        // maximum first, and fallbacks are rare.
+        if (max_ascent > self.ascent) {
+            const d = max_ascent - self.ascent;
+            for (self.scratch.items) |*g| g.dy += d;
         }
 
         // Everything above is device pixels. The run leaves in layout units,
@@ -296,9 +300,215 @@ pub const Font = struct {
         return .{
             .glyphs = self.scratch.items,
             .width = pen_x / self.scale,
-            .ascent = self.ascent / self.scale,
-            .descent = self.descent / self.scale,
+            .ascent = max_ascent / self.scale,
+            .descent = max_descent / self.scale,
         };
+    }
+
+    /// Shapes `s[off..][0..len]` with this font and appends to `self.scratch`.
+    ///
+    /// `pen_x` is carried in and out, so a caller can shape a range, hand the
+    /// next one to another font, and come back. `baseline` is the y every
+    /// glyph is placed against -- the *outer* font's ascent, not this one's,
+    /// which is what keeps a mixed line on one baseline.
+    fn shapeRange(
+        self: *Font,
+        atlas: *Atlas,
+        s: []const u8,
+        off: usize,
+        len: usize,
+        pen_x: *f32,
+        max_ascent: *f32,
+        max_descent: *f32,
+        allow_fallback: bool,
+    ) Error!void {
+        try self.shapeInto(atlas, s, off, len, pen_x, self.ascent, max_ascent, max_descent, allow_fallback, self);
+    }
+
+    fn shapeInto(
+        self: *Font,
+        atlas: *Atlas,
+        s: []const u8,
+        off: usize,
+        len: usize,
+        pen_x: *f32,
+        baseline: f32,
+        max_ascent: *f32,
+        max_descent: *f32,
+        allow_fallback: bool,
+        out_owner: *Font,
+    ) Error!void {
+        if (len == 0) return;
+        c.hb_buffer_reset(self.buf);
+        // The WHOLE string with an offset, not the substring: HarfBuzz then
+        // reports clusters as byte offsets into `s`, so a fallback's glyphs
+        // carry the same offsets everything else does and a caret can still
+        // be placed by byte.
+        c.hb_buffer_add_utf8(self.buf, s.ptr, @intCast(s.len), @intCast(off), @intCast(len));
+        // Direction, script and language inferred from the text itself. For
+        // Latin and Vietnamese this is right; for mixed-direction text it is
+        // the thing a real itemiser replaces, and it is honest about being a
+        // guess in a way that hardcoding LTR/Latin would not be.
+        c.hb_buffer_guess_segment_properties(self.buf);
+        c.hb_shape(self.hb, self.buf, null, 0);
+
+        var n: c_uint = 0;
+        const infos = c.hb_buffer_get_glyph_infos(self.buf, &n);
+        const positions = c.hb_buffer_get_glyph_positions(self.buf, &n);
+        const count: usize = @intCast(n);
+
+        var pen_y: f32 = 0;
+        var i: usize = 0;
+        while (i < count) {
+            // Glyph zero is `.notdef`: the font has no glyph for this
+            // character and would draw its empty box. A run of them is one
+            // stretch of text to hand to another font.
+            if (allow_fallback and infos[i].codepoint == 0) {
+                var j = i;
+                while (j < count and infos[j].codepoint == 0) j += 1;
+                const c0: usize = @intCast(infos[i].cluster);
+                const c1: usize = if (j < count) @intCast(infos[j].cluster) else off + len;
+                if (c1 > c0) {
+                    const cp = std.unicode.utf8Decode(s[c0..offsets_nextChar(s, c0)]) catch 0;
+                    if (self.fallbackFor(cp)) |fb| {
+                        try fb.shapeInto(
+                            atlas,
+                            s,
+                            c0,
+                            c1 - c0,
+                            pen_x,
+                            baseline,
+                            max_ascent,
+                            max_descent,
+                            // One level only. A fallback that still has no
+                            // glyph has nothing better to offer, and the
+                            // search has to terminate.
+                            false,
+                            out_owner,
+                        );
+                        max_ascent.* = @max(max_ascent.*, fb.ascent);
+                        max_descent.* = @max(max_descent.*, fb.descent);
+                        i = j;
+                        continue;
+                    }
+                    self.missing += 1;
+                }
+            }
+
+            const gid = infos[i].codepoint;
+            const pos = positions[i];
+            const entry = try self.glyph(atlas, gid);
+
+            // The pen is fractional -- kerning and mark positioning are not
+            // whole pixels -- and the glyph's position is rounded, because the
+            // bitmap was rasterised on the pixel grid and sampling it anywhere
+            // else is what makes text blurry. The pen itself is NOT rounded:
+            // accumulating rounded advances drifts, and over a long line the
+            // drift is visible as uneven spacing.
+            const gx = @round(pen_x.* + f26dot6(pos.x_offset));
+            const gy = @round(pen_y - f26dot6(pos.y_offset));
+
+            // Every shaped glyph goes in the run, including the ones with no
+            // ink. A space advances the pen and draws nothing, and dropping it
+            // would leave a hole in the cluster sequence exactly where a caret
+            // has to be able to sit. The scene builder skips the ones with no
+            // ink, so this costs entries in the run and no quads in the scene.
+            try out_owner.scratch.append(out_owner.gpa, .{
+                .dx = gx + @as(f32, @floatFromInt(entry.left)),
+                .dy = baseline + gy - @as(f32, @floatFromInt(entry.top)),
+                .w = @floatFromInt(entry.slot.width()),
+                .h = @floatFromInt(entry.slot.height()),
+                .u0 = entry.slot.u0,
+                .v0 = entry.slot.v0,
+                .u1 = entry.slot.u1,
+                .v1 = entry.slot.v1,
+                .cluster = infos[i].cluster,
+                .pen_x = pen_x.*,
+            });
+
+            pen_x.* += f26dot6(pos.x_advance);
+            pen_y -= f26dot6(pos.y_advance);
+            i += 1;
+        }
+    }
+
+    /// A font that has `cp`, at this font's size, or null.
+    ///
+    /// Asked of fontconfig, which is the only thing on a Linux desktop that
+    /// knows what is installed and in what order the user wants it tried --
+    /// the same mechanism that put Noto Sans in front of this request in the
+    /// first place. The result is verified with `FT_Get_Char_Index` rather
+    /// than trusted: matching never fails on a system with any font at all,
+    /// so a character nothing covers comes back as some font that does not
+    /// have it either.
+    fn fallbackFor(self: *Font, cp: u21) ?*Font {
+        if (cp == 0) return null;
+        for (self.fallbacks.items) |*f| {
+            if (c.FT_Get_Char_Index(f.face, cp) != 0) return f;
+        }
+
+        const cs = c.FcCharSetCreate() orelse return null;
+        defer c.FcCharSetDestroy(cs);
+        if (c.FcCharSetAddChar(cs, cp) == 0) return null;
+
+        const pat = c.FcPatternCreate() orelse return null;
+        defer c.FcPatternDestroy(pat);
+        if (c.FcPatternAddCharSet(pat, "charset", cs) == 0) return null;
+        _ = c.FcPatternAddDouble(pat, "pixelsize", @floatFromInt(self.px));
+        _ = c.FcConfigSubstitute(null, pat, c.FcMatchPattern);
+        c.FcDefaultSubstitute(pat);
+
+        var res: c.FcResult = undefined;
+        const matched = c.FcFontMatch(null, pat, &res) orelse return null;
+        defer c.FcPatternDestroy(matched);
+        if (res != c.FcResultMatch) return null;
+
+        var file: [*c]c.FcChar8 = undefined;
+        if (c.FcPatternGetString(matched, "file", 0, &file) != c.FcResultMatch) return null;
+
+        var face: c.FT_Face = undefined;
+        if (c.FT_New_Face(self.ft, @ptrCast(file), 0, &face) != 0) return null;
+        var ok = false;
+        defer if (!ok) {
+            _ = c.FT_Done_Face(face);
+        };
+        if (c.FT_Get_Char_Index(face, cp) == 0) return null;
+        if (c.FT_Set_Pixel_Sizes(face, 0, self.px) != 0) return null;
+        const hb = c.hb_ft_font_create_referenced(face) orelse return null;
+        const buf = c.hb_buffer_create() orelse {
+            c.hb_font_destroy(hb);
+            return null;
+        };
+        const path = std.mem.span(@as([*:0]const u8, @ptrCast(file)));
+        const owned = self.gpa.dupe(u8, path) catch {
+            c.hb_buffer_destroy(buf);
+            c.hb_font_destroy(hb);
+            return null;
+        };
+
+        const m = face.*.size.*.metrics;
+        self.fallbacks.append(self.gpa, .{
+            .gpa = self.gpa,
+            .ft = self.ft,
+            .face = face,
+            .hb = hb,
+            .buf = buf,
+            .px = self.px,
+            // One: the outer font converts the whole run to layout units once,
+            // and doing it twice would halve these glyphs again.
+            .scale = 1,
+            .path = owned,
+            .ascent = f26dot6(m.ascender),
+            .descent = -f26dot6(m.descender),
+            .line_height = f26dot6(m.height),
+        }) catch {
+            self.gpa.free(owned);
+            c.hb_buffer_destroy(buf);
+            c.hb_font_destroy(hb);
+            return null;
+        };
+        ok = true;
+        return &self.fallbacks.items[self.fallbacks.items.len - 1];
     }
 
     /// The number of glyphs shaping produces for a string. Separate from
@@ -774,4 +984,89 @@ test "a paragraph wraps between Vietnamese syllables, with a real font" {
     // And the box is the stack, which is what makes an element sized for it.
     try testing.expect(w.run.height() > one.height());
     try testing.expectEqual(font.line_height, w.run.line_height);
+}
+
+test "a character the family lacks is shaped by a font that has it" {
+    // Noto Sans has no CJK, no Hebrew and no arrows; before this, all three
+    // came out as the font's `.notdef` box and nothing said so.
+    var lib = try Library.init();
+    defer lib.deinit();
+    var font = try openSans(&lib, testing.allocator);
+    defer font.deinit();
+    var atlas = try Atlas.init(testing.allocator, 512, 512);
+    defer atlas.deinit();
+
+    const s = "tiếng 日本語 việt";
+    const run = try font.shape(&atlas, s);
+    try testing.expect(run.glyphs.len > 0);
+
+    // A fallback was opened, and it is not the font we started with.
+    try testing.expect(font.fallbacks.items.len >= 1);
+    try testing.expect(!std.mem.eql(u8, font.path, font.fallbacks.items[0].path));
+
+    // Every CJK character got ink. Without a fallback they are `.notdef`,
+    // which is a box with ink too -- so the test is that each one has a
+    // DIFFERENT atlas rectangle, which three copies of one box would not.
+    const cjk_start = "tiếng ".len;
+    var seen: [3]ui.Glyph = undefined;
+    var found: usize = 0;
+    for (run.glyphs) |g| {
+        if (g.cluster >= cjk_start and g.cluster < cjk_start + 9 and g.hasInk()) {
+            if (found < 3) seen[found] = g;
+            found += 1;
+        }
+    }
+    try testing.expectEqual(@as(usize, 3), found);
+    try testing.expect(seen[0].u0 != seen[1].u0 or seen[0].v0 != seen[1].v0);
+    try testing.expect(seen[1].u0 != seen[2].u0 or seen[1].v0 != seen[2].v0);
+
+    // And nothing was left without a glyph.
+    try testing.expectEqual(@as(u32, 0), font.missing);
+}
+
+test "a fallback keeps the baseline and the byte offsets" {
+    var lib = try Library.init();
+    defer lib.deinit();
+    var font = try openSans(&lib, testing.allocator);
+    defer font.deinit();
+    var atlas = try Atlas.init(testing.allocator, 512, 512);
+    defer atlas.deinit();
+
+    const s = "a日b";
+    const run = try font.shape(&atlas, s);
+    try testing.expectEqual(@as(usize, 3), run.glyphs.len);
+
+    // Clusters are byte offsets into the whole string, not into the piece
+    // the fallback was handed: 0, 1, 4.
+    try testing.expectEqual(@as(u32, 0), run.glyphs[0].cluster);
+    try testing.expectEqual(@as(u32, 1), run.glyphs[1].cluster);
+    try testing.expectEqual(@as(u32, 4), run.glyphs[2].cluster);
+
+    // The pen only moves forward, and the fallback glyph is between its
+    // neighbours rather than back at the origin.
+    try testing.expect(run.glyphs[0].pen_x < run.glyphs[1].pen_x);
+    try testing.expect(run.glyphs[1].pen_x < run.glyphs[2].pen_x);
+    try testing.expectEqual(@as(f32, 0), run.glyphs[0].pen_x);
+
+    // And a caret can still be placed by byte, which is the whole reason the
+    // clusters have to be absolute.
+    try testing.expectEqual(run.glyphs[1].pen_x, run.caretX(1));
+    try testing.expectEqual(run.glyphs[2].pen_x, run.caretX(4));
+
+    // The box grew to hold the taller face rather than clipping it.
+    try testing.expect(run.ascent >= font.ascent / font.scale);
+    try testing.expect(run.height() >= font.height());
+}
+
+test "a character no font has is counted, not hidden" {
+    var lib = try Library.init();
+    defer lib.deinit();
+    var font = try openSans(&lib, testing.allocator);
+    defer font.deinit();
+    var atlas = try Atlas.init(testing.allocator, 256, 256);
+    defer atlas.deinit();
+
+    // A private-use codepoint: nothing on any system has a glyph for it.
+    _ = try font.shape(&atlas, "a\u{F0000}b");
+    try testing.expect(font.missing >= 1);
 }

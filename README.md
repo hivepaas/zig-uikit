@@ -13,7 +13,7 @@ A declarative GPU UI toolkit for Zig.
 zig build test                           # 197 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
-zig build test-text                      # 16 tests, needs a font installed
+zig build test-text                      # 19 tests, needs a font installed
 zig build test-input                     # 14 tests, needs xkbcommon and a layout
 zig build check-macos                    # type-checks the macOS sources, from Linux
 zig build test-gpu                       # Vulkan: 8 tests; Metal: 11 tests
@@ -576,11 +576,54 @@ Snapping to the device grid instead of the layout grid costs nothing that can
 be measured: a full rebuild of the bench's 7 344-glyph scene is 38.5 µs before
 and after.
 
+### Font fallback, and what a missing glyph looked like before it
+
+A font matched for `sans` has Latin and Vietnamese and not much else. Asked to
+shape `日本語`, Noto Sans returned three copies of glyph zero — the font's
+`.notdef` box — and nothing anywhere said so. Checked rather than assumed:
+
+```
+"tiếng": 5 glyphs, 0 notdef      "🇻🇳": 2 glyphs, 2 notdef
+"日本語": 3 glyphs, 3 notdef      "→":  1 glyphs, 1 notdef
+"אב":    2 glyphs, 2 notdef
+```
+
+So a run of `.notdef` is now shaped again by a font that has those characters.
+Fontconfig is asked, because it is the only thing that knows what is installed
+and in what order this user wants it tried — the same mechanism that put Noto
+Sans in front of the original request. Its answer is then **verified** with
+`FT_Get_Char_Index` rather than trusted: matching never fails on a system with
+any font at all, so a character nothing covers comes back as some font that
+does not have it either. When that happens the character is counted in
+`Font.missing` instead of quietly drawing a box.
+
+Three things the implementation has to get right, each of which is a test:
+
+- **The clusters stay absolute.** The fallback is handed the whole string with
+  an offset, not the substring, so HarfBuzz reports byte offsets into the
+  original and a caret can still be placed by byte across the join.
+- **The baseline stays the first font's.** A fallback's glyphs are placed
+  against the outer font's ascent, so a mixed line sits on one baseline; if
+  the fallback is taller, the finished run is pushed down once rather than
+  shaped twice to find the maximum first.
+- **The caches stay separate.** A glyph cache is keyed by glyph id, and the
+  same id means a different glyph in another face, so a fallback is simply
+  another `Font` with its own cache. Sharing one would draw the wrong letters.
+
+![a title bar reading 日本語 한국어 Ελληνικά and an arrow](docs/demo.png)
+
+Those four scripts are in the demo's title bar because a wrong one would be
+obvious there. `zig build demo` reports what it took: **one** fallback face,
+`NotoSansCJK-Regular.ttc`, which carries Greek and arrows as well as CJK, and
+zero characters left without a glyph.
+
 ### What text does not do yet
 
-Bidirectional text, and font fallback for a glyph the matched family lacks.
-Each is a separate piece of work rather than something to half-do inside what
-is here.
+Bidirectional text. A fallback run of Hebrew or Arabic is shaped right to left
+within itself, which is correct for that run and says nothing about where the
+run goes relative to its neighbours — that needs the bidi algorithm and
+per-direction runs through the caret arithmetic, and it is a separate piece of
+work rather than something to half-do inside what is here.
 
 Wrapping also needs a width given to it rather than discovered, and that is a
 real limitation and not a simplification for the demo. The width a paragraph
