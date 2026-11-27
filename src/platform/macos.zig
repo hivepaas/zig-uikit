@@ -38,6 +38,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const objc = @import("objc");
+/// For tools that need one message this module has no wrapper for -- the
+/// window demo's `--cursor` sets a cursor the way another application would.
+pub const runtime = objc;
 const ui = @import("zig-uikit");
 const id = objc.id;
 const send = objc.send;
@@ -131,6 +134,13 @@ pub const Window = struct {
 
     /// The press being dragged, if a mouse button is down in the text target.
     gesture: ?ui.editing.Gesture = null,
+
+    /// The cursor the application wants over this window. See `setCursor`.
+    cursor: ui.Cursor = .arrow,
+    /// Times the cursor had to be set: because the application changed its
+    /// mind, or because something else -- AppKit at a window edge, another
+    /// application's window the pointer came from -- left a different one.
+    cursor_sets: u32 = 0,
 
     /// Called to draw a frame while the user drags the window's edge. See
     /// `setLiveFrame`.
@@ -510,6 +520,75 @@ pub const Window = struct {
         return .{ .frame = frame, .main_height = send(objc.CGRect, main, "frame", .{}).size.height };
     }
 
+    /// The cursor to show while the pointer is over this window's content.
+    ///
+    /// The application decides, because only it knows what is under the
+    /// pointer (`ui.cursor.forPointer` has the text-field rule), and says so
+    /// whenever its answer changes; the window shows it.
+    ///
+    /// It is held as a *level*, not sent as an edge: every `pump` compares
+    /// the application's current cursor with this one and sets it again if
+    /// they differ. AppKit changes the cursor behind a view's back -- to a
+    /// resize arrow at the window's edge, to whatever the window the pointer
+    /// came from left -- and a view that set its cursor only when its own
+    /// answer changed would keep the wrong one until the pointer crossed into
+    /// the field and out again. Cursor rectangles are AppKit's own answer to
+    /// that, and they are the wrong shape here: they are areas registered in
+    /// advance, where this toolkit hit-tests a laid-out tree every frame and
+    /// already knows.
+    pub fn setCursor(self: *Window, c: ui.Cursor) void {
+        const pool = objc.AutoreleasePool.push();
+        defer pool.pop();
+        self.cursor = c;
+        self.applyCursor();
+    }
+
+    fn nsCursor(c: ui.Cursor) ?id {
+        const NSCursor = objc.class("NSCursor") catch return null;
+        return switch (c) {
+            .arrow => send(id, NSCursor, "arrowCursor", .{}),
+            .text => send(id, NSCursor, "IBeamCursor", .{}),
+        };
+    }
+
+    fn applyCursor(self: *Window) void {
+        // Only over the content, and only while this application is the
+        // active one: the cursor is the whole screen's, and an inactive
+        // application setting it would fight the one in front.
+        if (!self.pointer_inside) return;
+        if (!objc.truthy(send(objc.BOOL, self.app, "isActive", .{}))) return;
+        const want = nsCursor(self.cursor) orelse return;
+        const NSCursor = objc.class("NSCursor") catch return;
+        if (send(?id, NSCursor, "currentCursor", .{}) == want) return;
+        send(void, want, "set", .{});
+        self.cursor_sets += 1;
+    }
+
+    /// The cursor the *screen* shows now, whichever application set it, as
+    /// one of ours, or null for any other shape. For tests: the application's
+    /// own idea (`NSCursor.currentCursor`) is what it last set, which says
+    /// nothing about whether anyone can see it.
+    ///
+    /// `currentSystemCursor` returns a new object rather than the shared one,
+    /// so the comparison is by hot spot and image size, which is enough to
+    /// tell an arrow from an I-beam.
+    pub fn systemCursor(self: *const Window) ?ui.Cursor {
+        _ = self;
+        const pool = objc.AutoreleasePool.push();
+        defer pool.pop();
+        const NSCursor = objc.class("NSCursor") catch return null;
+        const shown = send(?id, NSCursor, "currentSystemCursor", .{}) orelse return null;
+        for ([_]ui.Cursor{ .arrow, .text }) |c| {
+            const known = nsCursor(c) orelse continue;
+            const a = send(objc.CGPoint, shown, "hotSpot", .{});
+            const b = send(objc.CGPoint, known, "hotSpot", .{});
+            const sa = send(objc.CGSize, send(id, shown, "image", .{}), "size", .{});
+            const sb = send(objc.CGSize, send(id, known, "image", .{}), "size", .{});
+            if (a.x == b.x and a.y == b.y and sa.width == sb.width and sa.height == sb.height) return c;
+        }
+        return null;
+    }
+
     pub const MouseKind = enum { down, dragged, up };
 
     /// A left-button event at a point in layout units, delivered through
@@ -609,6 +688,7 @@ pub const Window = struct {
         self.pointer_y = @floatCast(bounds.size.height - p.y);
         self.pointer_inside = p.x >= 0 and p.y >= 0 and p.x < bounds.size.width and p.y < bounds.size.height;
         self.focused = objc.truthy(send(objc.BOOL, self.window, "isKeyWindow", .{}));
+        self.applyCursor();
     }
 };
 

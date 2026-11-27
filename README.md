@@ -1639,6 +1639,51 @@ channel difference 1):
 
 ![A selection across a line break](docs/demo-selection-macos.png)
 
+### The cursor
+
+An I-beam over the field, an arrow elsewhere, and an I-beam for the whole of
+a drag that began in the field, wherever the pointer goes — the drag is still
+selecting, and AppKit's text view and GTK's entry both keep it.
+`src/cursor.zig` has the vocabulary (`arrow` and `text`, the two shapes every
+platform has and agrees on, with their AppKit, Wayland and Win32 names) and
+that one rule, with a test. Which shape is under the pointer is the
+application's to say, since only it has hit-tested the tree; the window shows
+it (`Window.setCursor`).
+
+**The cursor is a level, not an edge.** The cursor is the whole screen's,
+and other things set it behind a view's back: AppKit at the window's resize
+edge, the window the pointer came from. Setting it only when the
+application's answer changes would leave the wrong one up until the pointer
+crossed into the field and out again — the last step below, run with the
+check removed, is exactly that. So every `pump` compares AppKit's current cursor with the wanted one,
+and sets it again if they differ — while the pointer is over the content and
+the application is active, so that a window in the background does not fight
+the one in front. Cursor rectangles are AppKit's own answer, and they are the
+wrong shape for this toolkit: areas registered in advance, where the
+application hit-tests a laid-out tree every frame and already knows.
+
+`--cursor` moves the real pointer for about a second — over the field, off
+it, a press in the field held while the pointer is off it, the release, back
+over the field, and then a crosshair set the way another application would —
+and puts it back. Each step is checked against `NSCursor.currentSystemCursor`,
+which is what the screen shows, not what this program last asked for:
+
+```
+  the pointer over the field: text -- ok
+  the pointer off it: arrow -- ok
+  a drag that began in the field, off it: text -- ok
+  the drag released: arrow -- ok
+  back over the field: text -- ok
+  a crosshair set behind the window's back: text -- ok
+6 steps, 0 wrong; the cursor was set 6 times
+```
+
+Both rules were run with themselves switched off, and each test fails then:
+without the check in `pump` the last step shows "another shape"; without the
+drag rule the third shows an arrow. `currentSystemCursor` returns a new object
+each time, so it is matched to an arrow or an I-beam by hot spot and image
+size.
+
 ### Accessibility on macOS
 
 `src/access.zig` is the internal accessibility tree that
@@ -1782,8 +1827,10 @@ clients.
   path is covered by `zig build test` and not by a live input method. Japanese
   or Chinese input would exercise it, and the candidate window would then be
   the first real test of `firstRectForCharacterRange:`.
-- An I-beam cursor over the field, and clicks anywhere but the field: there
-  is no focus model to give them to.
+- Clicks anywhere but the field: there is no focus model to give them to, and
+  the button does nothing when clicked (an accessibility client can press it).
+- Cursor shapes beyond the two the toolkit asks for, and the cursor on Linux:
+  `src/cursor.zig` names the Wayland shapes, and nothing sends them yet.
 - The process is not an application bundle, and the input method logs
   `getApplicationProperty: called with invalid property` once per key because
   of it. Harmless, and gone once there is an `Info.plist`.

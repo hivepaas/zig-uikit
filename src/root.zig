@@ -31,6 +31,7 @@ pub const editing = @import("editing.zig");
 pub const input_client = @import("input_client.zig");
 pub const input_method = @import("input_method.zig");
 pub const access = @import("access.zig");
+pub const cursor = @import("cursor.zig");
 pub const a11y = @import("a11y.zig");
 pub const linebreak = @import("linebreak.zig");
 pub const text_layout = @import("text_layout.zig");
@@ -60,6 +61,8 @@ pub const Key = keys.Key;
 pub const Mods = keys.Mods;
 pub const KeyEvent = keys.KeyEvent;
 pub const KeyQueue = keys.Queue;
+
+pub const Cursor = cursor.Cursor;
 
 pub const Glyph = glyph.Glyph;
 pub const TextRun = glyph.TextRun;
@@ -92,6 +95,7 @@ test {
     _ = input_client;
     _ = input_method;
     _ = access;
+    _ = cursor;
     _ = a11y;
     _ = linebreak;
     _ = text_layout;

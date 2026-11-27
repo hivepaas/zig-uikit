@@ -438,6 +438,52 @@ fn sleepNs(ns: u64) void {
     _ = std.c.nanosleep(&ts, &ts);
 }
 
+/// One step of `--cursor`: something done to the pointer, and the cursor the
+/// screen must show afterwards. Checked with `Window.systemCursor`, which is
+/// the screen's cursor and not this program's idea of it.
+const CursorStep = struct {
+    what: []const u8,
+    /// Where to move the real pointer, in Core Graphics' global coordinates.
+    warp: ?CGPoint = null,
+    /// A synthetic press or release, at a point in layout units.
+    mouse: ?struct { p: ui.Point, kind: mac.Window.MouseKind } = null,
+    /// Set a cursor behind the window's back.
+    foreign: bool = false,
+    expect: ?ui.Cursor,
+};
+
+fn currentPointer() CGPoint {
+    const e = CGEventCreate(null) orelse return .{ .x = 0, .y = 0 };
+    defer CFRelease(e);
+    return CGEventGetLocation(e);
+}
+
+/// A point in layout units as Core Graphics' global coordinates, which have
+/// their origin at the top left of the main display.
+fn layoutToGlobal(win: *mac.Window, p: ui.Point) CGPoint {
+    const r = win.layoutRectToScreen(.{ .x = p.x, .y = p.y, .w = 0, .h = 0 });
+    return .{ .x = r.origin.x, .y = win.screenFrame().main_height - r.origin.y };
+}
+
+fn cursorScript(win: *mac.Window, t: *const ui.Tree) [6]CursorStep {
+    const f = t.bounds(demo.editable.?.field);
+    const in_field: ui.Point = .{ .x = f.x + f.w / 2, .y = f.y + f.h / 2 };
+    // Above the field, on the label that names it: content, not text.
+    const off_field: ui.Point = .{ .x = f.x + 10, .y = f.y - 40 };
+    return .{
+        .{ .what = "the pointer over the field", .warp = layoutToGlobal(win, in_field), .expect = .text },
+        .{ .what = "the pointer off it", .warp = layoutToGlobal(win, off_field), .expect = .arrow },
+        // A press in the field with the pointer where it is: the drag has
+        // begun in text, so the I-beam stays while it lasts.
+        .{ .what = "a drag that began in the field, off it", .mouse = .{ .p = in_field, .kind = .down }, .expect = .text },
+        .{ .what = "the drag released", .mouse = .{ .p = in_field, .kind = .up }, .expect = .arrow },
+        .{ .what = "back over the field", .warp = layoutToGlobal(win, in_field), .expect = .text },
+        // A foreign cursor, with the pointer still: the window has nothing
+        // new to say, and puts its own back anyway.
+        .{ .what = "a crosshair set behind the window's back", .foreign = true, .expect = .text },
+    };
+}
+
 fn hitTest(ctx: ?*anyopaque, doc: *const ui.Document, p: ui.Point, clamp: bool) ?ui.editing.Hit {
     const f: *const Field = @ptrCast(@alignCast(ctx.?));
     return demo.editableHit(f.t, doc.len(), p, clamp);
@@ -571,6 +617,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var ax_test = false;
     var click_test = false;
     var resize_test = false;
+    var cursor_test = false;
     var live_off = false;
     var resize_thread: ?std.Thread = null;
     var resize_reported = false;
@@ -587,6 +634,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (std.mem.eql(u8, a, "--ax")) ax_test = true;
         if (std.mem.eql(u8, a, "--click")) click_test = true;
         if (std.mem.eql(u8, a, "--resize")) resize_test = true;
+        // Moves the real pointer over the field and off it, checks what the
+        // screen shows, and puts the pointer back. See `CursorStep`.
+        if (std.mem.eql(u8, a, "--cursor")) cursor_test = true;
         // Measures the window without its live-resize drawing: the baseline.
         if (std.mem.eql(u8, a, "--no-live")) live_off = true;
     }
@@ -725,6 +775,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var click_at: usize = 0;
     var click_wrong: u32 = 0;
     var click_capture_frame: u64 = std.math.maxInt(u64);
+    var cursor_steps: [6]CursorStep = undefined;
+    var cursor_at: usize = 0;
+    var cursor_wrong: u32 = 0;
+    var cursor_was: CGPoint = .{ .x = 0, .y = 0 };
     var ax_removed = false;
     const frame_ns = win.refreshInterval() * 1e9;
     var last_present_ns: u64 = 0;
@@ -898,6 +952,42 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 break;
             }
         }
+        // `--cursor`: one step every eight frames from the twentieth, each
+        // checked on the step after it, so that a pump has sampled the
+        // pointer and the frame has decided.
+        if (cursor_test and frames >= 20 and frames % 8 == 4) {
+            scripted_frame = true;
+            if (cursor_at == 0) {
+                cursor_was = currentPointer();
+                cursor_steps = cursorScript(win, &t);
+            } else {
+                const st = cursor_steps[cursor_at - 1];
+                const on_screen = win.systemCursor();
+                const ok = on_screen == st.expect;
+                if (!ok) cursor_wrong += 1;
+                std.debug.print("  {s}: {s} -- {s}\n", .{ st.what, if (on_screen) |c| @tagName(c) else "another shape", if (ok) "ok" else "WRONG" });
+            }
+            if (cursor_at < cursor_steps.len) {
+                const st = cursor_steps[cursor_at];
+                if (st.warp) |p| _ = CGWarpMouseCursorPosition(p);
+                if (st.mouse) |m| win.sendMouse(m.p, m.kind, 1, false);
+                if (st.foreign) {
+                    // What another application, or AppKit at the window's
+                    // edge, does: sets a cursor of its own. Nothing in this
+                    // program's state changes, so only the level check in
+                    // `pump` can notice.
+                    const rt = mac.runtime;
+                    const NSCursor = try rt.class("NSCursor");
+                    rt.send(void, rt.send(rt.id, NSCursor, "crosshairCursor", .{}), "set", .{});
+                }
+                cursor_at += 1;
+            } else {
+                _ = CGWarpMouseCursorPosition(cursor_was);
+                std.debug.print("{d} steps, {d} wrong; the cursor was set {d} times\n", .{ cursor_steps.len, cursor_wrong, win.cursor_sets });
+                if (cursor_wrong > 0) return error.CursorScriptDiverged;
+                break;
+            }
+        }
         // `--resize`: the window's corner dragged 240 by 140 points in 30
         // steps, through AppKit's own resize loop. `sendResizeDrag` returns
         // only when the drag is over -- the frame loop is stopped for all of
@@ -991,6 +1081,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 p.background = hover_tint;
                 t.setPaint(hovered, p);
             }
+        }
+
+        // The I-beam over the field, and for the whole of a drag that began
+        // in it. A hit test against the field's rectangle, which is what
+        // `editableHit` does when it is not clamping.
+        if (sweep == 0) {
+            const over_text = inside and demo.editableHit(&t, doc.len(), .{ .x = px, .y = py }, false) != null;
+            const want_cursor = ui.cursor.forPointer(over_text, win.gesture != null);
+            if (want_cursor != win.cursor) win.setCursor(want_cursor);
         }
 
         const layout = t.flush();
