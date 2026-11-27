@@ -33,6 +33,7 @@ pub const input_method = @import("input_method.zig");
 pub const access = @import("access.zig");
 pub const cursor = @import("cursor.zig");
 pub const a11y = @import("a11y.zig");
+pub const bidi = @import("bidi.zig");
 pub const linebreak = @import("linebreak.zig");
 pub const text_layout = @import("text_layout.zig");
 pub const scene = @import("scene.zig");
@@ -97,6 +98,7 @@ test {
     _ = access;
     _ = cursor;
     _ = a11y;
+    _ = bidi;
     _ = linebreak;
     _ = text_layout;
     _ = scene;

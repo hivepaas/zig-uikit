@@ -209,6 +209,9 @@ pub const Font = struct {
     /// Scratch for the run being built, reused between calls.
     scratch: std.ArrayList(ui.Glyph) = .empty,
 
+    /// The paragraph's direction runs, reused between calls.
+    bidi_runs: std.ArrayList(ui.bidi.Run) = .empty,
+
     /// Fonts opened to cover characters this one does not have.
     ///
     /// Owned, and kept per font rather than per library because the glyph
@@ -237,6 +240,7 @@ pub const Font = struct {
         self.fallbacks.deinit(self.gpa);
         self.cache.deinit(self.gpa);
         self.scratch.deinit(self.gpa);
+        self.bidi_runs.deinit(self.gpa);
         self.gpa.free(self.path);
         c.hb_buffer_destroy(self.buf);
         c.hb_font_destroy(self.hb);
@@ -270,7 +274,32 @@ pub const Font = struct {
         var pen_x: f32 = 0;
         var max_ascent = self.ascent;
         var max_descent = self.descent;
-        try self.shapeRange(atlas, s, 0, s.len, &pen_x, &max_ascent, &max_descent, true);
+
+        // One buffer per direction run, in visual order. HarfBuzz does not do
+        // bidi: handed a right-to-left buffer it reverses everything in it,
+        // including an English word, so `"אבג abc דהו"` came out with `abc`
+        // as `cba`. See `src/bidi.zig`.
+        //
+        // Text with no right-to-left character in it -- nearly all of it --
+        // takes the single-run path and never touches the algorithm.
+        if (ui.bidi.hasRtl(s)) {
+            _ = try ui.bidi.runs(self.gpa, s, null, &self.bidi_runs);
+            for (self.bidi_runs.items) |r| {
+                try self.shapeRange(
+                    atlas,
+                    s,
+                    r.start,
+                    r.end - r.start,
+                    &pen_x,
+                    &max_ascent,
+                    &max_descent,
+                    true,
+                    r.direction(),
+                );
+            }
+        } else {
+            try self.shapeRange(atlas, s, 0, s.len, &pen_x, &max_ascent, &max_descent, true, .ltr);
+        }
 
         // A fallback with a taller ascent needs the whole line pushed down,
         // because the baseline was placed at this font's ascent before the
@@ -321,8 +350,9 @@ pub const Font = struct {
         max_ascent: *f32,
         max_descent: *f32,
         allow_fallback: bool,
+        dir: ui.bidi.Direction,
     ) Error!void {
-        try self.shapeInto(atlas, s, off, len, pen_x, self.ascent, max_ascent, max_descent, allow_fallback, self);
+        try self.shapeInto(atlas, s, off, len, pen_x, self.ascent, max_ascent, max_descent, allow_fallback, self, dir);
     }
 
     fn shapeInto(
@@ -337,6 +367,7 @@ pub const Font = struct {
         max_descent: *f32,
         allow_fallback: bool,
         out_owner: *Font,
+        dir: ui.bidi.Direction,
     ) Error!void {
         if (len == 0) return;
         c.hb_buffer_reset(self.buf);
@@ -345,10 +376,16 @@ pub const Font = struct {
         // carry the same offsets everything else does and a caret can still
         // be placed by byte.
         c.hb_buffer_add_utf8(self.buf, s.ptr, @intCast(s.len), @intCast(off), @intCast(len));
-        // Direction, script and language inferred from the text itself. For
-        // Latin and Vietnamese this is right; for mixed-direction text it is
-        // the thing a real itemiser replaces, and it is honest about being a
-        // guess in a way that hardcoding LTR/Latin would not be.
+        // The direction is decided, not guessed: `bidi.runs` resolved it for
+        // the whole paragraph and this is one of its runs. Set before
+        // guessing, because `hb_buffer_guess_segment_properties` only fills
+        // in what is still unset -- so script and language are still inferred
+        // from the text, which is right for them and was never right for
+        // direction.
+        c.hb_buffer_set_direction(self.buf, if (dir == .rtl)
+            c.HB_DIRECTION_RTL
+        else
+            c.HB_DIRECTION_LTR);
         c.hb_buffer_guess_segment_properties(self.buf);
         c.hb_shape(self.hb, self.buf, null, 0);
 
@@ -366,8 +403,29 @@ pub const Font = struct {
             if (allow_fallback and infos[i].codepoint == 0) {
                 var j = i;
                 while (j < count and infos[j].codepoint == 0) j += 1;
-                const c0: usize = @intCast(infos[i].cluster);
-                const c1: usize = if (j < count) @intCast(infos[j].cluster) else off + len;
+
+                // The byte range the run covers, which is NOT simply the
+                // first and last clusters. HarfBuzz emits glyphs in visual
+                // order, so in a right-to-left run the clusters **descend**
+                // along the array: the run starts at the last of them and
+                // ends where the glyph before it began.
+                //
+                // Getting this wrong does not produce a missing glyph, it
+                // produces a duplicated line. Shaping `"אבג abc דהו"` took
+                // the end of the string as the end of the run and shaped
+                // thirteen bytes of it a second time, so the text appeared
+                // twice -- found by printing the clusters, not by reading the
+                // code.
+                const rtl = c.hb_buffer_get_direction(self.buf) == c.HB_DIRECTION_RTL;
+                const c0: usize = if (rtl)
+                    @intCast(infos[j - 1].cluster)
+                else
+                    @intCast(infos[i].cluster);
+                const c1: usize = if (rtl)
+                    (if (i > 0) @intCast(infos[i - 1].cluster) else off + len)
+                else
+                    (if (j < count) @intCast(infos[j].cluster) else off + len);
+
                 if (c1 > c0) {
                     const cp = std.unicode.utf8Decode(s[c0..offsets_nextChar(s, c0)]) catch 0;
                     if (self.fallbackFor(cp)) |fb| {
@@ -385,6 +443,9 @@ pub const Font = struct {
                             // search has to terminate.
                             false,
                             out_owner,
+                            // The same direction: this is a stretch of one
+                            // bidi run, not a run of its own.
+                            dir,
                         );
                         max_ascent.* = @max(max_ascent.*, fb.ascent);
                         max_descent.* = @max(max_descent.*, fb.descent);
@@ -1069,4 +1130,101 @@ test "a character no font has is counted, not hidden" {
     // A private-use codepoint: nothing on any system has a glyph for it.
     _ = try font.shape(&atlas, "a\u{F0000}b");
     try testing.expect(font.missing >= 1);
+}
+
+test "an English word in a Hebrew line is not reversed" {
+    // The bug this fixes, end to end: HarfBuzz handed the whole line as one
+    // right-to-left buffer shapes `abc` as `cba`. Split into direction runs,
+    // it does not. Checked on the glyphs, because that is where it was wrong.
+    var lib = try Library.init();
+    defer lib.deinit();
+    var font = try openSans(&lib, testing.allocator);
+    defer font.deinit();
+    var atlas = try Atlas.init(testing.allocator, 512, 512);
+    defer atlas.deinit();
+
+    const s = "אבג abc דהו";
+    const run = try font.shape(&atlas, s);
+    // Eleven characters, eleven glyphs: no duplication, which is what the
+    // right-to-left cluster range used to produce.
+    try testing.expectEqual(@as(usize, 11), run.glyphs.len);
+
+    // `a`, `b`, `c` are at bytes 7, 8, 9 and must appear in that order from
+    // left to right.
+    var xa: f32 = -1;
+    var xb: f32 = -1;
+    var xc: f32 = -1;
+    for (run.glyphs) |g| switch (g.cluster) {
+        7 => xa = g.pen_x,
+        8 => xb = g.pen_x,
+        9 => xc = g.pen_x,
+        else => {},
+    };
+    try testing.expect(xa >= 0 and xb >= 0 and xc >= 0);
+    try testing.expect(xa < xb);
+    try testing.expect(xb < xc);
+
+    // And the Hebrew still runs the other way: the first logical word is on
+    // the right of the line, the last on the left.
+    var first_hebrew: f32 = -1;
+    var last_hebrew: f32 = -1;
+    for (run.glyphs) |g| {
+        if (g.cluster == 0) first_hebrew = g.pen_x;
+        if (g.cluster == 15) last_hebrew = g.pen_x;
+    }
+    try testing.expect(last_hebrew < first_hebrew);
+}
+
+test "a right-to-left run inside English keeps its own order" {
+    var lib = try Library.init();
+    defer lib.deinit();
+    var font = try openSans(&lib, testing.allocator);
+    defer font.deinit();
+    var atlas = try Atlas.init(testing.allocator, 512, 512);
+    defer atlas.deinit();
+
+    const s = "abc אבג def";
+    const run = try font.shape(&atlas, s);
+    try testing.expectEqual(@as(usize, 11), run.glyphs.len);
+
+    // Latin before and after, in order; Hebrew between them, reversed.
+    var x0: f32 = -1;
+    var x4: f32 = -1;
+    var x8: f32 = -1;
+    var x10: f32 = -1;
+    for (run.glyphs) |g| switch (g.cluster) {
+        0 => x0 = g.pen_x,
+        4 => x4 = g.pen_x,
+        8 => x8 = g.pen_x,
+        10 => x10 = g.pen_x,
+        else => {},
+    };
+    try testing.expect(x0 < x8);
+    try testing.expect(x8 < x4);
+    try testing.expect(x4 < x10);
+}
+
+test "Latin and Vietnamese take the path that never runs the algorithm" {
+    // The fast path has to produce the same answer, not merely be faster.
+    var lib = try Library.init();
+    defer lib.deinit();
+    var font = try openSans(&lib, testing.allocator);
+    defer font.deinit();
+    var atlas = try Atlas.init(testing.allocator, 512, 512);
+    defer atlas.deinit();
+
+    const s = "tiếng Việt";
+    try testing.expect(!ui.bidi.hasRtl(s));
+    const run = try font.shape(&atlas, s);
+    var prev: f32 = -1;
+    for (run.glyphs) |g| {
+        try testing.expect(g.pen_x >= prev);
+        prev = g.pen_x;
+    }
+    // Clusters ascend too, which is what "one left-to-right run" means.
+    var last: u32 = 0;
+    for (run.glyphs) |g| {
+        try testing.expect(g.cluster >= last);
+        last = g.cluster;
+    }
 }

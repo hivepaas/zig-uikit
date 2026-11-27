@@ -529,6 +529,11 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
     // was that font's empty `.notdef` box -- and nothing said so. They are in
     // the title bar because that is where a wrong one would be obvious.
     _ = try label(t, title, ui_font, atlas, "日本語 한국어 Ελληνικά →", dim);
+    // A right-to-left line with a Latin word inside it. Shaped as one
+    // right-to-left buffer, `zig` comes out `giz` -- which is the point of
+    // putting a word here that anyone can check rather than a line of Hebrew
+    // that only some readers can.
+    _ = try label(t, title, ui_font, atlas, "אבג zig דהו", dim);
 
     // --- body ---
     const body = try t.appendChild(t.root(), .{

@@ -386,6 +386,18 @@ pub fn main() !void {
             for (0..iters) |_| try text.setText(&t2, el, &font, &atlas, line);
             report("shape it and install it", nowNs() - t0, iters, "plus the copy onto the element");
         }
+        {
+            // What the bidirectional path costs when it is actually taken:
+            // the same length of text, with a right-to-left word in it, so
+            // the algorithm runs and the line is shaped as three buffers
+            // instead of one.
+            const mixed = "tiếng Việt אבג zig uikit דהו rất hay";
+            _ = try font.shape(&atlas, mixed);
+            const iters = 20_000;
+            const t0 = nowNs();
+            for (0..iters) |_| _ = try font.shape(&atlas, mixed);
+            report("shape a mixed-direction line", nowNs() - t0, iters, "three runs, and the algorithm");
+        }
     }
 
     // --- raster ---

@@ -10,10 +10,10 @@ A declarative GPU UI toolkit for Zig.
 > There are no widgets. Expect the API to change without notice.
 
 ```sh
-zig build test                           # 204 tests, no platform dependencies
+zig build test                           # 223 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
-zig build test-text                      # 19 tests, needs a font installed
+zig build test-text                      # 22 tests, needs a font installed
 zig build test-input                     # 14 tests, needs xkbcommon and a layout
 zig build check-macos                    # type-checks the macOS sources, from Linux
 zig build test-gpu                       # Vulkan: 8 tests; Metal: 11 tests
@@ -443,10 +443,13 @@ three times, and all four spikes answer it with a fixed rectangle — which is
 why their candidate windows appear in the wrong part of the screen. These are
 the functions that answer it properly.
 
-They are **left to right only**, and the run says so rather than pretending
-otherwise. A mixed-direction line needs the glyphs grouped into runs of one
-direction each and the arithmetic done per run. A toolkit that got Vietnamese
-right by shaping properly should not then get Arabic wrong by assuming.
+They are **left to right only**, and that is now the one place where it still
+matters. A mixed-direction line *renders* correctly — see "Bidirectional text"
+— but these three functions walk the glyphs assuming the clusters ascend, and
+in a mixed line they do not. The caret and the hit test are therefore wrong
+there, in the way they always were, while the drawing beside them is right.
+Fixing it means doing the arithmetic per direction run, which is a separate
+piece of work with the run table already in hand.
 
 `src/offsets.zig` is the other half, and it is §1 of the spec made executable:
 
@@ -661,13 +664,69 @@ obvious there. `zig build demo` reports what it took: **one** fallback face,
 `NotoSansCJK-Regular.ttc`, which carries Greek and arrows as well as CJK, and
 zero characters left without a glyph.
 
+### Bidirectional text
+
+HarfBuzz does not do bidi. Handed a buffer it shapes it in one direction, so
+`"אבג abc דהו"` — a Hebrew line with an English word in it — came out with
+`abc` reversed to `cba`. Measured first, by printing the clusters:
+
+```
+"abc אבג def":  c0@0 c1@8 c2@18 c3@25 c8@29 c6@35 c4@44 c10@54 …   correct
+"אבג abc דהו":  … c9@31 c8@38 c7@47 …                              c, b, a
+```
+
+The same print found a worse one. **Font fallback, committed two days before,
+was duplicating text.** In a right-to-left run HarfBuzz emits glyphs in visual
+order, so the clusters *descend* along the array — and the code that worked
+out which bytes a `.notdef` run covered took the first and last clusters as
+start and end. For the last run in the line it took the end of the string as
+the end of the run and shaped thirteen bytes a second time: eleven characters
+came out as seventeen glyphs. Not a missing glyph, a duplicated line, and
+invisible in any left-to-right test.
+
+`src/bidi.zig` is UAX #9 — enough of it to set a line of text. It resolves the
+paragraph's embedding levels and returns the runs in visual order; `shape`
+then uses one HarfBuzz buffer per run, with the direction **set** rather than
+guessed, and `hb_buffer_guess_segment_properties` left to infer script and
+language, which it was always right about.
+
+Three things are left out, each stated rather than discovered. The **explicit
+formatting codes** (`LRE`, `RLE`, the isolates): rules X1–X8 are a third of
+the algorithm and exist for documents that embed direction by hand, which a
+label and a text field do not. **N0, paired brackets**: without it a bracket
+between two runs takes the surrounding direction instead of matching its
+partner. And **mirroring the glyphs** — `(` drawn as `)` in a right-to-left
+run — which is the font's business through `rtlm`.
+
+The character table is a subset too, and the subset is the point: Latin,
+Greek, Cyrillic, Vietnamese and CJK as left-to-right, Hebrew and Arabic as
+right-to-left, both kinds of digits, the combining marks, and ASCII
+punctuation as neutral. That is every script this toolkit can draw; anything
+else defaults to left-to-right, which is what the standard does for unassigned
+codepoints anyway.
+
+![a title bar whose last line reads והד zig גבא](docs/demo.png)
+
+The demo's title bar ends with `אבג zig דהו`, chosen so the check does not
+need a reader of Hebrew: if `zig` appears as `giz`, it is wrong.
+
+**It costs nothing when it is not needed.** `bidi.hasRtl` is a byte scan over
+UTF-8 lead bytes — conservative, so a false positive costs one pass that
+produces one run and a false negative is impossible — and text without any
+right-to-left character never reaches the algorithm:
+
+| | |
+| --- | --- |
+| shape a 40-character Vietnamese line | **2.09 us**, unchanged |
+| shape a mixed-direction line of the same length | 3.96 us |
+
+The second is three HarfBuzz buffers, the algorithm, and two fallback faces.
+
 ### What text does not do yet
 
-Bidirectional text. A fallback run of Hebrew or Arabic is shaped right to left
-within itself, which is correct for that run and says nothing about where the
-run goes relative to its neighbours — that needs the bidi algorithm and
-per-direction runs through the caret arithmetic, and it is a separate piece of
-work rather than something to half-do inside what is here.
+The caret and the hit test in mixed-direction text; see "The caret" above.
+Rendering is correct and the arithmetic over it is not, which is a worse
+asymmetry than when neither was, and it is the next thing here.
 
 Wrapping also needs a width given to it rather than discovered, and that is a
 real limitation and not a simplification for the demo. The width a paragraph
