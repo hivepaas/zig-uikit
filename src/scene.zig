@@ -281,6 +281,32 @@ pub const Scene = struct {
         return self.owners.items[quad_index];
     }
 
+    /// The element painted frontmost at `p`, or null where nothing is
+    /// painted: the scene-driven hit test `Tree.hitTest` leaves to this file.
+    ///
+    /// It walks the primitives back to front in the order they were drawn,
+    /// layers included, so a popover hanging out of the row that owns it --
+    /// which the tree's descent by containment never enters -- is hit before
+    /// whatever it covers. A primitive counts where the point is inside both
+    /// its rectangle and its clip, so a row scrolled out of its list is not
+    /// clicked through the list's edge. Glyphs count: a click on a letter is a
+    /// click on its label. Rounded corners do not: a click in the corner of a
+    /// rounded button is on the button, which is what a person meant.
+    ///
+    /// What it answers is what is *on screen*, which is the last built scene
+    /// -- the right question for a click, whose target is what the user saw.
+    /// Linear in the primitives, which is fine for a click and is why hover,
+    /// every frame, keeps the tree's binary search.
+    pub fn hitTest(self: *const Scene, p: Point) ?Index {
+        var i = self.quads.items.len;
+        while (i > 0) {
+            i -= 1;
+            const q = self.quads.items[i];
+            if (q.rect().contains(p) and q.clipRect().contains(p)) return self.owners.items[i];
+        }
+        return null;
+    }
+
     /// Rebuilds the primitive list from the tree, unless nothing has changed.
     ///
     /// The tree must have been laid out. Returns what the build cost; a frame

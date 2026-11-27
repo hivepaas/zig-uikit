@@ -32,6 +32,7 @@ pub const input_client = @import("input_client.zig");
 pub const input_method = @import("input_method.zig");
 pub const access = @import("access.zig");
 pub const cursor = @import("cursor.zig");
+pub const focus = @import("focus.zig");
 pub const a11y = @import("a11y.zig");
 pub const bidi = @import("bidi.zig");
 pub const linebreak = @import("linebreak.zig");
@@ -97,6 +98,7 @@ test {
     _ = input_method;
     _ = access;
     _ = cursor;
+    _ = focus;
     _ = a11y;
     _ = bidi;
     _ = linebreak;

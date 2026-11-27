@@ -98,6 +98,11 @@ pub fn editableLines() ?*const ui.text_layout.Wrapped {
 pub var access_tree: ?*ui.access.Tree = null;
 /// The typeable field's node, for the window to attach the document to.
 pub var editable_node: ui.access.NodeId = ui.access.no_node;
+/// The popover's button, its node and its paint as built, for a window that
+/// gives it focus and lets it be pressed.
+pub var button_el: Index = std.math.maxInt(Index);
+pub var button_node: ui.access.NodeId = ui.access.no_node;
+pub var button_paint: ui.Paint = .{};
 /// Set while building something whose own node already says what its label
 /// would: the button, the text field.
 var access_mute = false;
@@ -634,7 +639,9 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
             .align_items = .center,
         });
         t.setPaint(ok, .{ .background = accent, .corner_radius = 6 });
-        _ = try register(t, ok, .{ .role = .button, .name = "Đồng ý", .state = .{ .focusable = true } });
+        button_el = ok;
+        button_paint = t.paint(ok);
+        button_node = try register(t, ok, .{ .role = .button, .name = "Đồng ý", .state = .{ .focusable = true } });
         access_mute = true;
         _ = try label(t, ok, ui_font, atlas, "Đồng ý", Color.white);
         access_mute = false;

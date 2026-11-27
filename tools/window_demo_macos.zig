@@ -136,6 +136,106 @@ fn syncField(ctx: ?*anyopaque) void {
     f.refresh() catch {};
 }
 
+/// The text target for the field: the window edits its document while the
+/// field has focus, and has none otherwise.
+fn fieldTarget(f: *Field) mac.Window.TextTarget {
+    var tt: mac.Window.TextTarget = .{ .doc = f.doc, .rect = rangeRect, .hit = hitTest, .sync = syncField, .ctx = f };
+    tt.options.lines = demo.editableLines();
+    return tt;
+}
+
+/// What has keyboard focus inside the window -- the field or the button --
+/// and the button the pointer is pressing. The rules are `ui.focus`'s; this
+/// is the demo carrying them out: attaching the field to the window's text
+/// input or detaching it, telling the accessibility tree, and painting.
+const Focus = struct {
+    win: *mac.Window,
+    t: *ui.Tree,
+    at: *ui.access.Tree,
+    field: *Field,
+    scene: *const ui.Scene,
+    node: ui.access.NodeId,
+    press: ui.focus.Press = .{},
+    /// Button activations, by the pointer or by Space.
+    activated: u32 = 0,
+    /// Tab stops at buttons even without the system setting: `--focus`
+    /// tests the order, not this Mac's settings.
+    force_tab_to_buttons: bool = false,
+
+    fn options(self: *const Focus) ui.focus.Options {
+        var o = ui.focus.Options.mac;
+        o.tab_to_buttons = self.force_tab_to_buttons or self.win.keyboardNavigation();
+        return o;
+    }
+
+    fn set(self: *Focus, n: ui.access.NodeId) void {
+        if (n == self.node) return;
+        self.node = n;
+        self.apply();
+    }
+
+    /// Makes everything agree with `node`: after a change, and after the
+    /// trees are rebuilt for a new display.
+    fn apply(self: *Focus) void {
+        self.at.setFocus(self.node);
+        const on_field = self.node == demo.editable_node;
+        const has_field = self.win.text != null;
+        if (on_field and !has_field) self.win.setTextTarget(fieldTarget(self.field));
+        if (!on_field and has_field) self.win.setTextTarget(null);
+        self.win.accessibilityFocusChanged();
+        self.paint();
+    }
+
+    /// The button's ring when it has focus and its darker fill while the
+    /// pointer holds it; the field's selection grey when it does not have
+    /// focus, as a Mac draws an inactive selection. The caret is the main
+    /// loop's, because it also depends on the window being key.
+    fn paint(self: *Focus) void {
+        if (demo.button_el != std.math.maxInt(ui.Index)) {
+            var p = demo.button_paint;
+            if (self.node == demo.button_node) {
+                p.border_color = ui.Color.hex(0xBFD3FF);
+                p.border_width = 2;
+            }
+            if (self.press.armed == demo.button_node and self.press.over) p.background = ui.Color.hex(0x3A62C0);
+            self.t.setPaint(demo.button_el, p);
+        }
+        if (demo.editable) |ed| {
+            const c = if (self.node == demo.editable_node) demo.selection_color else ui.Color.hex(0x464A52);
+            for (ed.selection) |o| {
+                var p = self.t.paint(o.box);
+                p.background = c;
+                self.t.setPaint(o.box, p);
+            }
+        }
+    }
+
+    fn activate(self: *Focus, n: ui.access.NodeId) void {
+        self.activated += 1;
+        std.debug.print("pressed: \"{s}\"\n", .{if (self.at.get(n)) |node| node.name else "?"});
+    }
+
+    /// `Window.PointerHook`: every press, drag and release, before the field
+    /// sees it, so that a click on the unfocused field focuses it and then
+    /// places the caret.
+    fn pointer(ctx: ?*anyopaque, _: *mac.Window, ev: mac.Window.PointerEvent) void {
+        const self: *Focus = @ptrCast(@alignCast(ctx.?));
+        // What was painted at the point, popover included -- not the tree's
+        // descent, which cannot see a layer (`Scene.hitTest`).
+        const el = self.scene.hitTest(ev.p) orelse self.t.root();
+        const node = ui.focus.nodeAt(self.at, self.t, el);
+        switch (ev.kind) {
+            .down => {
+                if (ui.focus.onPress(self.at, node, self.options())) |n| self.set(n);
+                _ = self.press.down(self.at, node);
+            },
+            .dragged => self.press.moved(self.at, node),
+            .up => if (self.press.up(self.at, node)) |b| self.activate(b),
+        }
+        self.paint();
+    }
+};
+
 /// A frame at the window's new size, drawn from `setFrameSize:` while the
 /// user drags. The same work the main loop does on a resize -- new
 /// drawables, a full layout, a scene -- and nothing else: no hover, no
@@ -438,6 +538,25 @@ fn sleepNs(ns: u64) void {
     _ = std.c.nanosleep(&ts, &ts);
 }
 
+/// `--focus`, in order. Telex is the input source throughout, so that a
+/// letter typed with the button focused would compose if the input method
+/// were still attached, and so that composing again after Shift+Tab shows it
+/// was attached again.
+const focus_steps = [_][]const u8{
+    "Tab moves focus to the button",
+    "Space presses it, and types no space",
+    "a letter with the button focused types nothing",
+    "Shift-Tab goes back to the field",
+    "Telex composes in it again: aa is â",
+    "a click on the button presses it and leaves focus in the field",
+    "a press on the button let go off it presses nothing",
+    "a click on a label leaves focus where it was",
+    "Tab away to the button",
+    "a click in the field focuses it and places the caret, in one click",
+};
+
+const kVK_Tab = 48;
+
 /// One step of `--cursor`: something done to the pointer, and the cursor the
 /// screen must show afterwards. Checked with `Window.systemCursor`, which is
 /// the screen's cursor and not this program's idea of it.
@@ -618,6 +737,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var click_test = false;
     var resize_test = false;
     var cursor_test = false;
+    var focus_test = false;
     var live_off = false;
     var resize_thread: ?std.Thread = null;
     var resize_reported = false;
@@ -637,6 +757,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // Moves the real pointer over the field and off it, checks what the
         // screen shows, and puts the pointer back. See `CursorStep`.
         if (std.mem.eql(u8, a, "--cursor")) cursor_test = true;
+        // Tab, Space, Telex, and clicks on the button, the label and the
+        // field. See `FocusTest`.
+        if (std.mem.eql(u8, a, "--focus")) focus_test = true;
         // Measures the window without its live-resize drawing: the baseline.
         if (std.mem.eql(u8, a, "--no-live")) live_off = true;
     }
@@ -705,7 +828,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .glyphs = &wrapped_glyphs,
         .lines = &wrapped_lines,
     };
-    win.setTextTarget(.{ .doc = &doc, .rect = rangeRect, .hit = hitTest, .sync = syncField, .ctx = &field });
+    win.setTextTarget(fieldTarget(&field));
     defer win.setTextTarget(null);
     // Wrapped once before anything asks where the text is: `buildUi` set it
     // as one line, and the field's width is known now that it is laid out.
@@ -715,6 +838,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
     at.setFocus(demo.editable_node);
     win.setAccessTarget(.{ .tree = &at, .layout = &t });
     defer win.setAccessTarget(null);
+    var focus: Focus = .{ .win = win, .t = &t, .at = &at, .field = &field, .scene = &scene, .node = demo.editable_node, .force_tab_to_buttons = focus_test };
+    win.setPointerHook(.{ .ctx = &focus, .event = Focus.pointer });
+    defer win.setPointerHook(null);
     // Whether the text changed or only the caret moved, for the notification
     // a screen reader needs: a value change is read aloud, a caret move is not.
     var text_hash = std.hash.Wyhash.hash(0, doc.text());
@@ -724,8 +850,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // back. `--type` wants a plain layout so that letters are letters.
     var source_buf: [256]u8 = undefined;
     var restore_source: ?[]const u8 = null;
-    if (type_test or telex) {
-        const want: [*:0]const u8 = if (telex)
+    if (type_test or telex or focus_test) {
+        const want: [*:0]const u8 = if (telex or focus_test)
             "com.apple.inputmethod.VietnameseIM.VietnameseSimpleTelex"
         else
             "com.apple.keylayout.ABC";
@@ -776,6 +902,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var click_wrong: u32 = 0;
     var click_capture_frame: u64 = std.math.maxInt(u64);
     var cursor_steps: [6]CursorStep = undefined;
+    var focus_at: usize = 0;
+    var focus_wrong: u32 = 0;
+    var focus_before: [512]u8 = undefined;
+    var focus_before_len: usize = 0;
     var cursor_at: usize = 0;
     var cursor_wrong: u32 = 0;
     var cursor_was: CGPoint = .{ .x = 0, .y = 0 };
@@ -849,8 +979,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 at = try ui.access.Tree.init(gpa, "zig-uikit");
                 try demo.buildUi(&t, &fonts);
                 at.setDocument(demo.editable_node, &doc);
-                at.setFocus(demo.editable_node);
                 win.setAccessTarget(.{ .tree = &at, .layout = &t });
+                // The nodes were registered in the same order, so the ids
+                // are the same ones; the paint and the tree's focus are new.
+                focus.apply();
                 try renderer.setAtlas(fonts.atlas.view());
                 atlas_gen = fonts.atlas.generation;
                 scene.setPixelScale(win.scale);
@@ -904,6 +1036,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
             if (ev.key == .escape) {
                 win.closed = true;
                 break;
+            }
+            // Tab and Shift+Tab: `insertTab:` and `insertBacktab:` from the
+            // field, the same from the view's key bindings when nothing
+            // editable has focus.
+            if (ev.key == .tab and !ev.mods.anyAccel()) {
+                if (ui.focus.next(&at, focus.node, ev.mods.shift, focus.options())) |n| focus.set(n);
+                continue;
+            }
+            if (ui.focus.activates(&at, focus.node, ev)) {
+                focus.activate(focus.node);
+                continue;
             }
             unhandled += 1;
         }
@@ -988,6 +1131,84 @@ pub fn main(init: std.process.Init.Minimal) !void {
                 break;
             }
         }
+        // `--focus`: one step every eight frames from the twentieth, each
+        // checked at the next, as `--cursor` does. See `focus_steps`.
+        if (focus_test and frames >= 20 and frames % 8 == 4) {
+            scripted_frame = true;
+            if (focus_at > 0) {
+                const i = focus_at - 1;
+                const before = focus_before[0..focus_before_len];
+                const text_now = doc.text();
+                const on_field = focus.node == demo.editable_node and win.text != null and at.focus == demo.editable_node;
+                const ok = switch (i) {
+                    0 => focus.node == demo.button_node and win.text == null and at.focus == demo.button_node,
+                    1 => focus.activated == 1 and std.mem.eql(u8, text_now, before),
+                    2 => std.mem.eql(u8, text_now, before),
+                    3 => on_field,
+                    4 => on_field and std.mem.endsWith(u8, text_now, "â"),
+                    5 => focus.activated == 2 and on_field,
+                    6 => focus.activated == 2,
+                    7 => on_field,
+                    8 => focus.node == demo.button_node and win.text == null,
+                    9 => on_field and std.mem.startsWith(u8, text_now[doc.focus..], "vào"),
+                    else => unreachable,
+                };
+                if (!ok) focus_wrong += 1;
+                std.debug.print("  {s} -- {s}\n", .{ focus_steps[i], if (ok) "ok" else "WRONG" });
+            }
+            if (focus_at < focus_steps.len) {
+                const fb = t.bounds(demo.editable.?.field);
+                const bb = t.bounds(demo.button_el);
+                const button_mid: ui.Point = .{ .x = bb.x + bb.w / 2, .y = bb.y + bb.h / 2 };
+                const label: ui.Point = .{ .x = fb.x + 10, .y = fb.y - 40 };
+                switch (focus_at) {
+                    0 => win.sendKey(kVK_Tab, "\t", "\t", .{}),
+                    1 => {
+                        focus_before_len = doc.text().len;
+                        @memcpy(focus_before[0..focus_before_len], doc.text());
+                        win.sendKey(kVK_Space, " ", " ", .{});
+                    },
+                    // Through the input source, as a person types: with no
+                    // input context it reaches the application as a key.
+                    2 => win.sendKeyCode(letterCode('x'), .{}),
+                    3 => win.sendKey(kVK_Tab, "\x19", "\t", .{ .shift = true }),
+                    4 => {
+                        win.sendKeyCode(letterCode('a'), .{});
+                        win.sendKeyCode(letterCode('a'), .{});
+                    },
+                    5 => {
+                        win.sendMouse(button_mid, .down, 1, false);
+                        win.sendMouse(button_mid, .up, 1, false);
+                    },
+                    6 => {
+                        win.sendMouse(button_mid, .down, 1, false);
+                        win.sendMouse(label, .dragged, 1, false);
+                        win.sendMouse(label, .up, 1, false);
+                    },
+                    7 => {
+                        win.sendMouse(label, .down, 1, false);
+                        win.sendMouse(label, .up, 1, false);
+                    },
+                    8 => win.sendKey(kVK_Tab, "\t", "\t", .{}),
+                    // Its own step: a key is queued for the frame and a
+                    // click is handled as it arrives, so a Tab and a click
+                    // in one frame happen click first.
+                    9 => {
+                        const vao = std.mem.indexOf(u8, doc.text(), "vào").?;
+                        const r = demo.editableRangeRect(&t, .{ .start = vao, .end = vao + 1 });
+                        const p: ui.Point = .{ .x = r.x + 1, .y = r.y + r.h / 2 };
+                        win.sendMouse(p, .down, 1, false);
+                        win.sendMouse(p, .up, 1, false);
+                    },
+                    else => unreachable,
+                }
+                focus_at += 1;
+            } else {
+                std.debug.print("{d} steps, {d} wrong; {d} button presses, {d} mouse presses taken by the input method\n", .{ focus_steps.len, focus_wrong, focus.activated, win.ime.presses_to_input_method });
+                if (focus_wrong > 0) return error.FocusScriptDiverged;
+                break;
+            }
+        }
         // `--resize`: the window's corner dragged 240 by 140 points in 30
         // steps, through AppKit's own resize loop. `sendResizeDrag` returns
         // only when the drag is over -- the frame loop is stopped for all of
@@ -1055,8 +1276,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
             if (since > 10_000_000_000) break;
         }
         if (demo.editable) |ed| {
-            if (win.focused != caret_visible) {
-                caret_visible = win.focused;
+            const show_caret = win.focused and focus.node == demo.editable_node;
+            if (show_caret != caret_visible) {
+                caret_visible = show_caret;
                 t.setPaint(ed.caret.box, .{
                     .background = if (caret_visible) demo.caret_color else ui.Color.rgba(0, 0, 0, 0),
                 });

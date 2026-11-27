@@ -135,6 +135,10 @@ pub const Window = struct {
     /// The press being dragged, if a mouse button is down in the text target.
     gesture: ?ui.editing.Gesture = null,
 
+    /// Told about every press, drag and release in the content before the
+    /// text target is. See `setPointerHook`.
+    pointer_hook: ?PointerHook = null,
+
     /// The cursor the application wants over this window. See `setCursor`.
     cursor: ui.Cursor = .arrow,
     /// Times the cursor had to be set: because the application changed its
@@ -520,6 +524,13 @@ pub const Window = struct {
         return .{ .frame = frame, .main_height = send(objc.CGRect, main, "frame", .{}).size.height };
     }
 
+    /// Whether the user has turned on keyboard navigation (System Settings,
+    /// Keyboard), which is what makes Tab stop at buttons on a Mac. See
+    /// `ui.focus.Options`.
+    pub fn keyboardNavigation(self: *const Window) bool {
+        return objc.truthy(send(objc.BOOL, self.app, "isFullKeyboardAccessEnabled", .{}));
+    }
+
     /// The cursor to show while the pointer is over this window's content.
     ///
     /// The application decides, because only it knows what is under the
@@ -590,6 +601,35 @@ pub const Window = struct {
     }
 
     pub const MouseKind = enum { down, dragged, up };
+
+    /// A left-button event in the content, in layout units.
+    pub const PointerEvent = struct {
+        kind: MouseKind,
+        p: ui.Point,
+        clicks: u32 = 1,
+        shift: bool = false,
+    };
+
+    pub const PointerHook = struct {
+        ctx: ?*anyopaque,
+        event: *const fn (ctx: ?*anyopaque, w: *Window, ev: PointerEvent) void,
+    };
+
+    /// Tells the application about every press, drag and release in the
+    /// content -- buttons, labels, the background, the text field -- and
+    /// *before* the text target sees it.
+    ///
+    /// Before, because a press is where focus moves. A click on a text field
+    /// that does not have focus has to give it focus and place the caret, in
+    /// that order, in one event: the application attaches the field as the
+    /// text target from inside this call, and the press then reaches it. Told
+    /// afterwards, the first click on an unfocused field would only focus it.
+    /// The input method still sees a press first, when one is attached,
+    /// because a click inside its composition is its business and not the
+    /// application's.
+    pub fn setPointerHook(self: *Window, h: ?PointerHook) void {
+        self.pointer_hook = h;
+    }
 
     /// A left-button event at a point in layout units, delivered through
     /// AppKit like `sendKey`: to the window, the view, and the input method,
@@ -846,6 +886,8 @@ fn viewClass() Error!objc.Class {
         try b.method("viewDidEndLiveResize", &didEndLiveResize, "v@:");
         try b.method("mouseDragged:", &mouseDragged, "v@:@");
         try b.method("mouseUp:", &mouseUp, "v@:@");
+        try b.method("inputContext", &inputContext, "@@:");
+        try b.method("insertText:", &insertTextPlain, "v@:@");
 
         try b.method("insertText:replacementRange:", &insertText, "v@:@" ++ R);
         try b.method("setMarkedText:selectedRange:replacementRange:", &setMarkedText, "v@:@" ++ R ++ R);
@@ -1108,13 +1150,31 @@ fn toInputMethod(self: id, event: id) bool {
     return objc.truthy(send(objc.BOOL, ctx, "handleEvent:", .{event}));
 }
 
+/// Where a mouse event is, in layout units.
+fn layoutPointOf(w: *Window, event: id) ui.Point {
+    const loc = send(objc.CGPoint, event, "locationInWindow", .{});
+    const v = send(objc.CGPoint, w.view, "convertPoint:fromView:", .{ loc, @as(?id, null) });
+    const bounds = send(objc.CGRect, w.view, "bounds", .{});
+    return .{ .x = @floatCast(v.x), .y = @floatCast(bounds.size.height - v.y) };
+}
+
+fn toApplication(w: *Window, event: id, kind: Window.MouseKind) void {
+    const h = w.pointer_hook orelse return;
+    const clicks: u32 = @intCast(@max(1, send(objc.NSInteger, event, "clickCount", .{})));
+    const flags = send(objc.NSUInteger, event, "modifierFlags", .{});
+    h.event(h.ctx, w, .{ .kind = kind, .p = layoutPointOf(w, event), .clicks = clicks, .shift = flags & (1 << 17) != 0 });
+}
+
 fn mouseDown(self: id, _: objc.SEL, event: id) callconv(.c) void {
     const w = stateOf(self) orelse return;
-    const t = w.text orelse return;
-    if (toInputMethod(self, event)) {
+    if (w.text != null and toInputMethod(self, event)) {
         w.ime.presses_to_input_method += 1;
         return;
     }
+    // The application first, which may move focus and so change the text
+    // target. See `setPointerHook`.
+    toApplication(w, event, .down);
+    const t = w.text orelse return;
     const at = hitOf(w, event, false) orelse return;
     // The input method declined the click, so the composition ends where it
     // stands: committed, and the input method told to drop its state. This
@@ -1141,8 +1201,9 @@ fn mouseDown(self: id, _: objc.SEL, event: id) callconv(.c) void {
 
 fn mouseDragged(self: id, _: objc.SEL, event: id) callconv(.c) void {
     const w = stateOf(self) orelse return;
+    if (w.text != null and toInputMethod(self, event)) return;
+    toApplication(w, event, .dragged);
     const t = w.text orelse return;
-    if (toInputMethod(self, event)) return;
     const g = w.gesture orelse return;
     const at = hitOf(w, event, true) orelse return;
     const res = ui.editing.drag(t.doc, g, at) catch return;
@@ -1151,8 +1212,32 @@ fn mouseDragged(self: id, _: objc.SEL, event: id) callconv(.c) void {
 
 fn mouseUp(self: id, _: objc.SEL, event: id) callconv(.c) void {
     const w = stateOf(self) orelse return;
-    _ = toInputMethod(self, event);
+    if (w.text != null) _ = toInputMethod(self, event);
+    toApplication(w, event, .up);
     w.gesture = null;
+}
+
+/// `NSResponder`'s `insertText:`, the one-argument form, which is what the
+/// key bindings call when there is no input context -- that is, while nothing
+/// editable has focus (`inputContext` below). Without it, Space with a button
+/// focused went up the responder chain and was lost: measured, by `--focus`.
+fn insertTextPlain(self: id, sel: objc.SEL, string: id) callconv(.c) void {
+    insertText(self, sel, string, ic.Utf16Range.none);
+}
+
+/// No input context while nothing editable has focus.
+///
+/// AppKit routes keys through the first responder's input context, and the
+/// view is the first responder whichever element has focus inside it. With
+/// a button focused, Vietnamese Telex would otherwise go on composing --
+/// reading context from a document nobody is editing, and turning Space into
+/// part of a word instead of a press. Returning nil makes `interpretKeyEvents:`
+/// run the key bindings alone, so Space is `insertText:` and Tab is
+/// `insertTab:`, both of which reach the application as keys.
+fn inputContext(self: id, _: objc.SEL) callconv(.c) ?id {
+    const w = stateOf(self) orelse return null;
+    if (w.text == null) return null;
+    return objc.sendSuper(?id, self, view_class.?, "inputContext", .{});
 }
 
 fn characterIndex(self: id, _: objc.SEL, screen: objc.CGPoint) callconv(.c) objc.NSUInteger {

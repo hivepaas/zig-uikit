@@ -593,11 +593,13 @@ pub const Tree = struct {
     ///
     /// What this does NOT respect is `Paint.layer`. A layered subtree paints
     /// over whatever is beneath it but is not hit first here, so a tooltip
-    /// drawn over a button does not yet intercept the click. Getting that right
-    /// means testing in the order things were actually painted, which is the
-    /// order `Scene` already holds, against the clip each primitive already
-    /// carries. So it belongs to a scene-driven hit test and is left undone
-    /// rather than approximated here.
+    /// drawn over a button does not intercept the click -- and a popover
+    /// hanging outside the element that owns it is never reached at all,
+    /// because the descent only enters what contains the point. Getting that
+    /// right means testing in the order things were actually painted, against
+    /// the clip each primitive carries, which is `Scene.hitTest`. Use that for
+    /// a click; this stays for hover, which runs every frame and wants the
+    /// binary search.
     /// A container's children, in order. Empty until the first `layout`.
     pub fn childrenOf(self: *const Tree, el: Index) []const Index {
         if (self.child_off.items.len <= el + 1) return &.{};

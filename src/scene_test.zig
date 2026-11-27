@@ -314,6 +314,45 @@ test "entering a layer escapes the clip it was inside" {
     try expectRect(.{ .x = 0, .y = 0, .w = 1000, .h = 600 }, sc.items()[0].clipRect());
 }
 
+test "a click hits the popover over a control, and not what is clipped away" {
+    // The tree's own hit test descends by containment and ignores layers, so
+    // it answers with the control *under* the popover -- and never reaches a
+    // popover that hangs outside the element that owns it. The scene knows
+    // what was painted on top.
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    t.setPaint(t.root(), .{ .background = Color.white });
+    const owner = try t.appendChild(t.root(), .{ .axis = .col, .width = .{ .fixed = 40 }, .height = .{ .fixed = 20 } });
+    const under = try t.appendChild(t.root(), .{ .width = .{ .fixed = 200 }, .height = .{ .fixed = 200 } });
+    t.setPaint(under, .{ .background = red });
+    const pop = try t.appendChild(owner, .{ .position = .absolute, .left = 10, .top = 30, .width = .{ .fixed = 100 }, .height = .{ .fixed = 50 } });
+    t.setPaint(pop, .{ .background = green, .layer = ui.layers.popover });
+    // A list clipping a row that is scrolled half out of it.
+    const list = try t.appendChild(t.root(), .{ .axis = .col, .width = .{ .fixed = 100 }, .height = .{ .fixed = 40 } });
+    t.setPaint(list, .{ .clip_children = true });
+    const row = try t.appendChild(list, .{ .width = .{ .fixed = 100 }, .height = .{ .fixed = 80 }, .flex_shrink = 0 });
+    t.setPaint(row, .{ .background = blue });
+    t.layout(viewport);
+
+    var sc = Scene.init(testing.allocator);
+    defer sc.deinit();
+    _ = try sc.build(&t);
+
+    const in_pop: ui.Point = .{ .x = t.bounds(pop).x + 5, .y = t.bounds(pop).y + 5 };
+    try testing.expectEqual(@as(?Index, pop), sc.hitTest(in_pop));
+    try testing.expect(t.hitTest(in_pop) != pop);
+    // Beside the popover, the control beneath it.
+    const beside: ui.Point = .{ .x = t.bounds(under).x + 150, .y = t.bounds(under).y + 150 };
+    try testing.expectEqual(@as(?Index, under), sc.hitTest(beside));
+    // The row inside the list, and below the list's edge the row's lower
+    // half, which is not painted and is not hit.
+    const lb = t.bounds(list);
+    try testing.expectEqual(@as(?Index, row), sc.hitTest(.{ .x = lb.x + 5, .y = lb.y + 5 }));
+    try testing.expectEqual(@as(?Index, t.root()), sc.hitTest(.{ .x = lb.x + 5, .y = lb.y + lb.h + 10 }));
+    // Off every primitive.
+    try testing.expectEqual(@as(?Index, null), sc.hitTest(.{ .x = -5, .y = -5 }));
+}
+
 // ----------------------------------------------------- what it actually looks like
 
 fn render(t: *const Tree, w: u32, h: u32) !Framebuffer {

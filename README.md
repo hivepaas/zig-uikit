@@ -1787,6 +1787,90 @@ drag rule the third shows an arrow. `currentSystemCursor` returns a new object
 each time, so it is matched to an arrow or an I-beam by hot spot and image
 size.
 
+### Focus
+
+Two things take focus in the demo, the field and the popover's button, and
+`src/focus.zig` has the rules in core: where Tab goes, what a click does to
+focus, Space on a button, and a button pressed with the pointer. Six tests,
+no window.
+
+It runs **over the accessibility tree, not the layout tree.** What can take
+focus is exactly what a screen reader is told is focusable, so the two cannot
+disagree; the layout elements that are not things — a caret's boxes, a row's
+gap — are candidates for neither; and focus order is the accessibility tree's
+order, which is reading order. A press lands on the nearest registered node,
+so a click on the field's text is a click on the field.
+
+**The platforms disagree twice, and both are options.** On a Mac, Tab stops at
+buttons only when keyboard navigation is on (System Settings, Keyboard), and a
+click on a button presses it without taking focus from the field — a Mac user
+who clicks OK and goes on typing expects the text to land where it did. GTK and
+Windows do the opposite on both counts. `focus.Options.mac` is the first;
+the defaults are the second; the window asks AppKit for the setting at each
+Tab. A press on something that cannot take focus — a label, the background —
+leaves focus where it is, which every desktop platform does and a web page
+does not.
+
+A button **fires on a release over itself**, and a release anywhere else backs
+out of the click; while held it looks pressed only while letting go would
+press it. Space presses a focused button. Enter does not: in a dialog it means
+the default button wherever focus is, and that is the dialog's to decide.
+
+The window side is two hooks:
+
+- `Window.setPointerHook` tells the application about every press, drag and
+  release in the content **before the text target sees it**. A press is where
+  focus moves, so a click on the unfocused field has to focus it and place the
+  caret in one event: the application attaches the field from inside the hook
+  and the press reaches it. Run with the hook called afterwards, `--focus`'s
+  last step fails — the first click only focuses.
+- With nothing editable focused, the view has **no input context**. AppKit
+  sends keys through the first responder's input context, and the view is the
+  first responder whatever has focus inside it. Run with the context left
+  attached, Telex kept state from the keys it was given while the button had
+  focus, and later took a mouse press for itself — the click on the button
+  never arrived, and two steps fail. Without an input context, AppKit's key
+  bindings call `NSResponder`'s one-argument `insertText:` rather than
+  `insertText:replacementRange:`, and a view that implements only the second
+  loses Space: that was the first failure of the first run.
+
+**A click needs a hit test that knows about layers, and the tree's does not.**
+The button is in the popover, which hangs out of the sidebar row that owns it.
+`Tree.hitTest` descends by containment and never enters the popover, and
+ignores layers anyway, so the first run's clicks on the button landed on what
+was underneath. `Scene.hitTest` walks the primitives back to front in drawing
+order, inside each one's clip, and answers with the element painted frontmost —
+the hit test the tree's own comment had said belonged to the scene. It is
+linear in the primitives, which is fine once per click; hover, every frame,
+keeps the tree's binary search, and is still wrong over the popover.
+
+`--focus` runs with Telex as the input source, so that a letter typed with the
+button focused would compose if the input method were still attached, and so
+that composing again after Shift+Tab shows it came back:
+
+```
+  Tab moves focus to the button -- ok
+  Space presses it, and types no space -- ok
+  a letter with the button focused types nothing -- ok
+  Shift-Tab goes back to the field -- ok
+  Telex composes in it again: aa is â -- ok
+  a click on the button presses it and leaves focus in the field -- ok
+  a press on the button let go off it presses nothing -- ok
+  a click on a label leaves focus where it was -- ok
+  Tab away to the button -- ok
+  a click in the field focuses it and places the caret, in one click -- ok
+10 steps, 0 wrong; 2 button presses, 0 mouse presses taken by the input method
+```
+
+It forces Tab to stop at buttons whatever the setting, because it tests the
+order rather than this Mac's preferences. One ordering it found: keys are
+queued for the frame and a press is handled as it arrives, so a Tab and a
+click sent in the same frame happen click first. A person cannot do both in
+eight milliseconds; a script can, and the script now gives each its own step.
+
+Focus moves are also accessibility focus: the tree's focus follows, and
+`AXFocusedUIElementChanged` is posted.
+
 ### Accessibility on macOS
 
 `src/access.zig` is the internal accessibility tree that
@@ -1930,8 +2014,11 @@ clients.
   path is covered by `zig build test` and not by a live input method. Japanese
   or Chinese input would exercise it, and the candidate window would then be
   the first real test of `firstRectForCharacterRange:`.
-- Clicks anywhere but the field: there is no focus model to give them to, and
-  the button does nothing when clicked (an accessibility client can press it).
+- Hover over the popover: hover uses the tree's hit test, which does not know
+  about layers (see Focus), so there it finds what is under the popover.
+  Clicks use the scene's.
+- Focus on Linux. `src/focus.zig` is in core and the Wayland window does not
+  use it yet; its keyboard goes to the field whatever is clicked.
 - Cursor shapes beyond the two the toolkit asks for, and the cursor on Linux:
   `src/cursor.zig` names the Wayland shapes, and nothing sends them yet.
 - The process is not an application bundle, and the input method logs
