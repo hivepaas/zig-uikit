@@ -246,17 +246,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Scratch for `displayText`, which splices the preedit in at the caret.
     var shown: std.ArrayList(u8) = .empty;
     defer shown.deinit(gpa);
-    // The wrapped run and its line table. Owned here because `demo.editable`
-    // borrows them: they live as long as the field does.
-    var wrapped_glyphs: std.ArrayList(ui.Glyph) = .empty;
-    defer wrapped_glyphs.deinit(gpa);
-    var wrapped_lines: std.ArrayList(ui.text_layout.Line) = .empty;
-    defer wrapped_lines.deinit(gpa);
+    // The wrapped run, its line table and its direction spans. Owned here
+    // because `demo.editable` borrows them: they live as long as the field
+    // does.
+    var wrapped: ui.text_layout.Buffers = .{};
+    defer wrapped.deinit(gpa);
 
     // Wrap the field once before anything reads its geometry: `buildUi` set
     // the text unwrapped, and the bridge and the input method below both ask
     // where the caret is.
-    try demo.refreshEditable(&t, &fonts, &doc, &shown, &wrapped_glyphs, &wrapped_lines);
+    try demo.refreshEditable(&t, &fonts, &doc, &shown, &wrapped);
     _ = t.flush();
 
     // Where the candidate window should go. Surface coordinates, which is
@@ -489,7 +488,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         }
         if (text_dirty) {
             const e0 = nowNs();
-            demo.refreshEditable(&t, &fonts, &doc, &shown, &wrapped_glyphs, &wrapped_lines) catch |e| switch (e) {
+            demo.refreshEditable(&t, &fonts, &doc, &shown, &wrapped) catch |e| switch (e) {
                 // 512x512 holds thousands of glyphs at this size, so this
                 // needs a lot of distinct characters to reach. It is caught
                 // rather than propagated because losing the window over it

@@ -10,10 +10,10 @@ A declarative GPU UI toolkit for Zig.
 > There are no widgets. Expect the API to change without notice.
 
 ```sh
-zig build test                           # 231 tests, no platform dependencies
+zig build test                           # 235 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
-zig build test-text                      # 26 tests, needs a font installed
+zig build test-text                      # 27 tests, needs a font installed
 zig build test-input                     # 14 tests, needs xkbcommon and a layout
 zig build check-macos                    # type-checks the macOS sources, from Linux
 zig build test-gpu                       # Vulkan: 8 tests; Metal: 11 tests
@@ -239,7 +239,7 @@ discovered later.
 
 ## Text
 
-`zig build test-text` — 15 tests, and they need a font installed, which is why
+`zig build test-text` — 27 tests, and they need a font installed, which is why
 they are not in `zig build test`.
 
 **HarfBuzz is in the first slice of text, not a later one.** The tempting
@@ -747,18 +747,63 @@ right-to-left character never reaches the algorithm:
 
 The second is three HarfBuzz buffers, the algorithm, and two fallback faces.
 
+**Breaking a line of it** is the other half, and it has to be done in the order
+the standard gives rather than the order that is convenient: resolve the
+paragraph, break it into lines, then reorder **each line**. A paragraph's
+visual order is not the concatenation of its lines' visual orders, so a line
+cannot be a slice of the shaped paragraph — assembling one from the glyphs
+whose clusters fall before the break takes glyphs from all over it.
+
+So `text_layout.wrap` has a second path. It measures a candidate line by
+summing advances in logical order, because the x of a byte is not monotonic in
+the byte and the distance between two carets is therefore not the width of the
+text between them — it can come out negative. Then it clips each of the
+paragraph's direction runs to the chosen line, reorders the clipped pieces by
+rule **L2**, and copies each one's glyphs in at the pen the pieces before it
+left. The glyphs *within* a piece keep their relative positions, so this is a
+reorder and not a reshape: breaking inside a direction run does not change the
+shaping of either side for the scripts this draws. A `Line` carries its own
+stretches, so the caret arithmetic on a wrapped line is the same arithmetic as
+on a run — one `glyph.View` over a range of the paragraph's glyph array,
+written once and used by both.
+
+It also fixed a bug nobody had reported, because the old guard was narrower
+than the problem. A paragraph that is **entirely** right-to-left has one
+direction run, so it was not "mixed" and took the slicing path — where the
+clusters descend, no glyph's cluster is below the first break, every line came
+out empty, and the leftover clause put the whole paragraph on the last one.
+
+| | |
+| --- | --- |
+| break an already-shaped paragraph into lines | **11.3–11.8 us** |
+| break a mixed-direction paragraph of the same length | 11.9–12.1 us |
+
+Those two were measured together on a machine with a virtual machine using a
+core, so they are high against every other number here, which was measured
+idle; what the pair says is the part that is not sensitive to that. The mixed
+path costs about 4% more than the plain one, not a multiple of it: the sum
+over the glyphs it does per candidate break is small beside the breaking that
+both of them do.
+
+What is still approximate is the **trailing whitespace of a line in a
+right-to-left paragraph**. Rule L1 resets it to the paragraph's level, which
+puts it at the paragraph's trailing end; this puts it at the right-hand end,
+which is that rule for a left-to-right paragraph and an approximation for a
+right-to-left one — where, with no right-alignment, there is no trailing end
+for it to be at. The glyphs have no ink, so what moves is where a caret after
+them is drawn.
+
 ### What text does not do yet
 
-**Breaking a mixed-direction line.** Wrapping assembles each line from the
-glyphs whose clusters fall before the break, and in a mixed line the clusters
-are in visual order rather than logical, so that assembly would take glyphs
-from all over it. Doing it properly means breaking in logical order and then
-reordering each line, which is the order UAX #9 gives. Until then such a line
-is laid out whole: it may overflow, which is visible, rather than being
-assembled out of order, which is not. The caret inside it is still right,
-because the span table survives.
+**Aligning a paragraph.** Every line starts at the left edge, which is the
+wrong edge for a right-to-left paragraph: such a paragraph should be set
+against the right of its box, and until it is, the trailing whitespace of a
+wrapped line in one has nowhere correct to go (below). Centring and
+justification are the same missing thing. Nothing in the layout engine
+prevents it — a line knows its ink width and the box knows its own — and it is
+not done rather than half-done.
 
-Wrapping also needs a width given to it rather than discovered, and that is a
+Wrapping needs a width given to it rather than discovered, and that is a
 real limitation and not a simplification for the demo. The width a paragraph
 may use comes from layout, and layout needs the paragraph's size; resolving
 that needs a measure pass this engine does not have. A fixed-width container

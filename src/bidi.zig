@@ -406,32 +406,49 @@ pub fn runs(
         start = j;
     }
 
-    // --- L2: reverse, from the highest level down to the lowest odd one ---
-    var max_level: u8 = 0;
-    var min_odd: u8 = 255;
-    for (out.items) |r| {
-        max_level = @max(max_level, r.level);
-        if (r.level & 1 == 1) min_odd = @min(min_odd, r.level);
-    }
-    if (min_odd <= max_level) {
-        var lvl = max_level;
-        while (lvl >= min_odd) : (lvl -= 1) {
-            var k: usize = 0;
-            while (k < out.items.len) {
-                if (out.items[k].level < lvl) {
-                    k += 1;
-                    continue;
-                }
-                var j = k;
-                while (j < out.items.len and out.items[j].level >= lvl) j += 1;
-                std.mem.reverse(Run, out.items[k..j]);
-                k = j;
-            }
-            if (lvl == 0) break;
-        }
-    }
+    // --- L2 ---
+    reorder(Run, out.items);
 
     return para_dir;
+}
+
+/// Rule L2, on anything with a `level`: reverse any contiguous sequence at or
+/// above each level, from the highest down to the lowest odd one.
+///
+/// Generic over the element because it is needed twice. Once here, on a
+/// paragraph's runs. Once in `text_layout`, on the pieces of a *line* after
+/// the paragraph has been broken -- which is the whole reason the levels are
+/// carried on `glyph.Span` rather than a direction flag, and is work this is
+/// the only correct order for: the standard reorders each line, not the
+/// paragraph, and a line's first and last runs are not the paragraph's.
+///
+/// `items` must be in logical order going in, and comes out in visual order.
+pub fn reorder(comptime T: type, items: []T) void {
+    var max_level: u8 = 0;
+    var min_odd: u8 = 255;
+    for (items) |it| {
+        max_level = @max(max_level, it.level);
+        if (it.level & 1 == 1) min_odd = @min(min_odd, it.level);
+    }
+    // Nothing odd: every level runs left to right and logical order is
+    // already visual order.
+    if (min_odd > max_level) return;
+
+    var lvl = max_level;
+    while (lvl >= min_odd) : (lvl -= 1) {
+        var k: usize = 0;
+        while (k < items.len) {
+            if (items[k].level < lvl) {
+                k += 1;
+                continue;
+            }
+            var j = k;
+            while (j < items.len and items[j].level >= lvl) j += 1;
+            std.mem.reverse(T, items[k..j]);
+            k = j;
+        }
+        if (lvl == 0) break;
+    }
 }
 
 // ---------------------------------------------------------------------- tests

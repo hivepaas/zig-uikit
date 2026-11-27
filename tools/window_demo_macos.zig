@@ -118,13 +118,12 @@ const Field = struct {
     fonts: *demo.Fonts,
     doc: *ui.Document,
     shown: *std.ArrayList(u8),
-    glyphs: *std.ArrayList(ui.Glyph),
-    lines: *std.ArrayList(ui.text_layout.Line),
+    buf: *ui.text_layout.Buffers,
 
     /// Shapes and wraps the field again, and hands the text target the new
     /// line table -- `demo.editableLines` is null until the first wrap.
     fn refresh(self: *Field) !void {
-        try demo.refreshEditable(self.t, self.fonts, self.doc, self.shown, self.glyphs, self.lines);
+        try demo.refreshEditable(self.t, self.fonts, self.doc, self.shown, self.buf);
         if (self.win.text) |*tt| tt.options.lines = demo.editableLines();
     }
 };
@@ -428,20 +427,18 @@ fn linuxEquivalent(gpa: std.mem.Allocator, fonts: *demo.Fonts, width: f32) !ui.D
         doc: ui.Document,
         fonts: *demo.Fonts,
         width: f32,
-        glyphs: std.ArrayList(ui.Glyph) = .empty,
-        lines: std.ArrayList(ui.text_layout.Line) = .empty,
+        buf: ui.text_layout.Buffers = .{},
         goal_x: ?f32 = null,
 
         fn key(self: *@This(), ev: ui.KeyEvent) !void {
             const one = try self.fonts.ui.shape(&self.fonts.atlas, self.doc.text());
-            const w = try ui.text_layout.wrap(self.gpa, one, self.doc.text(), self.width, self.fonts.ui.line_height, &self.glyphs, &self.lines);
+            const w = try ui.text_layout.wrap(self.gpa, one, self.doc.text(), self.width, self.fonts.ui.line_height, &self.buf);
             const r = try ui.editing.apply(&self.doc, ev, .{ .lines = &w, .goal_x = self.goal_x });
             self.goal_x = r.goal_x;
         }
     };
     var rp: Replay = .{ .gpa = gpa, .doc = ui.Document.init(gpa), .fonts = fonts, .width = width };
-    defer rp.glyphs.deinit(gpa);
-    defer rp.lines.deinit(gpa);
+    defer rp.buf.deinit(gpa);
     errdefer rp.doc.deinit();
     _ = try rp.doc.insert(.application, demo.editable_initial);
     const ctrl: ui.Mods = .{ .ctrl = true };
@@ -844,12 +841,10 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // both shapes is the point of that function.
     var shown: std.ArrayList(u8) = .empty;
     defer shown.deinit(gpa);
-    // The field's wrapped run and its line table. Owned here because
-    // `demo.editable` borrows them for as long as the field exists.
-    var wrapped_glyphs: std.ArrayList(ui.Glyph) = .empty;
-    defer wrapped_glyphs.deinit(gpa);
-    var wrapped_lines: std.ArrayList(ui.text_layout.Line) = .empty;
-    defer wrapped_lines.deinit(gpa);
+    // The field's wrapped run, line table and direction spans. Owned here
+    // because `demo.editable` borrows them for as long as the field exists.
+    var wrapped: ui.text_layout.Buffers = .{};
+    defer wrapped.deinit(gpa);
     _ = try doc.insert(.application, demo.editable_initial);
     var field: Field = .{
         .win = win,
@@ -857,8 +852,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
         .fonts = &fonts,
         .doc = &doc,
         .shown = &shown,
-        .glyphs = &wrapped_glyphs,
-        .lines = &wrapped_lines,
+        .buf = &wrapped,
     };
     win.setTextTarget(fieldTarget(&field));
     defer win.setTextTarget(null);

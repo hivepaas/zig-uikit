@@ -895,16 +895,14 @@ test "a double-click on the right half of a word's last letter selects that word
 
 const Laid = struct {
     src: std.ArrayList(glyph_mod.Glyph) = .empty,
-    gl: std.ArrayList(glyph_mod.Glyph) = .empty,
-    ln: std.ArrayList(text_layout.Line) = .empty,
+    buf: text_layout.Buffers = .{},
     w: text_layout.Wrapped = undefined,
 
     const advance = 10;
 
     fn deinit(self: *Laid) void {
         self.src.deinit(testing.allocator);
-        self.gl.deinit(testing.allocator);
-        self.ln.deinit(testing.allocator);
+        self.buf.deinit(testing.allocator);
     }
 
     fn of(self: *Laid, s: []const u8, max_width: f32) !*const text_layout.Wrapped {
@@ -934,7 +932,7 @@ const Laid = struct {
             .ascent = 8,
             .descent = 2,
         };
-        self.w = try text_layout.wrap(testing.allocator, run, s, max_width, 12, &self.gl, &self.ln);
+        self.w = try text_layout.wrap(testing.allocator, run, s, max_width, 12, &self.buf);
         return &self.w;
     }
 };

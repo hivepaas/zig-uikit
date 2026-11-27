@@ -398,6 +398,34 @@ pub fn main() !void {
             for (0..iters) |_| _ = try font.shape(&atlas, mixed);
             report("shape a mixed-direction line", nowNs() - t0, iters, "three runs, and the algorithm");
         }
+        {
+            // Breaking, which is a separate pass over the shaped run -- and
+            // two different passes. Plain text slices the paragraph and
+            // measures a prefix by subtracting two caret positions; mixed
+            // text assembles each line out of reordered pieces and measures
+            // by summing advances, which is a pass over the glyphs per
+            // candidate break. The second number is what that costs, on a
+            // paragraph of about the same length.
+            const plain = "tìm một đoạn văn đủ dài để phải ngắt ra nhiều dòng khác nhau";
+            const mix = "tìm một אבג דהו đủ dài để phải ngắt ra nhiều dòng khác nhau";
+            var buf: ui.text_layout.Buffers = .{};
+            defer buf.deinit(gpa);
+
+            const one_plain = try font.shape(&atlas, plain);
+            const width = one_plain.width / 3;
+            const iters = 20_000;
+            {
+                const t0 = nowNs();
+                for (0..iters) |_| _ = try ui.text_layout.wrap(gpa, one_plain, plain, width, font.line_height, &buf);
+                report("break a paragraph into lines", nowNs() - t0, iters, "already shaped; four lines");
+            }
+            {
+                const one_mixed = try font.shape(&atlas, mix);
+                const t0 = nowNs();
+                for (0..iters) |_| _ = try ui.text_layout.wrap(gpa, one_mixed, mix, width, font.line_height, &buf);
+                report("break a mixed-direction paragraph", nowNs() - t0, iters, "clip, reorder and place per line");
+            }
+        }
     }
 
     // --- raster ---

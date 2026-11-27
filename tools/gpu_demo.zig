@@ -76,12 +76,10 @@ pub fn main() !void {
     // the field outlives any block they could be scoped to.
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(gpa);
-    var wg: std.ArrayList(ui.Glyph) = .empty;
-    defer wg.deinit(gpa);
-    var wl: std.ArrayList(ui.text_layout.Line) = .empty;
-    defer wl.deinit(gpa);
+    var wbuf: ui.text_layout.Buffers = .{};
+    defer wbuf.deinit(gpa);
     if (fonts) |*f| {
-        try demo.refreshEditable(&t, f, &doc, &scratch, &wg, &wl);
+        try demo.refreshEditable(&t, f, &doc, &scratch, &wbuf);
         _ = t.flush();
     }
 

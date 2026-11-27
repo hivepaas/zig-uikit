@@ -288,8 +288,10 @@ pub const Font = struct {
         // Text with no right-to-left character in it -- nearly all of it --
         // takes the single-run path and never touches the algorithm.
         self.spans.clearRetainingCapacity();
+        var base_level: u8 = 0;
         if (ui.bidi.hasRtl(s)) {
-            _ = try ui.bidi.runs(self.gpa, s, null, &self.bidi_runs);
+            const para = try ui.bidi.runs(self.gpa, s, null, &self.bidi_runs);
+            base_level = if (para == .rtl) 1 else 0;
             for (self.bidi_runs.items) |r| {
                 const first = self.scratch.items.len;
                 try self.shapeRange(
@@ -310,13 +312,13 @@ pub const Font = struct {
                     .count = @intCast(self.scratch.items.len - first),
                     .start = @intCast(r.start),
                     .end = @intCast(r.end),
-                    .rtl = r.direction() == .rtl,
+                    .level = r.level,
                 });
             }
             // One run is one direction, which is what an empty table already
             // means. Keeping it empty is what lets every caller skip the
             // general case without a flag to check.
-            if (self.spans.items.len == 1 and !self.spans.items[0].rtl) {
+            if (self.spans.items.len == 1 and !self.spans.items[0].rtl()) {
                 self.spans.clearRetainingCapacity();
             }
         } else {
@@ -351,6 +353,7 @@ pub const Font = struct {
         return .{
             .glyphs = self.scratch.items,
             .spans = self.spans.items,
+            .base_level = base_level,
             .width = pen_x / self.scale,
             .ascent = max_ascent / self.scale,
             .descent = max_descent / self.scale,
@@ -613,18 +616,17 @@ pub const Font = struct {
     /// every glyph a pen position and a cluster, so the width of any prefix is a
     /// lookup. See `text_layout.zig` for when that is and is not the right trade.
     ///
-    /// `glyphs` and `lines` are the caller's, and the returned run borrows the
-    /// first -- `Tree.setText` copies it, which is the intended destination.
+    /// `buf` is the caller's, and the returned run borrows its glyphs --
+    /// `Tree.setText` copies them, which is the intended destination.
     pub fn shapeWrapped(
         self: *Font,
         atlas: *Atlas,
         s: []const u8,
         max_width: f32,
-        glyphs: *std.ArrayList(ui.Glyph),
-        lines: *std.ArrayList(ui.text_layout.Line),
+        buf: *ui.text_layout.Buffers,
     ) (Error || Allocator.Error)!ui.text_layout.Wrapped {
         const one = try self.shape(atlas, s);
-        return ui.text_layout.wrap(self.gpa, one, s, max_width, self.line_height, glyphs, lines);
+        return ui.text_layout.wrap(self.gpa, one, s, max_width, self.line_height, buf);
     }
 
     fn glyph(self: *Font, atlas: *Atlas, gid: u32) Error!Cached {
@@ -677,10 +679,9 @@ pub fn setWrappedText(
     atlas: *Atlas,
     s: []const u8,
     max_width: f32,
-    glyphs: *std.ArrayList(ui.Glyph),
-    lines: *std.ArrayList(ui.text_layout.Line),
+    buf: *ui.text_layout.Buffers,
 ) (Error || ui.Error)!ui.text_layout.Wrapped {
-    const w = try font.shapeWrapped(atlas, s, max_width, glyphs, lines);
+    const w = try font.shapeWrapped(atlas, s, max_width, buf);
     try t.setText(el, w.run);
     return w;
 }
@@ -1032,17 +1033,15 @@ test "a paragraph wraps between Vietnamese syllables, with a real font" {
     var atlas = try Atlas.init(testing.allocator, 256, 256);
     defer atlas.deinit();
 
-    var glyphs: std.ArrayList(ui.Glyph) = .empty;
-    defer glyphs.deinit(testing.allocator);
-    var lines: std.ArrayList(ui.text_layout.Line) = .empty;
-    defer lines.deinit(testing.allocator);
+    var buf: ui.text_layout.Buffers = .{};
+    defer buf.deinit(testing.allocator);
 
     const s = "tiếng Việt rất hay và rất khó sắp chữ cho đúng";
     const one = try font.shape(&atlas, s);
     const full_width = one.width;
 
     // A third of the natural width, so it has to break several times.
-    const w = try font.shapeWrapped(&atlas, s, full_width / 3, &glyphs, &lines);
+    const w = try font.shapeWrapped(&atlas, s, full_width / 3, &buf);
     try testing.expect(w.lines.len >= 3);
     try testing.expectEqual(@as(u32, @intCast(w.lines.len)), w.run.lines);
 
@@ -1068,6 +1067,92 @@ test "a paragraph wraps between Vietnamese syllables, with a real font" {
     // And the box is the stack, which is what makes an element sized for it.
     try testing.expect(w.run.height() > one.height());
     try testing.expectEqual(font.line_height, w.run.line_height);
+}
+
+test "a mixed-direction paragraph wraps, with a real font" {
+    // The hand-built runs in `text_layout.zig` say what each line should hold;
+    // this says the two halves fit together on real text. Hebrew comes from a
+    // fallback font, so the line's glyphs were produced by two faces and have
+    // to end up in one order.
+    var lib = try Library.init();
+    defer lib.deinit();
+    var font = try openSans(&lib, testing.allocator);
+    defer font.deinit();
+    var atlas = try Atlas.init(testing.allocator, 512, 512);
+    defer atlas.deinit();
+
+    var buf: ui.text_layout.Buffers = .{};
+    defer buf.deinit(testing.allocator);
+
+    const s = "shalom אבג and גדה again אבג end";
+    const one = try font.shape(&atlas, s);
+    try testing.expect(one.spans.len > 1);
+
+    const w = try font.shapeWrapped(&atlas, s, one.width / 3, &buf);
+    try testing.expect(w.lines.len >= 3);
+    try testing.expectEqual(@as(u32, @intCast(w.lines.len)), w.run.lines);
+
+    var seen: usize = 0;
+    for (w.lines) |ln| {
+        // Valid UTF-8 and whole characters, which a breaker that split a
+        // Hebrew letter in half would not produce.
+        try testing.expect(std.unicode.utf8ValidateSlice(s[ln.start..ln.end]));
+
+        // **Each line is in visual order**: its glyph indices run left to
+        // right. This is the assertion the old code could not have passed --
+        // slicing the paragraph's visual order gave lines whose glyphs jumped
+        // back and forth across the line, and it is invisible in a count.
+        const gs = w.run.glyphs[ln.first..][0..ln.count];
+        for (gs, 0..) |g, k| {
+            if (k > 0) try testing.expect(g.pen_x >= gs[k - 1].pen_x - 0.01);
+            // The line's offset is folded into `dy`, which is a bitmap top
+            // and not a baseline: the glyph's own bearing is in there too, so
+            // what can be said is that it is somewhere in this line's band.
+            try testing.expect(g.dy > ln.y - one.ascent - 0.01);
+            try testing.expect(g.dy < ln.y + w.run.line_height + one.descent);
+        }
+
+        // Its spans tile its glyphs, in that order.
+        var next = ln.first;
+        for (w.spans[ln.span_first..][0..ln.span_count]) |sp| {
+            try testing.expectEqual(next, sp.first);
+            next += sp.count;
+        }
+        try testing.expectEqual(ln.first + ln.count, next);
+        seen += ln.count;
+    }
+    // Nothing lost and nothing drawn twice -- the shape of the bug that
+    // duplicated a line when fallback and direction first met.
+    try testing.expectEqual(w.run.glyphs.len, seen);
+
+    // Every byte has a caret on the line that owns it, inside that line.
+    for (0..s.len) |b| {
+        const r = w.caret(b);
+        try testing.expect(r.x >= -0.01);
+        try testing.expect(r.x <= w.lines[w.lineOf(b)].width + 0.01);
+    }
+
+    // And a caret inside a Hebrew word still moves right to left: the second
+    // letter is to the left of the first.
+    const heb = std.mem.indexOf(u8, s, "אבג").?;
+    try testing.expect(w.caret(heb).x > w.caret(heb + 2).x);
+
+    // Two Hebrew words in one direction run go right to left as *words*
+    // too, which is the half of it a per-word reversal would get wrong --
+    // and the half that is hard to read off a 15-pixel screenshot, which is
+    // why it is asserted here instead.
+    const two = "abc אבג דהו xyz";
+    // Its own buffers: wrapping into `buf` again would leave `w` above
+    // pointing at glyphs that had been overwritten.
+    var pair_buf: ui.text_layout.Buffers = .{};
+    defer pair_buf.deinit(testing.allocator);
+    const pair = try font.shapeWrapped(&atlas, two, 1000, &pair_buf);
+    const first_word = std.mem.indexOf(u8, two, "אבג").?;
+    const second_word = std.mem.indexOf(u8, two, "דהו").?;
+    try testing.expect(pair.caret(first_word).x > pair.caret(second_word).x);
+    // The Latin on either side is in logical order around them.
+    try testing.expect(pair.caret(0).x < pair.caret(second_word).x);
+    try testing.expect(pair.caret(two.len).x > pair.caret(first_word).x);
 }
 
 test "a character the family lacks is shaped by a font that has it" {
@@ -1267,9 +1352,9 @@ test "the caret goes on the other side of right-to-left text" {
     const s = "abc אבג def";
     const run = try font.shape(&atlas, s);
     try testing.expectEqual(@as(usize, 3), run.spans.len);
-    try testing.expect(!run.spans[0].rtl);
-    try testing.expect(run.spans[1].rtl);
-    try testing.expect(!run.spans[2].rtl);
+    try testing.expect(!run.spans[0].rtl());
+    try testing.expect(run.spans[1].rtl());
+    try testing.expect(!run.spans[2].rtl());
 
     // The Latin before it still reads left to right.
     try testing.expect(run.caretX(0) < run.caretX(1));
@@ -1369,6 +1454,6 @@ test "text all one direction carries no table at all" {
     // left to right.
     const heb = try font.shape(&atlas, "אבג");
     try testing.expectEqual(@as(usize, 1), heb.spans.len);
-    try testing.expect(heb.spans[0].rtl);
+    try testing.expect(heb.spans[0].rtl());
     try testing.expect(heb.caretX(0) > heb.caretX(6));
 }

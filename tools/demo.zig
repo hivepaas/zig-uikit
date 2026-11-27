@@ -144,8 +144,7 @@ pub fn refreshEditable(
     fonts: *Fonts,
     doc: *const ui.Document,
     scratch: *std.ArrayList(u8),
-    glyphs: *std.ArrayList(ui.Glyph),
-    lines: *std.ArrayList(ui.text_layout.Line),
+    buf: *ui.text_layout.Buffers,
 ) !void {
     // `if (editable) |*p|` and not `&(editable orelse return)`: the second
     // takes the address of the unwrapped payload as an expression, and the
@@ -162,7 +161,7 @@ pub fn refreshEditable(
     // so it catches up immediately; it is a frame of staleness and not a
     // wrong answer that stays wrong.
     const avail = editableWrapWidth(t);
-    const w = try ui.text_layout.wrap(t.gpa, one, shown.text, avail, fonts.ui.line_height, glyphs, lines);
+    const w = try ui.text_layout.wrap(t.gpa, one, shown.text, avail, fonts.ui.line_height, buf);
     e.wrapped = w;
 
     // A field of one line centres its text; a field of several fills its
@@ -387,14 +386,12 @@ fn paragraph(
     }
     // The run is copied onto the element, so these live no longer than the
     // call.
-    var gl: std.ArrayList(ui.Glyph) = .empty;
-    defer gl.deinit(t.gpa);
-    var ls: std.ArrayList(ui.text_layout.Line) = .empty;
-    defer ls.deinit(t.gpa);
+    var wbuf: ui.text_layout.Buffers = .{};
+    defer wbuf.deinit(t.gpa);
 
     const e = try t.appendChild(parent, .{ .flex_shrink = 0 });
     t.setPaint(e, .{ .text_color = c });
-    _ = try text.setWrappedText(t, e, f.?, atlas.?, s, max_width, &gl, &ls);
+    _ = try text.setWrappedText(t, e, f.?, atlas.?, s, max_width, &wbuf);
     // One accessible node for the paragraph, not one per line: the lines are
     // a typesetting decision and a screen reader should not hear them.
     if (!access_mute) _ = try register(t, e, .{ .role = .static_text, .name = s });
@@ -628,6 +625,19 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
             ui_font,
             atlas,
             "Thư mục này nằm trong hộp cuộn nhưng vẫn vẽ được ra ngoài.",
+            popover_width - 2 * popover_padding,
+            bright,
+        );
+        // And one that mixes directions, because a line of it is not a slice
+        // of the paragraph: it is broken in logical order and then reordered
+        // per line. On screen the Hebrew reads right to left inside a
+        // Vietnamese sentence that reads left to right, across a break.
+        _ = try paragraph(
+            t,
+            pop,
+            ui_font,
+            atlas,
+            "Trộn hướng: אבג דהו וזח טיכ ở giữa câu.",
             popover_width - 2 * popover_padding,
             bright,
         );
@@ -873,11 +883,9 @@ pub fn main() !void {
     _ = try doc.insert(.application, editable_initial);
     var scratch: std.ArrayList(u8) = .empty;
     defer scratch.deinit(gpa);
-    var wg: std.ArrayList(ui.Glyph) = .empty;
-    defer wg.deinit(gpa);
-    var wl: std.ArrayList(ui.text_layout.Line) = .empty;
-    defer wl.deinit(gpa);
-    try refreshEditable(&t, &fonts, &doc, &scratch, &wg, &wl);
+    var wbuf: ui.text_layout.Buffers = .{};
+    defer wbuf.deinit(gpa);
+    try refreshEditable(&t, &fonts, &doc, &scratch, &wbuf);
     _ = t.flush();
 
     var sc = ui.Scene.init(gpa);
