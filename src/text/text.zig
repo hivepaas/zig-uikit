@@ -211,6 +211,10 @@ pub const Font = struct {
 
     /// The paragraph's direction runs, reused between calls.
     bidi_runs: std.ArrayList(ui.bidi.Run) = .empty,
+    /// The same runs as the shaped run carries them: glyph ranges rather than
+    /// byte ranges. Left empty for text that is all one direction, which is
+    /// what `TextRun.spans` takes to mean a single left-to-right stretch.
+    spans: std.ArrayList(ui.glyph.Span) = .empty,
 
     /// Fonts opened to cover characters this one does not have.
     ///
@@ -241,6 +245,7 @@ pub const Font = struct {
         self.cache.deinit(self.gpa);
         self.scratch.deinit(self.gpa);
         self.bidi_runs.deinit(self.gpa);
+        self.spans.deinit(self.gpa);
         self.gpa.free(self.path);
         c.hb_buffer_destroy(self.buf);
         c.hb_font_destroy(self.hb);
@@ -282,9 +287,11 @@ pub const Font = struct {
         //
         // Text with no right-to-left character in it -- nearly all of it --
         // takes the single-run path and never touches the algorithm.
+        self.spans.clearRetainingCapacity();
         if (ui.bidi.hasRtl(s)) {
             _ = try ui.bidi.runs(self.gpa, s, null, &self.bidi_runs);
             for (self.bidi_runs.items) |r| {
+                const first = self.scratch.items.len;
                 try self.shapeRange(
                     atlas,
                     s,
@@ -296,6 +303,21 @@ pub const Font = struct {
                     true,
                     r.direction(),
                 );
+                // The glyphs a direction run produced are contiguous, fallback
+                // included: a fallback appends into the same list in place.
+                try self.spans.append(self.gpa, .{
+                    .first = @intCast(first),
+                    .count = @intCast(self.scratch.items.len - first),
+                    .start = @intCast(r.start),
+                    .end = @intCast(r.end),
+                    .rtl = r.direction() == .rtl,
+                });
+            }
+            // One run is one direction, which is what an empty table already
+            // means. Keeping it empty is what lets every caller skip the
+            // general case without a flag to check.
+            if (self.spans.items.len == 1 and !self.spans.items[0].rtl) {
+                self.spans.clearRetainingCapacity();
             }
         } else {
             try self.shapeRange(atlas, s, 0, s.len, &pen_x, &max_ascent, &max_descent, true, .ltr);
@@ -328,6 +350,7 @@ pub const Font = struct {
 
         return .{
             .glyphs = self.scratch.items,
+            .spans = self.spans.items,
             .width = pen_x / self.scale,
             .ascent = max_ascent / self.scale,
             .descent = max_descent / self.scale,
@@ -1227,4 +1250,125 @@ test "Latin and Vietnamese take the path that never runs the algorithm" {
         try testing.expect(g.cluster >= last);
         last = g.cluster;
     }
+}
+
+test "the caret goes on the other side of right-to-left text" {
+    // Rendering mixed text correctly made the caret over it visibly wrong:
+    // before the first character of a right-to-left word is to its RIGHT,
+    // and the old arithmetic walked the glyphs assuming clusters ascend.
+    var lib = try Library.init();
+    defer lib.deinit();
+    var font = try openSans(&lib, testing.allocator);
+    defer font.deinit();
+    var atlas = try Atlas.init(testing.allocator, 512, 512);
+    defer atlas.deinit();
+
+    // "abc " then three Hebrew letters at bytes 4, 6, 8, then " def".
+    const s = "abc אבג def";
+    const run = try font.shape(&atlas, s);
+    try testing.expectEqual(@as(usize, 3), run.spans.len);
+    try testing.expect(!run.spans[0].rtl);
+    try testing.expect(run.spans[1].rtl);
+    try testing.expect(!run.spans[2].rtl);
+
+    // The Latin before it still reads left to right.
+    try testing.expect(run.caretX(0) < run.caretX(1));
+    try testing.expect(run.caretX(1) < run.caretX(4));
+
+    // Inside the Hebrew the caret moves LEFT as the offset grows, which is
+    // the whole point: byte 4 is the first Hebrew letter and sits rightmost.
+    try testing.expect(run.caretX(4) > run.caretX(6));
+    try testing.expect(run.caretX(6) > run.caretX(8));
+
+    // The caret before byte 4 is the right edge of the Hebrew stretch, and
+    // the caret at its end is the left edge -- so the whole stretch lies
+    // between the Latin on either side.
+    try testing.expect(run.caretX(3) <= run.caretX(10));
+    try testing.expect(run.caretX(10) < run.caretX(11));
+}
+
+test "a click in right-to-left text rounds to the right byte" {
+    var lib = try Library.init();
+    defer lib.deinit();
+    var font = try openSans(&lib, testing.allocator);
+    defer font.deinit();
+    var atlas = try Atlas.init(testing.allocator, 512, 512);
+    defer atlas.deinit();
+
+    const s = "abc אבג def";
+    const run = try font.shape(&atlas, s);
+
+    // Click on the middle of each Hebrew glyph: the character under the
+    // pointer is the one drawn there, whichever way the text runs. The x
+    // comes from the glyph and not from two carets, because at the edge of a
+    // direction run two carets are two different places.
+    for ([_]usize{ 4, 6, 8 }) |b| {
+        var mid: f32 = -1;
+        for (run.glyphs, 0..) |g, i| {
+            if (g.cluster != b) continue;
+            const right = if (i + 1 < run.glyphs.len) run.glyphs[i + 1].pen_x else run.width;
+            mid = (g.pen_x + right) * 0.5;
+        }
+        try testing.expect(mid >= 0);
+        try testing.expectEqual(b, run.clusterAt(mid, s.len));
+    }
+
+    // And they really are drawn in the opposite order from the bytes.
+    var x4: f32 = 0;
+    var x8: f32 = 0;
+    for (run.glyphs) |g| {
+        if (g.cluster == 4) x4 = g.pen_x;
+        if (g.cluster == 8) x8 = g.pen_x;
+    }
+    try testing.expect(x8 < x4);
+
+    // And a click rounds to a caret position that is a real character
+    // boundary, never into the middle of a letter.
+    var x: f32 = 0;
+    while (x < run.width) : (x += 1) {
+        const at = run.byteAt(x, s.len);
+        try testing.expect(at <= s.len);
+        try testing.expect(at == s.len or (s[at] & 0xC0) != 0x80);
+    }
+}
+
+test "a caret round-trips through its own x in mixed text" {
+    var lib = try Library.init();
+    defer lib.deinit();
+    var font = try openSans(&lib, testing.allocator);
+    defer font.deinit();
+    var atlas = try Atlas.init(testing.allocator, 512, 512);
+    defer atlas.deinit();
+
+    const s = "abc אבג def";
+    const run = try font.shape(&atlas, s);
+    // Every character boundary that is not a direction boundary -- those are
+    // two places on the screen for one offset, and the round trip can land on
+    // either.
+    for ([_]usize{ 0, 1, 2, 6, 8, 11, 12 }) |b| {
+        const x = run.caretX(b);
+        try testing.expectEqual(b, run.byteAt(x, s.len));
+    }
+}
+
+test "text all one direction carries no table at all" {
+    var lib = try Library.init();
+    defer lib.deinit();
+    var font = try openSans(&lib, testing.allocator);
+    defer font.deinit();
+    var atlas = try Atlas.init(testing.allocator, 512, 512);
+    defer atlas.deinit();
+
+    // The common case pays nothing: an empty table means one left-to-right
+    // stretch, and every caret function reads it that way.
+    const run = try font.shape(&atlas, "tiếng Việt");
+    try testing.expectEqual(@as(usize, 0), run.spans.len);
+    try testing.expect(run.caretX(0) < run.caretX(6));
+
+    // A line that is nothing but Hebrew does carry one, because it is not
+    // left to right.
+    const heb = try font.shape(&atlas, "אבג");
+    try testing.expectEqual(@as(usize, 1), heb.spans.len);
+    try testing.expect(heb.spans[0].rtl);
+    try testing.expect(heb.caretX(0) > heb.caretX(6));
 }

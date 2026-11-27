@@ -252,6 +252,7 @@ pub const Tree = struct {
     pub fn deinit(self: *Tree) void {
         for (self.els.items) |e| {
             if (e.text.glyphs.len > 0) self.gpa.free(e.text.glyphs);
+            if (e.text.spans.len > 0) self.gpa.free(e.text.spans);
         }
         self.els.deinit(self.gpa);
         self.pre.deinit(self.gpa);
@@ -427,10 +428,18 @@ pub const Tree = struct {
             &.{}
         else
             try self.gpa.dupe(Glyph, run.glyphs);
+        errdefer if (copy.len > 0) self.gpa.free(copy);
+        // The direction table is borrowed from the shaper too, and is empty
+        // for the text almost every element holds.
+        const spans = if (run.spans.len == 0)
+            &.{}
+        else
+            try self.gpa.dupe(glyph_mod.Span, run.spans);
 
         const e = &self.els.items[el];
         self.glyph_total -= e.text.glyphs.len;
         if (e.text.glyphs.len > 0) self.gpa.free(e.text.glyphs);
+        if (e.text.spans.len > 0) self.gpa.free(e.text.spans);
         // The whole run, with only the glyph slice replaced by the copy.
         //
         // Written out field by field first, which silently dropped the two
@@ -440,6 +449,7 @@ pub const Tree = struct {
         // `TextRun` safe by default instead of safe if someone remembers.
         e.text = run;
         e.text.glyphs = copy;
+        e.text.spans = spans;
         self.glyph_total += copy.len;
 
         try self.dirty.append(self.gpa, el);

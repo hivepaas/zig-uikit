@@ -10,10 +10,10 @@ A declarative GPU UI toolkit for Zig.
 > There are no widgets. Expect the API to change without notice.
 
 ```sh
-zig build test                           # 223 tests, no platform dependencies
+zig build test                           # 231 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
-zig build test-text                      # 22 tests, needs a font installed
+zig build test-text                      # 26 tests, needs a font installed
 zig build test-input                     # 14 tests, needs xkbcommon and a layout
 zig build check-macos                    # type-checks the macOS sources, from Linux
 zig build test-gpu                       # Vulkan: 8 tests; Metal: 11 tests
@@ -443,13 +443,38 @@ three times, and all four spikes answer it with a fixed rectangle — which is
 why their candidate windows appear in the wrong part of the screen. These are
 the functions that answer it properly.
 
-They are **left to right only**, and that is now the one place where it still
-matters. A mixed-direction line *renders* correctly — see "Bidirectional text"
-— but these three functions walk the glyphs assuming the clusters ascend, and
-in a mixed line they do not. The caret and the hit test are therefore wrong
-there, in the way they always were, while the drawing beside them is right.
-Fixing it means doing the arithmetic per direction run, which is a separate
-piece of work with the run table already in hand.
+They work in **mixed-direction text too**, and the rule that makes them is
+worth stating: in a right-to-left stretch the caret goes on the *other side*
+of the glyph. The caret before the first character of `אבג` is to the **right**
+of `א`, because that is where the text starts. A shaped run carries the
+direction stretches it was built from — `TextRun.spans`, empty for the text
+almost every element holds, which is taken to mean one left-to-right stretch —
+and the arithmetic reads them:
+
+| in `abc אבג def`, the caret before byte | x |
+| --- | --- |
+| 3, the space before the Hebrew | 25 |
+| 4, the first Hebrew letter | **54** |
+| 6 | 44 |
+| 8 | 35 |
+| 10, past the last Hebrew letter | 29, then 54 as the Latin starts |
+
+The clusters in such a run **descend** along the glyph array, so finding "the
+glyph whose cluster is the smallest at or after `b`" means scanning backwards.
+Scanning forwards finds the leftmost glyph instead and puts the caret at the
+far end of the word, which is what the first version did and what the table
+above was written down to catch.
+
+A click rounds the other way too: the left half of a letter means "after it"
+in right-to-left text, because the next letter is to its left.
+
+Two things are still not done. A **selection across a direction boundary** is
+not one rectangle, for the same reason one across a line break is not — the
+bytes between two offsets are not one stretch on screen. And a byte at a
+boundary has **two** valid caret positions, the end of one stretch and the
+start of the next; `caretX` takes the stretch that contains the offset, which
+keeps a caret moving forward as the offset grows and is one convention of
+several.
 
 `src/offsets.zig` is the other half, and it is §1 of the spec made executable:
 
@@ -724,9 +749,14 @@ The second is three HarfBuzz buffers, the algorithm, and two fallback faces.
 
 ### What text does not do yet
 
-The caret and the hit test in mixed-direction text; see "The caret" above.
-Rendering is correct and the arithmetic over it is not, which is a worse
-asymmetry than when neither was, and it is the next thing here.
+**Breaking a mixed-direction line.** Wrapping assembles each line from the
+glyphs whose clusters fall before the break, and in a mixed line the clusters
+are in visual order rather than logical, so that assembly would take glyphs
+from all over it. Doing it properly means breaking in logical order and then
+reordering each line, which is the order UAX #9 gives. Until then such a line
+is laid out whole: it may overflow, which is visible, rather than being
+assembled out of order, which is not. The caret inside it is still right,
+because the span table survives.
 
 Wrapping also needs a width given to it rather than discovered, and that is a
 real limitation and not a simplification for the demo. The width a paragraph

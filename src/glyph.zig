@@ -78,6 +78,23 @@ comptime {
 /// method and accessibility layers need (`docs/text-and-accessibility.md` §1)
 /// owns the bytes and indexes them in UTF-8, which is a different structure
 /// from this one and belongs beside it rather than inside it.
+/// One stretch of glyphs at a single direction, contiguous in visual order.
+pub const Span = struct {
+    /// Glyphs `[first, first + count)` of the run.
+    first: u32,
+    count: u32,
+    /// The byte range of the source string this stretch covers.
+    start: u32,
+    end: u32,
+    /// Whether the glyphs in it run right to left -- their clusters descend
+    /// where a left-to-right stretch's ascend.
+    rtl: bool,
+
+    pub fn last(self: Span) u32 {
+        return self.first + self.count;
+    }
+};
+
 pub const TextRun = struct {
     /// Const because nothing downstream of shaping mutates a glyph: layout
     /// reads the metrics, the scene builder reads the offsets. When a run is
@@ -106,6 +123,15 @@ pub const TextRun = struct {
     /// instead.
     ascent: f32 = 0,
     descent: f32 = 0,
+
+    /// The direction runs, in the order they are drawn.
+    ///
+    /// Empty means what nearly every run is: one stretch of left-to-right
+    /// text. Anything else is a mixed-direction line, where the glyphs are in
+    /// visual order and the clusters therefore are **not** monotonic -- which
+    /// is exactly what the three functions below would get wrong without
+    /// this.
+    spans: []const Span = &.{},
 
     /// How many lines the glyphs are stacked over. One for a run that has not
     /// been through `text_layout.wrap`.
@@ -157,11 +183,123 @@ pub const TextRun = struct {
     /// that corresponds to a byte. Splitting the advance proportionally is
     /// what a text editor does for a long ligature; it is a refinement of this
     /// and not a different answer.
-    pub fn caretX(self: TextRun, b: usize) f32 {
-        for (self.glyphs) |g| {
-            if (g.cluster >= b) return g.pen_x;
+    /// The spans, or the single left-to-right one an empty table stands for.
+    ///
+    /// One place to put the default, so that every function below is written
+    /// once for the general case rather than twice with a fast path that can
+    /// drift from it.
+    fn spansOf(self: TextRun, scratch: *[1]Span) []const Span {
+        if (self.spans.len > 0) return self.spans;
+        scratch[0] = .{
+            .first = 0,
+            .count = @intCast(self.glyphs.len),
+            .start = 0,
+            .end = if (self.glyphs.len == 0) 0 else std.math.maxInt(u32),
+            .rtl = false,
+        };
+        return scratch[0..1];
+    }
+
+    /// Where glyph `i` ends: where the next one starts, or the run's end.
+    fn edgeAfter(self: TextRun, i: usize) f32 {
+        return if (i + 1 < self.glyphs.len) self.glyphs[i + 1].pen_x else self.width;
+    }
+
+    /// The byte that follows the character glyph `i` of `sp` stands for, in
+    /// **logical** order.
+    ///
+    /// In a left-to-right stretch that is the next glyph along; in a
+    /// right-to-left one it is the previous, because the glyphs were laid out
+    /// in the opposite order from the bytes.
+    fn logicalNext(self: TextRun, sp: Span, i: usize) usize {
+        if (sp.rtl) {
+            return if (i > sp.first) self.glyphs[i - 1].cluster else sp.end;
         }
-        return self.width;
+        return if (i + 1 < sp.last()) self.glyphs[i + 1].cluster else sp.end;
+    }
+
+    /// Where a caret immediately before byte `b` sits, measured from the run's
+    /// origin.
+    ///
+    /// A byte inside a cluster resolves to that cluster's start. One glyph can
+    /// cover several bytes -- a ligature, or a precomposed character built
+    /// from a base and a mark -- and there is no position *inside* a glyph
+    /// that corresponds to a byte. Splitting the advance proportionally is
+    /// what a text editor does for a long ligature; it is a refinement of this
+    /// and not a different answer.
+    ///
+    /// **In a right-to-left stretch the caret goes on the other side of the
+    /// glyph.** Before the first character of `"אבג"` is to the *right* of
+    /// `א`, because that is where the text starts. Getting this backwards
+    /// puts the caret one character out and in the wrong direction, which is
+    /// what made it worth doing properly once the text itself drew correctly.
+    pub fn caretX(self: TextRun, b: usize) f32 {
+        var one: [1]Span = undefined;
+        const sp = spanFor(self.spansOf(&one), b) orelse return self.width;
+
+        // The glyph whose cluster is the smallest one at or after `b`. In a
+        // left-to-right stretch the clusters ascend along the array, so that
+        // is the first match going forwards; in a right-to-left one they
+        // **descend**, so it is the first match going backwards. Scanning
+        // forwards in a right-to-left stretch finds the leftmost glyph
+        // instead, and puts the caret at the far end of the word.
+        if (sp.rtl) {
+            var i = sp.last();
+            while (i > sp.first) {
+                i -= 1;
+                if (self.glyphs[i].cluster >= b) return self.edgeAfter(i);
+            }
+        } else {
+            var i = sp.first;
+            while (i < sp.last()) : (i += 1) {
+                if (self.glyphs[i].cluster >= b) return self.glyphs[i].pen_x;
+            }
+        }
+        // Past every cluster in the stretch: the logical end of it, which is
+        // its right edge going one way and its left edge going the other.
+        if (sp.count == 0) return self.width;
+        return if (sp.rtl)
+            self.glyphs[sp.first].pen_x
+        else
+            self.edgeAfter(sp.last() - 1);
+    }
+
+    /// The stretch a byte offset belongs to.
+    ///
+    /// A boundary between two directions is two valid caret positions -- the
+    /// end of one stretch and the start of the next are the same byte in
+    /// different places on the screen. This takes the stretch that *contains*
+    /// the offset, and falls back to the last one that ends at or before it,
+    /// which is the convention that keeps a caret moving forward through the
+    /// text as the offset grows.
+    fn spanFor(spans: []const Span, b: usize) ?Span {
+        for (spans) |sp| {
+            if (b >= sp.start and b < sp.end) return sp;
+        }
+        var best: ?Span = null;
+        for (spans) |sp| {
+            if (sp.end <= b) {
+                if (best == null or sp.end >= best.?.end) best = sp;
+            }
+        }
+        return best orelse (if (spans.len > 0) spans[0] else null);
+    }
+
+    /// The glyph `x` falls on, as an index, or null past either end.
+    fn glyphAt(self: TextRun, x: f32) ?usize {
+        if (self.glyphs.len == 0) return null;
+        if (x < self.glyphs[0].pen_x) return 0;
+        for (0..self.glyphs.len) |i| {
+            if (x < self.edgeAfter(i)) return i;
+        }
+        return null;
+    }
+
+    fn spanOfGlyph(spans: []const Span, i: usize) Span {
+        for (spans) |sp| {
+            if (i >= sp.first and i < sp.last()) return sp;
+        }
+        return spans[spans.len - 1];
     }
 
     /// The byte offset of the character *under* `x`: not rounded to an edge
@@ -171,40 +309,44 @@ pub const TextRun = struct {
     /// Before the first glyph, the first; past the end, `len`.
     pub fn clusterAt(self: TextRun, x: f32, len: usize) usize {
         if (self.glyphs.len == 0) return 0;
-        if (x < self.glyphs[0].pen_x) return self.glyphs[0].cluster;
-        for (self.glyphs, 0..) |g, i| {
-            const next_x = if (i + 1 < self.glyphs.len) self.glyphs[i + 1].pen_x else self.width;
-            if (x < next_x) return g.cluster;
-        }
-        return len;
+        const i = self.glyphAt(x) orelse return len;
+        return self.glyphs[i].cluster;
     }
 
     /// The byte offset a caret should move to for a click at `x`.
     ///
     /// Rounds to the nearer edge of whichever glyph `x` falls in, because a
     /// click in the left half of a letter means "before it" and in the right
-    /// half means "after it". Clicking past the end gives the end.
+    /// half means "after it" -- and in a right-to-left stretch those two
+    /// sentences swap, because the letter after this one is to its left.
     pub fn byteAt(self: TextRun, x: f32, len: usize) usize {
         if (self.glyphs.len == 0 or x <= 0) return 0;
-        for (self.glyphs, 0..) |g, i| {
-            const next_x = if (i + 1 < self.glyphs.len)
-                self.glyphs[i + 1].pen_x
-            else
-                self.width;
-            if (x >= next_x) continue;
-            const mid = (g.pen_x + next_x) * 0.5;
-            if (x < mid) return g.cluster;
-            return if (i + 1 < self.glyphs.len) self.glyphs[i + 1].cluster else len;
-        }
-        return len;
+        var one: [1]Span = undefined;
+        const spans = self.spansOf(&one);
+        const i = self.glyphAt(x) orelse return len;
+        const sp = spanOfGlyph(spans, i);
+        const g = self.glyphs[i];
+        const mid = (g.pen_x + self.edgeAfter(i)) * 0.5;
+        const near_side = x < mid;
+        const after = self.logicalNext(sp, i);
+        const at = if (sp.rtl) (if (near_side) after else g.cluster) else (if (near_side) g.cluster else after);
+        return @min(at, len);
     }
 
     /// The rectangle covering bytes `start..end`, relative to the run's
     /// origin. A zero-width rectangle is a caret; a wide one is a selection.
+    /// The rectangle covering bytes `start..end`, relative to the run's
+    /// origin. A zero-width rectangle is a caret; a wide one is a selection.
+    ///
+    /// **One rectangle**, so a selection that crosses a direction boundary is
+    /// not this: the bytes between two offsets are not one stretch on screen
+    /// when half of them run the other way. That wants a rectangle per span,
+    /// the way a selection across a line break already wants one per line,
+    /// and it is said here rather than approximated.
     pub fn rangeRect(self: TextRun, start: usize, end: usize) Rect {
         const x0 = self.caretX(@min(start, end));
         const x1 = self.caretX(@max(start, end));
-        return .{ .x = x0, .y = 0, .w = x1 - x0, .h = self.height() };
+        return .{ .x = @min(x0, x1), .y = 0, .w = @abs(x1 - x0), .h = self.height() };
     }
 };
 

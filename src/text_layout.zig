@@ -203,13 +203,27 @@ pub fn wrap(
     lines.clearRetainingCapacity();
     const lh = if (line_height > 0) line_height else src.height();
 
-    if (src.glyphs.len == 0 or text.len == 0) {
+    // A mixed-direction line is one line.
+    //
+    // The glyphs in one are in VISUAL order, so their clusters are not
+    // monotonic, and the loop below -- which fills a line with every glyph
+    // whose cluster is before the break -- would take glyphs from all over
+    // the line. Breaking mixed text properly means breaking in logical order
+    // and then reordering each line, which is the order UAX #9 gives and is a
+    // piece of work this does not do. A line that overflows is visible; one
+    // assembled out of order is not.
+    if (src.glyphs.len == 0 or text.len == 0 or src.spans.len > 1) {
+        // One line over everything there is. An empty run gives an empty
+        // line; a mixed-direction one gives a line that holds all of it, so
+        // that a caret and a hit test still have somewhere to look -- they
+        // are correct within the line, which is what `TextRun`'s span table
+        // is for, and it is only the *breaking* that is not done.
         try lines.append(gpa, .{
             .start = 0,
-            .end = 0,
+            .end = linebreak.trimTrailing(text, text.len),
             .first = 0,
-            .count = 0,
-            .width = 0,
+            .count = src.glyphs.len,
+            .width = src.width,
             .y = 0,
         });
         return .{ .run = src, .lines = lines.items };
@@ -647,4 +661,30 @@ test "a line's span is what a screen reader reads, and the space is on the line 
     try testing.expectEqual(@as(usize, 1), w.lineOwning(8));
     try testing.expectEqual(@as(usize, 1), w.lineOf(8));
     try testing.expectEqual(@as(usize, 1), w.lineOwning(s.len));
+}
+
+test "mixed-direction text is one line that holds all of it" {
+    // Breaking mixed text means breaking in logical order and reordering
+    // each line, which this does not do. What it must not do is produce a
+    // line assembled out of order, or an empty one that a caret cannot look
+    // in. One line, possibly overflowing, which is visible.
+    var b: Bits = .{};
+    defer b.deinit();
+    const s = "abc abc abc";
+    const src = try fakeRun(s, &b.src);
+    var mixed = src;
+    const spans = [_]glyph.Span{
+        .{ .first = 0, .count = 4, .start = 0, .end = 4, .rtl = false },
+        .{ .first = 4, .count = 7, .start = 4, .end = 11, .rtl = true },
+    };
+    mixed.spans = &spans;
+
+    const w = try wrap(testing.allocator, mixed, s, 2 * adv, 12, &b.gl, &b.ln);
+    try testing.expectEqual(@as(usize, 1), w.lines.len);
+    try testing.expectEqual(src.glyphs.len, w.lines[0].count);
+    try testing.expectEqual(s.len, w.lines[0].end);
+    try testing.expectEqual(src.width, w.lines[0].width);
+    // And the span table survived, so the caret inside the line is still
+    // right even though the line is too wide.
+    try testing.expectEqual(@as(usize, 2), w.run.spans.len);
 }
