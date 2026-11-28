@@ -416,13 +416,13 @@ pub fn main() !void {
             const iters = 20_000;
             {
                 const t0 = nowNs();
-                for (0..iters) |_| _ = try ui.text_layout.wrap(gpa, one_plain, plain, width, font.line_height, &buf);
+                for (0..iters) |_| _ = try ui.text_layout.wrap(gpa, one_plain, plain, &buf, .{ .width = width, .line_height = font.line_height });
                 report("break a paragraph into lines", nowNs() - t0, iters, "already shaped; four lines");
             }
             {
                 const one_mixed = try font.shape(&atlas, mix);
                 const t0 = nowNs();
-                for (0..iters) |_| _ = try ui.text_layout.wrap(gpa, one_mixed, mix, width, font.line_height, &buf);
+                for (0..iters) |_| _ = try ui.text_layout.wrap(gpa, one_mixed, mix, &buf, .{ .width = width, .line_height = font.line_height });
                 report("break a mixed-direction paragraph", nowNs() - t0, iters, "clip, reorder and place per line");
             }
         }

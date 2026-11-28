@@ -432,7 +432,10 @@ fn linuxEquivalent(gpa: std.mem.Allocator, fonts: *demo.Fonts, width: f32) !ui.D
 
         fn key(self: *@This(), ev: ui.KeyEvent) !void {
             const one = try self.fonts.ui.shape(&self.fonts.atlas, self.doc.text());
-            const w = try ui.text_layout.wrap(self.gpa, one, self.doc.text(), self.width, self.fonts.ui.line_height, &self.buf);
+            const w = try ui.text_layout.wrap(self.gpa, one, self.doc.text(), &self.buf, .{
+                .width = self.width,
+                .line_height = self.fonts.ui.line_height,
+            });
             const r = try ui.editing.apply(&self.doc, ev, .{ .lines = &w, .goal_x = self.goal_x });
             self.goal_x = r.goal_x;
         }

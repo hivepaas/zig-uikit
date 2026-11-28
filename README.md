@@ -10,7 +10,7 @@ A declarative GPU UI toolkit for Zig.
 > There are no widgets. Expect the API to change without notice.
 
 ```sh
-zig build test                           # 235 tests, no platform dependencies
+zig build test                           # 238 tests, no platform dependencies
 zig build demo                           # renders docs/demo.png in software
 zig build bench -Doptimize=ReleaseFast   # what it costs
 zig build test-text                      # 27 tests, needs a font installed
@@ -785,23 +785,55 @@ path costs about 4% more than the plain one, not a multiple of it: the sum
 over the glyphs it does per candidate break is small beside the breaking that
 both of them do.
 
-What is still approximate is the **trailing whitespace of a line in a
-right-to-left paragraph**. Rule L1 resets it to the paragraph's level, which
-puts it at the paragraph's trailing end; this puts it at the right-hand end,
-which is that rule for a left-to-right paragraph and an approximation for a
-right-to-left one — where, with no right-alignment, there is no trailing end
-for it to be at. The glyphs have no ink, so what moves is where a caret after
-them is drawn.
+### Setting a paragraph against an edge
+
+Everything above puts a line's glyphs in the right order; this is where the
+line goes. `text_layout.Align` is `start`, `end`, `left`, `right`, `center`,
+and **`start` is the default because it is the only one an application can
+choose without knowing which direction the text it was handed runs in**: the
+start of a right-to-left paragraph is its right-hand edge. A toolkit that made
+`left` the default would be asking every caller to answer a question about
+text it has never looked at.
+
+The offsets are added into the glyphs, in a second pass over the line, rather
+than carried beside them. A line's `y` was already baked in; had `x` not been,
+the scene builder, the caret, the hit test and the accessibility rectangles
+would each have had to add it, and one of them would have forgotten.
+
+Three decisions worth stating:
+
+- A line **wider than its box** starts at the box's left edge and overflows to
+  the right, whatever the alignment. Centring it would push its beginning off
+  the left, where nobody can read it; overflowing one way is visible.
+- Aligned text is **as wide as the box it was aligned in**, not as wide as its
+  widest line, because that is where its glyphs now are. Left-aligned text
+  keeps the ink width it always had, so nothing that was laid out before this
+  moved.
+- A width of zero still means "do not wrap", and then there is no box to align
+  in; the alignment is ignored rather than measured against nothing.
+
+And it finishes rule **L1**. The trailing whitespace of a wrapped line goes at
+the paragraph's *trailing* end, which for a right-to-left paragraph is its
+left — in front of the line's first character, hanging off the ink instead of
+indenting it. Until the line had a right edge to be set against, there was no
+honest place to put it: the previous commit put it on the right and said so.
+Now the caret before it is at the left end of the ink, which is where it
+belongs after every character on the line, and the caret before the line's
+first character is at the right end. Those two were the same x before.
+
+![a popover whose last paragraph is set against its right edge](docs/demo.png)
+
+The demo's popover ends with a Hebrew paragraph at `start`: it is set against
+the right, it wraps, and `zig` inside it still reads `zig`.
 
 ### What text does not do yet
 
-**Aligning a paragraph.** Every line starts at the left edge, which is the
-wrong edge for a right-to-left paragraph: such a paragraph should be set
-against the right of its box, and until it is, the trailing whitespace of a
-wrapped line in one has nowhere correct to go (below). Centring and
-justification are the same missing thing. Nothing in the layout engine
-prevents it — a line knows its ink width and the box knows its own — and it is
-not done rather than half-done.
+**Justifying a paragraph.** Alignment exists (below); justification does not.
+Stretching a line to reach both edges means deciding where the slack goes —
+between the words, inside them, or by stretching the glyphs themselves — and
+in a script with joined letters that is a shaping decision rather than a
+spacing one. It is a different piece of work, not a fifth value of the
+alignment enum, which is why it is not one.
 
 Wrapping needs a width given to it rather than discovered, and that is a
 real limitation and not a simplification for the demo. The width a paragraph

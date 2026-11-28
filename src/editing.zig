@@ -932,7 +932,7 @@ const Laid = struct {
             .ascent = 8,
             .descent = 2,
         };
-        self.w = try text_layout.wrap(testing.allocator, run, s, max_width, 12, &self.buf);
+        self.w = try text_layout.wrap(testing.allocator, run, s, &self.buf, .{ .width = max_width, .line_height = 12 });
         return &self.w;
     }
 };

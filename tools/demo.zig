@@ -161,7 +161,10 @@ pub fn refreshEditable(
     // so it catches up immediately; it is a frame of staleness and not a
     // wrong answer that stays wrong.
     const avail = editableWrapWidth(t);
-    const w = try ui.text_layout.wrap(t.gpa, one, shown.text, avail, fonts.ui.line_height, buf);
+    const w = try ui.text_layout.wrap(t.gpa, one, shown.text, buf, .{
+        .width = avail,
+        .line_height = fonts.ui.line_height,
+    });
     e.wrapped = w;
 
     // A field of one line centres its text; a field of several fills its
@@ -374,6 +377,7 @@ fn paragraph(
     s: []const u8,
     max_width: f32,
     c: Color,
+    alignment: ui.text_layout.Align,
 ) !Index {
     if (f == null or atlas == null) {
         const e = try t.appendChild(parent, .{
@@ -391,7 +395,7 @@ fn paragraph(
 
     const e = try t.appendChild(parent, .{ .flex_shrink = 0 });
     t.setPaint(e, .{ .text_color = c });
-    _ = try text.setWrappedText(t, e, f.?, atlas.?, s, max_width, &wbuf);
+    _ = try text.setWrappedText(t, e, f.?, atlas.?, s, &wbuf, .{ .width = max_width, .alignment = alignment });
     // One accessible node for the paragraph, not one per line: the lines are
     // a typesetting decision and a screen reader should not hear them.
     if (!access_mute) _ = try register(t, e, .{ .role = .static_text, .name = s });
@@ -627,6 +631,7 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
             "Thư mục này nằm trong hộp cuộn nhưng vẫn vẽ được ra ngoài.",
             popover_width - 2 * popover_padding,
             bright,
+            .start,
         );
         // And one that mixes directions, because a line of it is not a slice
         // of the paragraph: it is broken in logical order and then reordered
@@ -640,6 +645,22 @@ pub fn buildUi(t: *Tree, fonts: ?*Fonts) !void {
             "Trộn hướng: אבג דהו וזח טיכ ở giữa câu.",
             popover_width - 2 * popover_padding,
             bright,
+            .start,
+        );
+        // A paragraph that *starts* right-to-left, so `.start` is its right
+        // edge: it is set against the right of the popover, it wraps, and the
+        // space the break consumed hangs off the left of the second line
+        // rather than indenting it. All three were wrong a commit ago -- the
+        // last two did not exist and the first put every line on the left.
+        _ = try paragraph(
+            t,
+            pop,
+            ui_font,
+            atlas,
+            "אבג דהו וזח טיכ zig למנ סעפ צקר שת אבג דהו",
+            popover_width - 2 * popover_padding,
+            bright,
+            .start,
         );
         const ok = try t.appendChild(pop, .{
             .height = .{ .fixed = 24 },

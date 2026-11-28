@@ -622,11 +622,15 @@ pub const Font = struct {
         self: *Font,
         atlas: *Atlas,
         s: []const u8,
-        max_width: f32,
         buf: *ui.text_layout.Buffers,
+        opts: ui.text_layout.Options,
     ) (Error || Allocator.Error)!ui.text_layout.Wrapped {
         const one = try self.shape(atlas, s);
-        return ui.text_layout.wrap(self.gpa, one, s, max_width, self.line_height, buf);
+        // The font's line spacing unless the caller asked for one of its own,
+        // which is the only field of the options it is better placed to fill.
+        var o = opts;
+        if (o.line_height <= 0) o.line_height = self.line_height;
+        return ui.text_layout.wrap(self.gpa, one, s, buf, o);
     }
 
     fn glyph(self: *Font, atlas: *Atlas, gid: u32) Error!Cached {
@@ -678,10 +682,10 @@ pub fn setWrappedText(
     font: *Font,
     atlas: *Atlas,
     s: []const u8,
-    max_width: f32,
     buf: *ui.text_layout.Buffers,
+    opts: ui.text_layout.Options,
 ) (Error || ui.Error)!ui.text_layout.Wrapped {
-    const w = try font.shapeWrapped(atlas, s, max_width, buf);
+    const w = try font.shapeWrapped(atlas, s, buf, opts);
     try t.setText(el, w.run);
     return w;
 }
@@ -1041,7 +1045,7 @@ test "a paragraph wraps between Vietnamese syllables, with a real font" {
     const full_width = one.width;
 
     // A third of the natural width, so it has to break several times.
-    const w = try font.shapeWrapped(&atlas, s, full_width / 3, &buf);
+    const w = try font.shapeWrapped(&atlas, s, &buf, .{ .width = full_width / 3 });
     try testing.expect(w.lines.len >= 3);
     try testing.expectEqual(@as(u32, @intCast(w.lines.len)), w.run.lines);
 
@@ -1088,7 +1092,7 @@ test "a mixed-direction paragraph wraps, with a real font" {
     const one = try font.shape(&atlas, s);
     try testing.expect(one.spans.len > 1);
 
-    const w = try font.shapeWrapped(&atlas, s, one.width / 3, &buf);
+    const w = try font.shapeWrapped(&atlas, s, &buf, .{ .width = one.width / 3 });
     try testing.expect(w.lines.len >= 3);
     try testing.expectEqual(@as(u32, @intCast(w.lines.len)), w.run.lines);
 
@@ -1146,7 +1150,7 @@ test "a mixed-direction paragraph wraps, with a real font" {
     // pointing at glyphs that had been overwritten.
     var pair_buf: ui.text_layout.Buffers = .{};
     defer pair_buf.deinit(testing.allocator);
-    const pair = try font.shapeWrapped(&atlas, two, 1000, &pair_buf);
+    const pair = try font.shapeWrapped(&atlas, two, &pair_buf, .{ .width = 1000 });
     const first_word = std.mem.indexOf(u8, two, "אבג").?;
     const second_word = std.mem.indexOf(u8, two, "דהו").?;
     try testing.expect(pair.caret(first_word).x > pair.caret(second_word).x);

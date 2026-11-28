@@ -44,6 +44,50 @@ const Span = glyph.Span;
 const TextRun = glyph.TextRun;
 const Rect = geometry.Rect;
 
+/// Which edge of its box a paragraph's lines are set against.
+///
+/// `start` and `end` are the paragraph's own: the start of a right-to-left
+/// paragraph is its right-hand edge. They are the pair worth defaulting to,
+/// because an application that does not know which direction the text it was
+/// handed runs in still gets it right -- and almost no application knows.
+///
+/// Justification is not here. Stretching a line to both edges means deciding
+/// where the slack goes -- between words, inside them, or by stretching the
+/// glyphs -- and in a script with joined letters it is a shaping decision
+/// rather than a spacing one. It is a different piece of work, not a fifth
+/// value of this.
+pub const Align = enum {
+    start,
+    end,
+    left,
+    right,
+    center,
+
+    /// What it means for a paragraph at this embedding level: even levels run
+    /// left to right, odd ones right to left.
+    pub fn resolve(self: Align, base_level: u8) enum { left, right, center } {
+        const rtl = base_level & 1 == 1;
+        return switch (self) {
+            .left => .left,
+            .right => .right,
+            .center => .center,
+            .start => if (rtl) .right else .left,
+            .end => if (rtl) .left else .right,
+        };
+    }
+};
+
+/// What to break to, and how to set what comes out.
+pub const Options = struct {
+    /// The width to break at, and the box the lines are aligned in. Zero or
+    /// less means no limit: one line, and nothing to align it against.
+    width: f32,
+    /// The pitch to stack lines at. Zero takes the run's own height, which is
+    /// what a run with no font behind it has.
+    line_height: f32 = 0,
+    alignment: Align = .start,
+};
+
 pub const Line = struct {
     /// The byte range of the source text this line carries, trailing spaces
     /// included: they belong to the line that ends with them, which is what
@@ -53,6 +97,13 @@ pub const Line = struct {
     /// The line's glyphs, as a range into the wrapped run.
     first: usize,
     count: usize,
+    /// Where this line's ink starts, from the paragraph's left edge. Zero
+    /// unless the paragraph is aligned somewhere other than its left.
+    ///
+    /// Already added into the glyphs; it is kept because a hit test past the
+    /// end of a line needs to know where the line *is*, not only how wide it
+    /// is.
+    x: f32 = 0,
     /// Ink width, which is the width with the trailing spaces trimmed off.
     width: f32,
     /// The top of this line's box, from the paragraph's origin.
@@ -125,10 +176,10 @@ pub const Wrapped = struct {
                 scratch[0..1],
             .lo = ln.first,
             .hi = ln.first + ln.count,
-            // The ink, so that a click in the margin past the end of a line
-            // is past the end of the stretch rather than on the trailing
-            // space, which has an advance and nothing to see.
-            .right_edge = ln.width,
+            // Where the ink ends, so that a click in the margin past the end
+            // of a line is past the end of the stretch rather than on the
+            // trailing space, which has an advance and nothing to see.
+            .right_edge = ln.x + ln.width,
         };
     }
 
@@ -187,9 +238,11 @@ pub const Wrapped = struct {
         const i = self.lineAtY(y);
         const ln = self.lines[i];
         const past = if (i + 1 == self.lines.len) len else ln.end;
-        // The trailing spaces have glyphs and no ink to be under, and they
-        // sit past the ink whichever way the line runs.
-        if (ln.count == 0 or x >= ln.width) return past;
+        // The trailing spaces have glyphs and no ink to be under: past the
+        // ink of a left-to-right line, and hanging off the left of a
+        // right-to-left one, where they are before its first character.
+        if (ln.count == 0 or x >= ln.x + ln.width) return past;
+        if (x < ln.x and self.run.base_level & 1 == 1) return past;
         var one: [1]Span = undefined;
         return self.viewOfLine(i, &one).clusterAt(x) orelse past;
     }
@@ -242,7 +295,8 @@ pub const Wrapped = struct {
     }
 };
 
-/// Breaks `src` into lines no wider than `max_width`.
+/// Breaks `src` into lines no wider than `opts.width`, and sets them against
+/// the edge `opts.alignment` names.
 ///
 /// `buf` is cleared and filled; the returned run borrows its glyphs and the
 /// lines borrow its spans. A width of zero or less, or a run with no glyphs,
@@ -251,14 +305,14 @@ pub fn wrap(
     gpa: Allocator,
     src: TextRun,
     text: []const u8,
-    max_width: f32,
-    line_height: f32,
     buf: *Buffers,
+    opts: Options,
 ) Allocator.Error!Wrapped {
     buf.glyphs.clearRetainingCapacity();
     buf.lines.clearRetainingCapacity();
     buf.spans.clearRetainingCapacity();
-    const lh = if (line_height > 0) line_height else src.height();
+    const max_width = opts.width;
+    const lh = if (opts.line_height > 0) opts.line_height else src.height();
 
     if (src.glyphs.len == 0 or text.len == 0) {
         try buf.lines.append(gpa, .{
@@ -358,12 +412,41 @@ pub fn wrap(
         last.count = buf.glyphs.items.len - last.first;
     }
 
+    // --- alignment ---
+    //
+    // A second pass over the glyphs rather than an offset the scene builder
+    // would have to add: the offsets are already baked per line (`y` is), and
+    // everything downstream of this -- the scene builder, the caret, the hit
+    // test, the accessibility rectangles -- would otherwise each need to know
+    // about it and one of them would forget.
+    const how = opts.alignment.resolve(src.base_level);
+    if (max_width > 0 and how != .left) {
+        for (buf.lines.items) |*ln| {
+            const room = max_width - ln.width;
+            // A line wider than the box starts at the box's left edge and
+            // overflows to the right, whatever the alignment: overflowing one
+            // way is visible, and overflowing both ways is a line nobody can
+            // read the start of.
+            const shift = @max(0, if (how == .center) room / 2 else room);
+            if (shift == 0) continue;
+            ln.x = shift;
+            for (buf.glyphs.items[ln.first..][0..ln.count]) |*g| {
+                g.dx += shift;
+                g.pen_x += shift;
+            }
+        }
+    }
+
     return .{
         .run = .{
             .glyphs = buf.glyphs.items,
             .spans = buf.spans.items,
             .base_level = src.base_level,
-            .width = widest,
+            // Aligned text is as wide as the box it was aligned in, not as
+            // wide as its widest line: the glyphs were moved to the far edge
+            // of that box, and an element sized to the ink would clip them.
+            // Left-aligned text keeps the ink width it always had.
+            .width = if (how == .left) widest else @max(widest, max_width),
             .ascent = src.ascent,
             .descent = src.descent,
             .lines = @intCast(buf.lines.items.len),
@@ -431,10 +514,7 @@ fn placeLine(
     // an English word inside Hebrew inside an English paragraph is a level
     // nobody can recover from a flag.
     bidi.reorder(Span, buf.spans.items[span0..]);
-
-    var x: f32 = 0;
-    for (buf.spans.items[span0..]) |*p| emit(src, buf, p, &x, y);
-    const ink = x;
+    const n_ink = buf.spans.items.len - span0;
 
     // The trailing spaces the line owns, after everything else on it.
     //
@@ -452,7 +532,6 @@ fn placeLine(
     const tail_a: u32 = b0;
     const tail_b: u32 = if (last_line) std.math.maxInt(u32) else @intCast(chosen.next);
     if (tail_b > tail_a) {
-        const tail0 = buf.spans.items.len;
         for (order) |oi| {
             const sp = src.spans[oi];
             const a = @max(sp.start, tail_a);
@@ -471,10 +550,42 @@ fn placeLine(
                 .level = src.base_level,
             });
         }
-        for (buf.spans.items[tail0..]) |*p| emit(src, buf, p, &x, y);
     }
 
+    const pieces = buf.spans.items[span0..];
+    const n_tail = pieces.len - n_ink;
+    const rtl_para = src.base_level & 1 == 1;
+
+    // The rest of rule L1: the trailing whitespace goes at the paragraph's
+    // *trailing* end, which for a right-to-left paragraph is its left -- in
+    // front of the line's first character, hanging off the ink rather than
+    // indenting it. Both halves of that have to move: the glyphs, and the
+    // stretches, which have to stay in the order the glyphs are in.
+    if (rtl_para and n_tail > 0) std.mem.rotate(Span, pieces, n_ink);
+
+    var x: f32 = if (rtl_para and n_tail > 0) -piecesWidth(src, pieces[0..n_tail]) else 0;
+    var ink: f32 = 0;
+    for (pieces, 0..) |*p, i| {
+        emit(src, buf, p, &x, y);
+        // Where the ink ends: after the last ink piece, which comes last in a
+        // right-to-left paragraph and before the whitespace in every other.
+        if (!rtl_para and i + 1 == n_ink) ink = x;
+    }
+    if (rtl_para) ink = x;
+
     return ink;
+}
+
+/// What a run of pieces advances by, before any of them have been placed.
+fn piecesWidth(src: TextRun, pieces: []const Span) f32 {
+    var sum: f32 = 0;
+    for (pieces) |p| {
+        if (p.count == 0) continue;
+        const last = p.first + p.count - 1;
+        const right = if (last + 1 < src.glyphs.len) src.glyphs[last + 1].pen_x else src.width;
+        sum += right - src.glyphs[p.first].pen_x;
+    }
+    return sum;
 }
 
 const Range = struct { first: u32, count: u32 };
@@ -648,7 +759,7 @@ const Bits = struct {
 
     fn run(self: *Bits, s: []const u8, max_width: f32) !Wrapped {
         const src = try fakeRun(s, &self.src);
-        return wrap(testing.allocator, src, s, max_width, 12, &self.buf);
+        return wrap(testing.allocator, src, s, &self.buf, .{ .width = max_width, .line_height = 12 });
     }
 };
 
@@ -1008,7 +1119,7 @@ test "a mixed-direction paragraph breaks in logical order and each line is reord
         .{ .start = 7, .end = 13, .level = 0 },
     }, &b.src, &b.src_spans);
 
-    const w = try wrap(testing.allocator, src, s, 8 * adv, 12, &b.buf);
+    const w = try wrap(testing.allocator, src, s, &b.buf, .{ .width = 8 * adv, .line_height = 12 });
     try expectWellFormed(w, s);
     try testing.expectEqual(@as(usize, 2), w.lines.len);
 
@@ -1057,31 +1168,114 @@ test "a right-to-left paragraph wraps, and its first line is not its last" {
     const s = "ABC DEF GHI";
     const src = try fakeMixedRun(s, 1, &.{.{ .start = 0, .end = 11, .level = 1 }}, &b.src, &b.src_spans);
 
-    const w = try wrap(testing.allocator, src, s, 8 * adv, 12, &b.buf);
+    const w = try wrap(testing.allocator, src, s, &b.buf, .{ .width = 8 * adv, .line_height = 12 });
     try expectWellFormed(w, s);
     try testing.expectEqual(@as(usize, 2), w.lines.len);
 
     var buf: [16]u32 = undefined;
-    // "ABC DEF" displayed right to left is "FED CBA", and the space the line
-    // ends with is still at the end of it.
-    try testing.expectEqualSlices(u32, &.{ 6, 5, 4, 3, 2, 1, 0, 7 }, clustersOf(w, 0, &buf));
+    // "ABC DEF" displayed right to left is "FED CBA", and rule L1 puts the
+    // space the line ends with at the paragraph's trailing end -- which for
+    // this paragraph is the left, in front of everything else on the line.
+    try testing.expectEqualSlices(u32, &.{ 7, 6, 5, 4, 3, 2, 1, 0 }, clustersOf(w, 0, &buf));
     try testing.expectEqualSlices(u32, &.{ 10, 9, 8 }, clustersOf(w, 1, &buf));
     try testing.expectEqual(@as(f32, 7 * adv), w.lines[0].width);
     try testing.expectEqual(@as(f32, 3 * adv), w.lines[1].width);
 
+    // `start` is the right-hand edge for this paragraph, so both lines are
+    // set against it: the first has a character of room, the second five.
+    try testing.expectEqual(@as(f32, adv), w.lines[0].x);
+    try testing.expectEqual(@as(f32, 5 * adv), w.lines[1].x);
+    // And the space hangs off the left of the ink rather than indenting it:
+    // the first line's ink still reaches the box's right edge.
+    try testing.expectEqual(@as(f32, 0), w.run.glyphs[w.lines[0].first].pen_x);
+    try testing.expectEqual(@as(f32, 8 * adv), w.lines[0].x + w.lines[0].width);
+
     // The caret before the first character of a right-to-left line is at the
-    // right-hand end of it.
-    try testing.expectEqual(@as(f32, 7 * adv), w.caret(0).x);
-    try testing.expectEqual(@as(f32, 3 * adv), w.caret(8).x);
-    // And the trailing space of a wrapped right-to-left line is drawn at the
-    // right-hand end rather than the left, so the caret before it lands on
-    // the same edge as the caret before the first character. That is the
-    // approximation `placeLine` states: putting it at the left would mean
-    // indenting the ink by a space that is not there to see, and the real
-    // answer is to right-align a right-to-left paragraph, which nothing here
-    // does yet.
-    try testing.expectEqual(@as(f32, 7 * adv), w.caret(7).x);
+    // right-hand end of it, and the caret before the trailing space -- which
+    // is after every character on the line, reading right to left -- is at
+    // the left-hand end. Those were the same x before L1 moved the space.
+    try testing.expectEqual(@as(f32, 8 * adv), w.caret(0).x);
+    try testing.expectEqual(@as(f32, adv), w.caret(7).x);
+    try testing.expectEqual(@as(f32, 8 * adv), w.caret(8).x);
     try testing.expectEqual(@as(f32, 12), w.caret(8).y);
+    try testing.expectEqual(@as(f32, 5 * adv), w.caret(11).x);
+}
+
+test "a paragraph is set against the edge it is told to be" {
+    var b: Bits = .{};
+    defer b.deinit();
+    const s = "one two three";
+    const src = try fakeRun(s, &b.src);
+    const box = 10 * adv;
+
+    // Lines of seven and five characters in a box of ten.
+    const left = try wrap(testing.allocator, src, s, &b.buf, .{ .width = box, .line_height = 12 });
+    try expectWellFormed(left, s);
+    try testing.expectEqual(@as(usize, 2), left.lines.len);
+    try testing.expectEqual(@as(f32, 0), left.lines[0].x);
+    try testing.expectEqual(@as(f32, 0), left.lines[1].x);
+    // Left-aligned text is as wide as its ink, which is what an element sized
+    // to it has always been.
+    try testing.expectEqual(@as(f32, 7 * adv), left.run.width);
+
+    const right = try wrap(testing.allocator, src, s, &b.buf, .{ .width = box, .line_height = 12, .alignment = .right });
+    try expectWellFormed(right, s);
+    try testing.expectEqual(@as(f32, 3 * adv), right.lines[0].x);
+    try testing.expectEqual(@as(f32, 5 * adv), right.lines[1].x);
+    // Aligned text is as wide as the box: the glyphs were moved to its far
+    // edge, and an element sized to the ink would clip them.
+    try testing.expectEqual(box, right.run.width);
+    // The glyphs moved with it, and the caret and the hit test with them.
+    try testing.expectEqual(@as(f32, 3 * adv), right.run.glyphs[0].pen_x);
+    try testing.expectEqual(@as(f32, 3 * adv), right.caret(0).x);
+    try testing.expectEqual(@as(usize, 0), right.byteAt(3.1 * adv, 0, s.len));
+    // Left of the first line's ink is still its first character, not the end
+    // of the line above it.
+    try testing.expectEqual(@as(usize, 0), right.byteAt(0, 0, s.len));
+
+    const center = try wrap(testing.allocator, src, s, &b.buf, .{ .width = box, .line_height = 12, .alignment = .center });
+    try testing.expectEqual(@as(f32, 1.5 * adv), center.lines[0].x);
+    try testing.expectEqual(@as(f32, 2.5 * adv), center.lines[1].x);
+    try testing.expectEqual(@as(f32, 1.5 * adv), center.caret(0).x);
+
+    // `start` and `end` are the paragraph's own edges, and this paragraph
+    // runs left to right.
+    const start = try wrap(testing.allocator, src, s, &b.buf, .{ .width = box, .line_height = 12, .alignment = .start });
+    try testing.expectEqual(@as(f32, 0), start.lines[0].x);
+    const end = try wrap(testing.allocator, src, s, &b.buf, .{ .width = box, .line_height = 12, .alignment = .end });
+    try testing.expectEqual(@as(f32, 3 * adv), end.lines[0].x);
+}
+
+test "a line wider than the box overflows one way, whatever the alignment" {
+    // Centring a line that does not fit would push its start off the left of
+    // the box, where nobody can read it. It starts at the box's left edge and
+    // overflows to the right instead, which is where every other overflow in
+    // this engine goes.
+    var b: Bits = .{};
+    defer b.deinit();
+    const s = "supercalifragilistic";
+    const src = try fakeRun(s, &b.src);
+    for ([_]Align{ .left, .right, .center, .start, .end }) |a| {
+        const w = try wrap(testing.allocator, src, s, &b.buf, .{ .width = 3 * adv, .line_height = 12, .alignment = a });
+        try expectWellFormed(w, s);
+        try testing.expectEqual(@as(usize, 1), w.lines.len);
+        try testing.expectEqual(@as(f32, 0), w.lines[0].x);
+        try testing.expectEqual(@as(f32, 0), w.run.glyphs[0].pen_x);
+    }
+}
+
+test "aligning is off when there is nothing to align in" {
+    // A width of zero is "no limit", so there is no box and nothing to be at
+    // the far edge of. The alignment is ignored rather than measured against
+    // zero, which would put every line at a negative x.
+    var b: Bits = .{};
+    defer b.deinit();
+    const s = "one two three";
+    const src = try fakeRun(s, &b.src);
+    const w = try wrap(testing.allocator, src, s, &b.buf, .{ .width = 0, .line_height = 12, .alignment = .right });
+    try testing.expectEqual(@as(usize, 1), w.lines.len);
+    try testing.expectEqual(@as(f32, 0), w.lines[0].x);
+    try testing.expectEqual(src.width, w.run.width);
 }
 
 test "a mixed paragraph that fits is one line, and its spans survive" {
@@ -1094,7 +1288,7 @@ test "a mixed paragraph that fits is one line, and its spans survive" {
         .{ .start = 7, .end = 13, .level = 0 },
     }, &b.src, &b.src_spans);
 
-    const w = try wrap(testing.allocator, src, s, 1000, 12, &b.buf);
+    const w = try wrap(testing.allocator, src, s, &b.buf, .{ .width = 1000, .line_height = 12 });
     try expectWellFormed(w, s);
     try testing.expectEqual(@as(usize, 1), w.lines.len);
     try testing.expectEqual(src.glyphs.len, w.lines[0].count);
@@ -1121,7 +1315,7 @@ test "no width loses or duplicates a glyph of a mixed paragraph" {
     var width: f32 = adv;
     while (width <= 14 * adv) : (width += adv) {
         const src = try fakeMixedRun(s, 0, &pieces, &b.src, &b.src_spans);
-        const w = try wrap(testing.allocator, src, s, width, 12, &b.buf);
+        const w = try wrap(testing.allocator, src, s, &b.buf, .{ .width = width, .line_height = 12 });
         try expectWellFormed(w, s);
 
         // Every line's spans cover its glyphs exactly, in visual order: the
