@@ -557,6 +557,34 @@ const focus_steps = [_][]const u8{
 
 const kVK_Tab = 48;
 
+/// One check of `--scroll`: a scroll event and where the list must be
+/// afterwards. A null `expect` is the list's end, which depends on the font.
+const ScrollStep = struct {
+    what: []const u8,
+    dy: f32,
+    precise: bool,
+    over_field: bool = false,
+    expect: ?f32,
+};
+
+const scroll_steps = [_]ScrollStep{
+    .{ .what = "a trackpad's 30 points down, over the list", .dy = 30, .precise = true, .expect = 30 },
+    .{ .what = "a wheel's one line down, which is 10 points", .dy = 1, .precise = false, .expect = 40 },
+    .{ .what = "1000 points up stops at the top", .dy = -1000, .precise = true, .expect = 0 },
+    .{ .what = "a wheel over the field scrolls the list not at all", .dy = 3, .precise = false, .over_field = true, .expect = 0 },
+    .{ .what = "100000 points down stops at the end", .dy = 100_000, .precise = true, .expect = null },
+};
+
+/// How far `el` can scroll: its content's height past its inside.
+fn scrollMax(t: *ui.Tree, el: ui.Index) f32 {
+    const before = t.style(el).scroll_y;
+    // `scrollBy` clamps, so asking for everything and putting it back is
+    // the answer the tree itself would give.
+    const moved = t.scrollBy(el, 0, 1e9) catch return 0;
+    _ = t.scrollBy(el, 0, -moved.y) catch {};
+    return before + moved.y;
+}
+
 /// One step of `--cursor`: something done to the pointer, and the cursor the
 /// screen must show afterwards. Checked with `Window.systemCursor`, which is
 /// the screen's cursor and not this program's idea of it.
@@ -738,6 +766,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var resize_test = false;
     var cursor_test = false;
     var focus_test = false;
+    var scroll_test = false;
     var live_off = false;
     var resize_thread: ?std.Thread = null;
     var resize_reported = false;
@@ -760,6 +789,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         // Tab, Space, Telex, and clicks on the button, the label and the
         // field. See `FocusTest`.
         if (std.mem.eql(u8, a, "--focus")) focus_test = true;
+        // Scroll events through AppKit: the checks in `scroll_steps`, then
+        // 200 timed steps.
+        if (std.mem.eql(u8, a, "--scroll")) scroll_test = true;
         // Measures the window without its live-resize drawing: the baseline.
         if (std.mem.eql(u8, a, "--no-live")) live_off = true;
     }
@@ -903,6 +935,15 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var click_capture_frame: u64 = std.math.maxInt(u64);
     var cursor_steps: [6]CursorStep = undefined;
     var focus_at: usize = 0;
+    var scroll_at: usize = 0;
+    var scroll_wrong: u32 = 0;
+    var scroll_row0: f32 = 0;
+    var scroll_timed: u32 = 0;
+    var scroll_was: CGPoint = .{ .x = 0, .y = 0 };
+    var scrolls: u64 = 0;
+    var scroll_ns_total: u64 = 0;
+    var scroll_frames: u64 = 0;
+    var scroll_frame_ns: u64 = 0;
     var focus_wrong: u32 = 0;
     var focus_before: [512]u8 = undefined;
     var focus_before_len: usize = 0;
@@ -1285,6 +1326,68 @@ pub fn main(init: std.process.Init.Minimal) !void {
             }
         }
 
+        // `--scroll`: checks first, one step every four frames, then 200
+        // alternating 12-point trackpad scrolls through AppKit, one a frame,
+        // timed as the Wayland demo times them.
+        if (scroll_test and frames >= 20) scroll: {
+            scripted_frame = true;
+            const list = demo.list_panel;
+            const lb = t.bounds(list);
+            const over_list: ui.Point = .{ .x = lb.x + lb.w / 2, .y = lb.y + lb.h / 2 };
+            if (scroll_at <= scroll_steps.len) {
+                if (frames % 4 != 0) break :scroll;
+                if (scroll_at > 0) {
+                    const st = scroll_steps[scroll_at - 1];
+                    const row = t.childrenOf(list)[0];
+                    const got = t.style(list).scroll_y;
+                    const want = if (st.expect) |e| e else scrollMax(&t, list);
+                    // The rows really moved, not just the number: the first
+                    // row is `got` above where it started.
+                    const ok = got == want and t.bounds(row).y == scroll_row0 - got;
+                    if (!ok) scroll_wrong += 1;
+                    std.debug.print("  {s}: scrolled {d} -- {s}\n", .{ st.what, got, if (ok) "ok" else "WRONG" });
+                } else {
+                    scroll_row0 = t.bounds(t.childrenOf(list)[0]).y;
+                    scroll_was = currentPointer();
+                }
+                if (scroll_at < scroll_steps.len) {
+                    const st = scroll_steps[scroll_at];
+                    const fb = t.bounds(demo.editable.?.field);
+                    const at_p = if (st.over_field) ui.Point{ .x = fb.x + fb.w / 2, .y = fb.y + fb.h / 2 } else over_list;
+                    _ = CGWarpMouseCursorPosition(layoutToGlobal(win, at_p));
+                    win.postScroll(st.dy, st.precise);
+                } else _ = CGWarpMouseCursorPosition(layoutToGlobal(win, over_list));
+                scroll_at += 1;
+            } else if (scroll_timed < 200) {
+                win.postScroll(if ((scroll_timed / 20) % 2 == 0) @as(f32, 12) else @as(f32, -12), true);
+                scroll_timed += 1;
+            }
+        }
+
+        // --- the wheel ---
+        //
+        // As on Wayland: a wheel event names a position, so the tree is asked
+        // which box there has anything to scroll, and the box moves its
+        // content by what AppKit reported -- points from a trackpad, lines
+        // times `NSScrollView`'s line from a wheel.
+        // From here to the scene: what a scroll costs the frame, without the
+        // script's own posting of the event above.
+        const wheel_t0 = nowNs();
+        const wheel = win.takeScroll();
+        var scrolled_this_frame = false;
+        if (wheel.x != 0 or wheel.y != 0) {
+            const target = t.scrollTargetAt(win.scroll_at);
+            if (target != 0 and target != std.math.maxInt(ui.Index)) {
+                const s0 = nowNs();
+                const moved = try t.scrollBy(target, wheel.x, wheel.y);
+                if (moved.x != 0 or moved.y != 0) {
+                    scrolls += 1;
+                    scroll_ns_total += nowNs() - s0;
+                    scrolled_this_frame = true;
+                }
+            }
+        }
+
         var px = win.pointer_x;
         var py = win.pointer_y;
         var inside = win.pointer_inside;
@@ -1320,6 +1423,27 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
         cpu_total_ns += cpu;
         cpu_worst_ns = @max(cpu_worst_ns, cpu);
+        if (scrolled_this_frame and scroll_at > scroll_steps.len) {
+            scroll_frames += 1;
+            scroll_frame_ns += nowNs() - wheel_t0;
+        }
+        if (scroll_test and scroll_timed >= 200 and !scrolled_this_frame) {
+            std.debug.print(
+                \\{d} checks, {d} wrong
+                \\{d} scroll events through AppKit, {d} of them precise
+                \\  applying one scroll          {d} ns mean
+                \\  the frame it lands in        {d} ns mean, over {d} frames
+                \\
+            , .{
+                scroll_steps.len,                      scroll_wrong,
+                win.scroll_events,                     win.scroll_precise,
+                scroll_ns_total / @max(1, scrolls),    scroll_frame_ns / @max(1, scroll_frames),
+                scroll_frames,
+            });
+            _ = CGWarpMouseCursorPosition(scroll_was);
+            if (scroll_wrong > 0) return error.ScrollScriptDiverged;
+            break;
+        }
         frames += 1;
         if (layout.total() > 0) frames_with_layout += 1;
         if (built.rebuilt) frames_with_scene += 1;
@@ -1353,7 +1477,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
         if (capture_pending and !swapchain.capture_request) {
             capture_pending = false;
             const crop: ?Crop = if (telex)
-                .{ .path = "docs/demo-typing-macos.png" }
+                // The crop only: the whole window mid-word is not the
+                // picture of the demo, and `--capture` owns that one.
+                .{ .path = "docs/demo-typing-macos.png", .whole = false }
             else if (click_test)
                 .{ .path = "docs/demo-selection-macos.png", .max_w = 10_000, .whole = false }
             else

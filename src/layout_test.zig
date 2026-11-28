@@ -1077,6 +1077,9 @@ test "the wheel finds the innermost box that has anything to scroll" {
     }
     // Enough after the list to overflow the panel too.
     _ = try t.appendChild(panel, .{ .height = .{ .fixed = 80 }, .flex_shrink = 0 });
+    // Both clip, which is what makes them scroll boxes.
+    t.setPaint(panel, .{ .clip_children = true });
+    t.setPaint(list, .{ .clip_children = true });
     t.layout(viewport);
 
     // Over a row: the row has nothing to scroll, the list does.
@@ -1097,4 +1100,33 @@ test "the wheel finds the innermost box that has anything to scroll" {
 
     // And nowhere over nothing.
     try testing.expectEqual(@as(Index, 0), t.scrollTargetAt(.{ .x = 900, .y = 500 }));
+}
+
+test "content past the edge of a box that does not clip is not something to scroll" {
+    // The demo's list row: a fixed height, padding, and a label taller than
+    // what is left inside. The label is drawn past the row's content box and
+    // seen there; the row is not a scroll box, and the wheel is the list's.
+    var t = try Tree.init(testing.allocator);
+    defer t.deinit();
+    const list = try t.appendChild(t.root(), .{
+        .axis = .col,
+        .height = .{ .fixed = 40 },
+        .flex_shrink = 0,
+        .align_items = .stretch,
+    });
+    t.setPaint(list, .{ .clip_children = true });
+    var rows: [4]Index = undefined;
+    for (&rows) |*r| {
+        r.* = try t.appendChild(list, .{ .axis = .row, .height = .{ .fixed = 26 }, .padding = 8, .flex_shrink = 0, .align_items = .center });
+        _ = try t.appendChild(r.*, .{ .width = .{ .fixed = 50 }, .height = .{ .fixed = 17 }, .flex_shrink = 0 });
+    }
+    t.layout(viewport);
+
+    const r0 = t.bounds(rows[0]);
+    try testing.expect(t.scrollExtent(rows[0]).h > r0.h - 16);
+    try testing.expectEqual(list, t.scrollTargetAt(.{ .x = r0.x + 20, .y = r0.y + 13 }));
+
+    // The same row told to clip is a scroll box, and owns the wheel.
+    t.setPaint(rows[0], .{ .clip_children = true });
+    try testing.expectEqual(rows[0], t.scrollTargetAt(.{ .x = r0.x + 20, .y = r0.y + 13 }));
 }

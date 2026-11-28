@@ -515,7 +515,6 @@ pub const Tree = struct {
         }
     }
 
-    /// Marks an element whose own size inputs changed by some other route.
     /// The innermost element at `p` that has something to scroll, or 0.
     ///
     /// A wheel event names a position, not an element, so something has to
@@ -523,9 +522,20 @@ pub const Tree = struct {
     /// content past its edge is what every toolkit does and what a user
     /// expects: a list inside a panel scrolls the list, and the same wheel
     /// over the panel's margin scrolls the panel.
+    ///
+    /// **Only a box that clips its children is a scroll box**, as in CSS,
+    /// where `overflow: visible` is not a scroll container. Content past the
+    /// edge of a box that does not clip is drawn there and seen, so there is
+    /// nothing hidden to scroll to -- and without the rule every padded row
+    /// whose text is taller than its content box was a "scroll box": the
+    /// demo's list rows are 26 high with 8 of padding, their labels 17, and
+    /// a wheel over any row scrolled the row by seven points instead of the
+    /// list. The Mac window's `--scroll` found it; the Wayland demo's scroll
+    /// test names its target and so could not.
     pub fn scrollTargetAt(self: *const Tree, p: Point) Index {
         var el = self.hitTest(p);
         while (el != none and el != 0) : (el = self.els.items[el].parent) {
+            if (!self.paint(el).clip_children) continue;
             const e = &self.els.items[el];
             const pad = e.style.padding;
             const ext = self.scrollExtent(el);
@@ -583,6 +593,7 @@ pub const Tree = struct {
         return moved;
     }
 
+    /// Marks an element whose own size inputs changed by some other route.
     pub fn markDirty(self: *Tree, el: Index) Error!void {
         try self.dirty.append(self.gpa, el);
     }

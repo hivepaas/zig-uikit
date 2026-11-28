@@ -63,6 +63,8 @@ extern "c" fn pthread_main_np() c_int;
 extern "CoreGraphics" fn CGEventCreateKeyboardEvent(source: ?*anyopaque, key: u16, down: bool) ?*anyopaque;
 extern "CoreGraphics" fn CGEventSetFlags(ev: *anyopaque, flags: u64) void;
 extern "CoreFoundation" fn CFRelease(obj: *anyopaque) void;
+extern "CoreGraphics" fn CGEventCreateScrollWheelEvent2(source: ?*anyopaque, units: u32, wheel_count: u32, wheel1: i32, wheel2: i32, wheel3: i32) ?*anyopaque;
+extern "CoreGraphics" fn CGEventPost(tap: u32, ev: *anyopaque) void;
 
 pub const LiveFrame = struct {
     ctx: ?*anyopaque,
@@ -134,6 +136,20 @@ pub const Window = struct {
 
     /// The press being dragged, if a mouse button is down in the text target.
     gesture: ?ui.editing.Gesture = null,
+
+    /// Scroll accumulated since the application last took it (`takeScroll`),
+    /// in layout units, positive when the content should move up -- the
+    /// direction `Tree.scrollBy` and the Wayland window both use. AppKit's
+    /// natural-scrolling setting is already folded into what it reports.
+    scroll_x: f32 = 0,
+    scroll_y: f32 = 0,
+    /// Where the last scroll event was, in layout units: a wheel event names
+    /// a position, and the box it scrolls is the one there.
+    scroll_at: ui.Point = .{ .x = -1, .y = -1 },
+    /// Scroll events, and of them the precise ones -- a trackpad or a Magic
+    /// Mouse, in points, against a wheel's notches in lines.
+    scroll_events: u32 = 0,
+    scroll_precise: u32 = 0,
 
     /// Told about every press, drag and release in the content before the
     /// text target is. See `setPointerHook`.
@@ -600,6 +616,37 @@ pub const Window = struct {
         return null;
     }
 
+    /// How far the content has been scrolled since this was last asked, and
+    /// clears it. Zero when nothing scrolled. The same shape as the Wayland
+    /// window's, so a frame loop asks both the same question.
+    pub fn takeScroll(self: *Window) ui.Point {
+        defer {
+            self.scroll_x = 0;
+            self.scroll_y = 0;
+        }
+        return .{ .x = self.scroll_x, .y = self.scroll_y };
+    }
+
+    /// A scroll event as a device delivers it, posted to the window server
+    /// at the pointer: `precise` is a trackpad's distance in points, and
+    /// otherwise `dy` is a wheel's count of lines. Positive `dy` scrolls the
+    /// content up, as `takeScroll` reports it.
+    ///
+    /// Posted rather than handed to the window, because that does not work:
+    /// `NSEvent` has no constructor for scroll events, and one made from a
+    /// Core Graphics event has window number 0 and a screen location, and
+    /// `NSWindow.sendEvent:` delivered none of the first run's to the view.
+    /// The window server sends a scroll to the window under the pointer, so
+    /// the caller puts the pointer there.
+    pub fn postScroll(self: *Window, dy: f32, precise: bool) void {
+        _ = self;
+        // Core Graphics' wheel 1 is positive upwards, which is the content
+        // moving down: the opposite of `takeScroll`.
+        const ev = CGEventCreateScrollWheelEvent2(null, if (precise) 0 else 1, 1, @intFromFloat(-dy), 0, 0) orelse return;
+        defer CFRelease(ev);
+        CGEventPost(0, ev); // kCGHIDEventTap
+    }
+
     pub const MouseKind = enum { down, dragged, up };
 
     /// A left-button event in the content, in layout units.
@@ -886,6 +933,7 @@ fn viewClass() Error!objc.Class {
         try b.method("viewDidEndLiveResize", &didEndLiveResize, "v@:");
         try b.method("mouseDragged:", &mouseDragged, "v@:@");
         try b.method("mouseUp:", &mouseUp, "v@:@");
+        try b.method("scrollWheel:", &scrollWheel, "v@:@");
         try b.method("inputContext", &inputContext, "@@:");
         try b.method("insertText:", &insertTextPlain, "v@:@");
 
@@ -1208,6 +1256,25 @@ fn mouseDragged(self: id, _: objc.SEL, event: id) callconv(.c) void {
     const at = hitOf(w, event, true) orelse return;
     const res = ui.editing.drag(t.doc, g, at) catch return;
     if (res.moved) w.text_changed = true;
+}
+
+/// What a scroll view scrolls for one line of a wheel that reports lines:
+/// `NSScrollView`'s default `verticalLineScroll`, measured.
+const line_scroll: f32 = 10;
+
+fn scrollWheel(self: id, _: objc.SEL, event: id) callconv(.c) void {
+    const w = stateOf(self) orelse return;
+    const precise = objc.truthy(send(objc.BOOL, event, "hasPreciseScrollingDeltas", .{}));
+    const unit: f32 = if (precise) 1 else line_scroll;
+    const dx: f32 = @floatCast(send(objc.CGFloat, event, "scrollingDeltaX", .{}));
+    const dy: f32 = @floatCast(send(objc.CGFloat, event, "scrollingDeltaY", .{}));
+    // AppKit's deltas are positive when the content should move down and
+    // right; the tree's are the other way.
+    w.scroll_x -= dx * unit;
+    w.scroll_y -= dy * unit;
+    w.scroll_at = layoutPointOf(w, event);
+    w.scroll_events += 1;
+    if (precise) w.scroll_precise += 1;
 }
 
 fn mouseUp(self: id, _: objc.SEL, event: id) callconv(.c) void {

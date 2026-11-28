@@ -1901,6 +1901,53 @@ eight milliseconds; a script can, and the script now gives each its own step.
 Focus moves are also accessibility focus: the tree's focus follows, and
 `AXFocusedUIElementChanged` is posted.
 
+### Scrolling on the Mac
+
+`scrollWheel:` adds up what AppKit reports, as the Wayland window adds up
+`axis` events, and the frame loop asks the same question of both:
+`takeScroll`, then `Tree.scrollTargetAt` at the event's position and
+`Tree.scrollBy`. A trackpad or a Magic Mouse reports **points**
+(`hasPreciseScrollingDeltas`); a wheel reports **lines**, which are multiplied
+by `NSScrollView`'s line — 10 points, measured rather than guessed. AppKit's
+deltas are positive when the content should move down, which is the opposite
+of the tree's, and natural scrolling is already folded into them.
+
+It found **a bug in core that both platforms had**: `scrollTargetAt` took any
+box with content past its edge for a scroll box, and every row of the demo's
+list is one — 26 high with 8 of padding leaves 10 inside, and its label is 17.
+The wheel over a row scrolled the row by seven points and the list not at all.
+The Wayland demo's scroll test names its target, so it could not see this.
+Now only a box that clips its children is a scroll box, as in CSS, where
+`overflow: visible` is not a scroll container: content past the edge of a box
+that does not clip is drawn there and seen, and there is nothing hidden to
+scroll to. A test builds the row and fails without the rule; the existing
+wheel test's panel and list now say they clip, which is what made them scroll
+boxes all along.
+
+`--scroll` puts the pointer over the list — the window server sends a scroll
+to the window under the pointer, and an `NSEvent` made from a Core Graphics
+scroll event has window number 0 and was not delivered by
+`NSWindow.sendEvent:` at all — posts real events, and puts the pointer back:
+
+```
+  a trackpad's 30 points down, over the list: scrolled 30 -- ok
+  a wheel's one line down, which is 10 points: scrolled 40 -- ok
+  1000 points up stops at the top: scrolled 0 -- ok
+  a wheel over the field scrolls the list not at all: scrolled 0 -- ok
+  100000 points down stops at the end: scrolled 439 -- ok
+5 checks, 0 wrong
+205 scroll events through AppKit, 203 of them precise
+  applying one scroll          357-1354 ns mean
+  the frame it lands in        20-44 us mean, over 180 frames
+```
+
+Each check also asks that the first row moved by exactly what the list
+scrolled, so it is the rows and not a number. The frame figure is from the
+event to the finished scene, on this M1 Pro and varying run to run; one run
+broken down was 4 us of hover and cursor, 7 us of layout flush and 26 us of
+scene build for 680 quads. The Wayland figure above is a different machine
+and is not comparable.
+
 ### Accessibility on macOS
 
 `src/access.zig` is the internal accessibility tree that
